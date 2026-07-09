@@ -107,9 +107,35 @@ fn accept_loop(
 
 /// SSH セッションを確立して認証まで行う。
 fn establish_session(config: &SshTunnelConfig) -> Result<Session, AppError> {
+    // session.set_timeout は接続確立後にしか効かないため、
+    // TCP 接続自体にも同じタイムアウトを適用する (ブラックホール化した
+    // ホストで OS の TCP タイムアウトまで待たされるのを防ぐ)
     let addr = format!("{}:{}", config.host, config.port);
-    let tcp = TcpStream::connect(&addr)
-        .map_err(|e| AppError::SshTunnel(format!("{addr} への接続に失敗: {e}")))?;
+    let socket_addrs: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&addr)
+        .map_err(|e| AppError::SshTunnel(format!("{addr} の名前解決に失敗: {e}")))?
+        .collect();
+    let mut tcp = None;
+    let mut last_error = None;
+    for socket_addr in &socket_addrs {
+        match TcpStream::connect_timeout(
+            socket_addr,
+            Duration::from_millis(SSH_TIMEOUT_MS as u64),
+        ) {
+            Ok(stream) => {
+                tcp = Some(stream);
+                break;
+            }
+            Err(e) => last_error = Some(e),
+        }
+    }
+    let tcp = tcp.ok_or_else(|| {
+        AppError::SshTunnel(format!(
+            "{addr} への接続に失敗: {}",
+            last_error
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "アドレスを解決できませんでした".into())
+        ))
+    })?;
 
     let mut session = Session::new()
         .map_err(|e| AppError::SshTunnel(format!("セッション作成に失敗: {e}")))?;

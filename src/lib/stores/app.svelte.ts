@@ -32,15 +32,33 @@ const loadConnections = async () => {
   }
 };
 
-/// 接続設定を再読込する (プール・SSH トンネルも破棄される)
+/// 接続設定を再読込する (プール・SSH トンネルも破棄される)。
+/// 旧設定の選択状態を残さないよう一旦クリアし、同名の接続が
+/// まだ存在する場合のみ再選択する (ファイル一覧も新設定で再取得される)。
 const reloadConnections = async () => {
+  if (!(await flushPendingSave())) {
+    return;
+  }
   try {
     await api.resetConnections();
   } catch (e) {
     errorMessage = toErrorMessage(e);
     return;
   }
+  const previousConnection = selectedConnection;
+  selectedConnection = null;
+  files = [];
+  selectedFile = null;
+  editorContent = "";
+  queryResult = null;
+  dirty = false;
   await loadConnections();
+  if (
+    previousConnection &&
+    connections.some((c) => c.name === previousConnection)
+  ) {
+    await selectConnection(previousConnection);
+  }
 };
 
 // 保留中の自動保存を確定させる。保存に失敗した場合は false を返す。
