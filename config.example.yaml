@@ -1,0 +1,68 @@
+# queryfolio 接続設定のサンプル。
+# sql-agent-mcp-server の config.yaml と互換のフォーマット。
+#
+# 解決順:
+#   1. QUERYFOLIO_CONFIG_YAML 環境変数 (YAML 文字列リテラル)
+#   2. QUERYFOLIO_CONFIG_YAML_GETTER_COMMAND 環境変数 (実行して stdout を使う)
+#      例: export QUERYFOLIO_CONFIG_YAML_GETTER_COMMAND='op read "op://development/queryfolio/config-yaml"'
+#   3. アプリ設定 (設定画面) の getter command
+#   4. ~/.config/queryfolio/config.yaml (このフォーマットのファイル)
+
+sql_servers:
+  - name: dev-postgres
+    description: "開発環境の PostgreSQL サーバー"
+    engine: postgres
+    host: localhost
+    port: 5432
+    schema: development_db
+    user: dev_user
+    password: your_password_here
+
+  - name: dev-mysql
+    description: "開発環境の MySQL サーバー"
+    engine: mysql
+    host: localhost
+    port: 3306
+    schema: test_db
+    user: mysql_user
+    password: your_mysql_password
+
+  # queryfolio 拡張: sqlite は schema に DB ファイルパスを指定する
+  - name: local-sqlite
+    description: "ローカルの SQLite ファイル"
+    engine: sqlite
+    schema: ~/data/example.sqlite3
+
+  - name: remote-db-with-ssh
+    description: "SSH トンネル経由でアクセスするリモートデータベース"
+    engine: postgres
+    host: localhost  # SSH トンネル経由の場合、踏み台から見た DB ホストを指定
+    port: 5432
+    schema: remote_db
+    user: remote_user
+    password: remote_password
+    ssh_tunnel:
+      host: ssh.example.com
+      port: 22
+      user: ssh_user
+      # password: ssh_password  # または private_key_path を使用
+      private_key_path: ~/.ssh/id_rsa
+      # private_key_passphrase: key_passphrase
+
+# 接続情報の雛形。sql_servers 側で template: <名前> を指定して継承できる。
+# サーバー側で指定したキーはテンプレートの同名キーを上書きする (シャローマージ)。
+sql_server_templates:
+  - name: my-awesome-sql-host
+    engine: mysql
+    host: db.example.com
+    port: 3306
+    user: shared_user
+    password: shared_password
+
+# 上のテンプレートを使う例:
+#
+# sql_servers:
+#   - template: my-awesome-sql-host
+#     name: my-app-db
+#     description: "アプリ本体の DB"
+#     schema: app_db
