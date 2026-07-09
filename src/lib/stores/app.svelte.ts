@@ -167,6 +167,8 @@ const runQuery = async (sql: string) => {
   }
   running = true;
   errorMessage = null;
+  // 失敗時に前回の結果を誤認・誤エクスポートしないよう、実行前にクリアする
+  queryResult = null;
   try {
     queryResult = await api.runQuery(selectedConnection, sql);
   } catch (e) {

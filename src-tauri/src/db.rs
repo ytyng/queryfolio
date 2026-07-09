@@ -399,6 +399,27 @@ fn json_number_f64(v: f64) -> serde_json::Value {
         .unwrap_or_else(|| serde_json::Value::String(v.to_string()))
 }
 
+/// JavaScript の Number は 2^53-1 (MAX_SAFE_INTEGER) を超える整数を
+/// 表現できず、Tauri の invoke 境界で丸められてしまう。
+/// 安全範囲を超える 64bit 整数は文字列で返して精度を保つ。
+const JS_MAX_SAFE_INTEGER: i64 = (1 << 53) - 1;
+
+fn json_i64(v: i64) -> serde_json::Value {
+    if (-JS_MAX_SAFE_INTEGER..=JS_MAX_SAFE_INTEGER).contains(&v) {
+        serde_json::json!(v)
+    } else {
+        serde_json::Value::String(v.to_string())
+    }
+}
+
+fn json_u64(v: u64) -> serde_json::Value {
+    if v <= JS_MAX_SAFE_INTEGER as u64 {
+        serde_json::json!(v)
+    } else {
+        serde_json::Value::String(v.to_string())
+    }
+}
+
 fn format_naive_datetime(v: chrono::NaiveDateTime) -> serde_json::Value {
     serde_json::Value::String(v.format("%Y-%m-%d %H:%M:%S%.f").to_string())
 }
@@ -410,12 +431,12 @@ fn mysql_value_to_json(row: &MySqlRow, i: usize) -> serde_json::Value {
             try_decode!(row, i, bool, |v: bool| serde_json::Value::Bool(v));
         }
         "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "BIGINT" => {
-            try_decode!(row, i, i64, |v: i64| serde_json::json!(v));
+            try_decode!(row, i, i64, json_i64);
         }
         // YEAR は sqlx 内部で UNSIGNED フラグ付きのため u64 側でデコードする
         "TINYINT UNSIGNED" | "SMALLINT UNSIGNED" | "MEDIUMINT UNSIGNED"
         | "INT UNSIGNED" | "BIGINT UNSIGNED" | "YEAR" => {
-            try_decode!(row, i, u64, |v: u64| serde_json::json!(v));
+            try_decode!(row, i, u64, json_u64);
         }
         "FLOAT" | "DOUBLE" => {
             try_decode!(row, i, f64, json_number_f64);
@@ -471,7 +492,7 @@ fn pg_value_to_json(row: &PgRow, i: usize) -> serde_json::Value {
             try_decode!(row, i, i32, |v: i32| serde_json::json!(v));
         }
         "INT8" => {
-            try_decode!(row, i, i64, |v: i64| serde_json::json!(v));
+            try_decode!(row, i, i64, json_i64);
         }
         "FLOAT4" => {
             try_decode!(row, i, f32, |v: f32| json_number_f64(v as f64));
@@ -530,7 +551,7 @@ fn sqlite_value_to_json(row: &SqliteRow, i: usize) -> serde_json::Value {
             try_decode!(row, i, bool, |v: bool| serde_json::Value::Bool(v));
         }
         "INTEGER" | "INT" => {
-            try_decode!(row, i, i64, |v: i64| serde_json::json!(v));
+            try_decode!(row, i, i64, json_i64);
         }
         "REAL" => {
             try_decode!(row, i, f64, json_number_f64);
@@ -542,13 +563,13 @@ fn sqlite_value_to_json(row: &SqliteRow, i: usize) -> serde_json::Value {
             try_decode!(row, i, Vec<u8>, bytes_to_json);
         }
         "NUMERIC" => {
-            try_decode!(row, i, i64, |v: i64| serde_json::json!(v));
+            try_decode!(row, i, i64, json_i64);
             try_decode!(row, i, f64, json_number_f64);
         }
         _ => {}
     }
     // sqlite は動的型付けのため、宣言型と実値が一致しないことがある
-    try_decode!(row, i, i64, |v: i64| serde_json::json!(v));
+    try_decode!(row, i, i64, json_i64);
     try_decode!(row, i, f64, json_number_f64);
     decode_fallback!(row, i)
 }
@@ -579,6 +600,27 @@ mod tests {
         assert!(!is_fetch_statement("UPDATE t SET a = 1"));
         assert!(!is_fetch_statement("DELETE FROM t"));
         assert!(!is_fetch_statement("CREATE TABLE t (a int)"));
+    }
+
+    #[test]
+    fn test_json_64bit_precision() {
+        // JS の安全整数範囲内は数値のまま
+        assert_eq!(json_i64(42), serde_json::json!(42));
+        assert_eq!(json_i64(-9007199254740991), serde_json::json!(-9007199254740991i64));
+        assert_eq!(json_u64(9007199254740991), serde_json::json!(9007199254740991u64));
+        // 範囲外は文字列で精度を保つ
+        assert_eq!(
+            json_i64(i64::MAX),
+            serde_json::Value::String("9223372036854775807".into())
+        );
+        assert_eq!(
+            json_i64(i64::MIN),
+            serde_json::Value::String("-9223372036854775808".into())
+        );
+        assert_eq!(
+            json_u64(u64::MAX),
+            serde_json::Value::String("18446744073709551615".into())
+        );
     }
 
     #[test]
