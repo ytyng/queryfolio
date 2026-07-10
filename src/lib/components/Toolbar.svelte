@@ -12,7 +12,7 @@
 <div
   class="flex shrink-0 items-center gap-2 border-b border-zinc-700 bg-zinc-900 px-3 py-1.5"
 >
-  <span class="text-sm font-semibold text-zinc-200">Queryfolio</span>
+  <span class="text-sm font-semibold text-zinc-200">QueryFolio</span>
   {#if appStore.selectedConnection}
     <span class="text-xs text-zinc-500">
       {appStore.selectedConnection}

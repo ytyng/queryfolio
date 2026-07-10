@@ -1,4 +1,4 @@
-# queryfolio
+# QueryFolio
 
 SQL client desktop app built with Tauri 2 + SvelteKit. A lightweight alternative to JetBrains DataGrip.
 

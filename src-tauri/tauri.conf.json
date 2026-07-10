@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "queryfolio",
+  "productName": "QueryFolio",
   "version": "0.1.0",
   "identifier": "com.ytyng.queryfolio",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "queryfolio",
+        "title": "QueryFolio",
         "width": 1280,
         "height": 800
       }
