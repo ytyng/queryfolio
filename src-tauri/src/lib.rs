@@ -1,5 +1,6 @@
 mod config;
 mod db;
+mod history;
 mod meta_commands;
 mod error;
 mod query_files;
@@ -26,6 +27,8 @@ struct AppState {
     /// dirty ファイルの保存先を読み込み時のディレクトリに固定する。
     sqlfiles_dir: tokio::sync::Mutex<Option<PathBuf>>,
     db: DbManager,
+    /// クエリ実行履歴の記録 (接続ごとの行数キャッシュを保持)。
+    history: history::HistoryManager,
 }
 
 impl AppState {
@@ -95,19 +98,71 @@ async fn run_query(
     max_rows: Option<usize>,
 ) -> Result<QueryResult, AppError> {
     let server = state.find_server(&connection).await?;
-    let pool: DbPool = state.db.get_pool(&server).await?;
+    // 履歴記録用に実行時点のアクティブスキーマを控えておく
+    let schema = match state.db.schema_override(&connection).await {
+        Some(schema) => Some(schema),
+        None => server.schema.clone(),
+    };
     let auto_limit = match state.resolve_default_limit().await? {
         0 => None,
         limit => Some(limit),
     };
-    db::run_query(
-        &pool,
-        &sql,
-        max_rows.unwrap_or(DEFAULT_MAX_ROWS),
-        auto_limit,
-        server.readonly,
+    let started = std::time::Instant::now();
+    let result = async {
+        let pool: DbPool = state.db.get_pool(&server).await?;
+        db::run_query(
+            &pool,
+            &sql,
+            max_rows.unwrap_or(DEFAULT_MAX_ROWS),
+            auto_limit,
+            server.readonly,
+        )
+        .await
+    }
+    .await;
+
+    // 成功・失敗にかかわらず実行履歴を記録する。
+    // 記録の失敗でクエリ結果を損なわないよう、エラーはログに留める。
+    // (追記は小さな同期 I/O なので async コンテキストのまま行う。
+    //  ローテーション時のみ全読み・書き直しが走るが、上限 1 万行 =
+    //  高々数 MB のため許容する)
+    let entry = history::HistoryEntry {
+        time: chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, false),
+        sql,
+        schema,
+        row_count: result.as_ref().ok().map(|r| match r.affected_rows {
+            Some(affected) => affected,
+            None => r.row_count as u64,
+        }),
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        success: result.is_ok(),
+    };
+    match history::default_history_dir() {
+        Ok(dir) => {
+            if let Err(e) = state.history.append(&dir, &connection, &entry) {
+                eprintln!("[history] failed to record the query history: {e}");
+            }
+        }
+        Err(e) => eprintln!("[history] {e}"),
+    }
+
+    result
+}
+
+/// 接続のクエリ実行履歴を新しい順に返す。
+/// search を指定すると SQL の部分一致 (大文字小文字を区別しない) で絞り込む。
+#[tauri::command]
+fn list_query_history(
+    connection: String,
+    search: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<history::HistoryEntry>, AppError> {
+    history::list_history(
+        &history::default_history_dir()?,
+        &connection,
+        search.as_deref(),
+        limit.unwrap_or(history::DEFAULT_LIST_LIMIT),
     )
-    .await
 }
 
 #[tauri::command]
@@ -282,6 +337,7 @@ pub fn run() {
             get_connections,
             reset_connections,
             run_query,
+            list_query_history,
             list_query_files,
             read_query_file,
             write_query_file,

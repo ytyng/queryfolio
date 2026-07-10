@@ -5,7 +5,8 @@ use crate::error::AppError;
 
 /// パス要素として安全な名前かを検証して返す。
 /// パストラバーサルや不可視ファイルを防ぐ。
-fn validate_component(name: &str) -> Result<&str, AppError> {
+/// (history.rs でも接続名の検証に使う)
+pub(crate) fn validate_component(name: &str) -> Result<&str, AppError> {
     let name = name.trim();
     if name.is_empty() {
         return Err(AppError::QueryFile("The name is empty".into()));
