@@ -147,6 +147,47 @@ async fn delete_query_file(
     )
 }
 
+/// 接続先サーバー上の database (スキーマ) 一覧を返す。
+#[tauri::command]
+async fn list_schemas(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+) -> Result<Vec<String>, AppError> {
+    let server = state.find_server(&connection).await?;
+    let pool = state.db.get_pool(&server).await?;
+    db::list_schemas(&pool, &server).await
+}
+
+/// 接続のアクティブスキーマ (database) を切り替える。
+/// プールが再構築され、次のクエリから新しい database に接続される。
+#[tauri::command]
+async fn set_active_schema(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    schema: String,
+) -> Result<(), AppError> {
+    if schema.trim().is_empty() {
+        return Err(AppError::Config("The schema name is empty".into()));
+    }
+    // 接続名の実在確認 (存在しない接続へのオーバーライド蓄積を防ぐ)
+    state.find_server(&connection).await?;
+    state.db.set_schema_override(&connection, schema).await;
+    Ok(())
+}
+
+/// 接続のアクティブスキーマを返す (オーバーライトが無ければ設定のデフォルト)。
+#[tauri::command]
+async fn get_active_schema(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+) -> Result<Option<String>, AppError> {
+    if let Some(schema) = state.db.schema_override(&connection).await {
+        return Ok(Some(schema));
+    }
+    let server = state.find_server(&connection).await?;
+    Ok(server.schema)
+}
+
 /// 設定の解決結果を返す (情報表示用。機密を含まない)。
 #[tauri::command]
 fn get_config_info() -> ConfigInfo {
@@ -221,6 +262,9 @@ pub fn run() {
             write_query_file,
             create_query_file,
             delete_query_file,
+            list_schemas,
+            set_active_schema,
+            get_active_schema,
             get_config_info,
             ensure_config_file,
         ])

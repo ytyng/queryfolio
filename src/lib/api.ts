@@ -5,6 +5,7 @@ export interface ConnectionInfo {
   description: string | null;
   engine: string;
   has_ssh_tunnel: boolean;
+  schema: string | null;
 }
 
 export interface QueryResult {
@@ -48,6 +49,15 @@ export const createQueryFile = (connection: string, fileName: string) =>
 
 export const deleteQueryFile = (connection: string, fileName: string) =>
   invoke<void>("delete_query_file", { connection, fileName });
+
+export const listSchemas = (connection: string) =>
+  invoke<string[]>("list_schemas", { connection });
+
+export const setActiveSchema = (connection: string, schema: string) =>
+  invoke<void>("set_active_schema", { connection, schema });
+
+export const getActiveSchema = (connection: string) =>
+  invoke<string | null>("get_active_schema", { connection });
 
 export const getConfigInfo = () => invoke<ConfigInfo>("get_config_info");
 

@@ -5,6 +5,7 @@
   import { ensureConfigFile } from "$lib/api";
   import appStore from "$lib/stores/app.svelte";
   import Toolbar from "$lib/components/Toolbar.svelte";
+  import EditorToolbar from "$lib/components/EditorToolbar.svelte";
   import ConnectionsPane from "$lib/components/ConnectionsPane.svelte";
   import FilesPane from "$lib/components/FilesPane.svelte";
   import SqlEditor from "$lib/components/SqlEditor.svelte";
@@ -66,6 +67,9 @@
     <FilesPane />
 
     <div class="flex min-w-0 flex-1 flex-col">
+      {#if appStore.selectedConnection}
+        <EditorToolbar engine={selectedEngine} />
+      {/if}
       <div class="min-h-0 flex-[3] border-b border-zinc-700">
         {#if appStore.selectedFile}
           <SqlEditor

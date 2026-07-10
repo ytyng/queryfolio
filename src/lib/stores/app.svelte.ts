@@ -13,6 +13,8 @@ let errorMessage = $state<string | null>(null);
 let running = $state(false);
 let loadingConnections = $state(false);
 let dirty = $state(false);
+let schemas = $state<string[]>([]);
+let activeSchema = $state<string | null>(null);
 
 let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -53,6 +55,8 @@ const reloadConnections = async (): Promise<boolean> => {
   editorContent = "";
   queryResult = null;
   dirty = false;
+  schemas = [];
+  activeSchema = null;
   await loadConnections();
   if (errorMessage) {
     return false;
@@ -89,11 +93,42 @@ const selectConnection = async (name: string) => {
   queryResult = null;
   errorMessage = null;
   dirty = false;
+  activeSchema =
+    connections.find((c) => c.name === name)?.schema ?? null;
+  schemas = [];
   try {
     files = await api.listQueryFiles(name);
   } catch (e) {
     errorMessage = toErrorMessage(e);
     files = [];
+  }
+  // スキーマ一覧の取得は接続確立を伴うため、失敗しても選択自体は成立させる
+  // (エラーは結果ペインに出さず、プルダウンを現在値のみにする)
+  try {
+    activeSchema = (await api.getActiveSchema(name)) ?? activeSchema;
+    schemas = await api.listSchemas(name);
+  } catch {
+    schemas = activeSchema ? [activeSchema] : [];
+  }
+};
+
+// アクティブスキーマ (database) を切り替える。成功したら true。
+const changeActiveSchema = async (schema: string): Promise<boolean> => {
+  if (!selectedConnection || schema === activeSchema) {
+    return true;
+  }
+  if (!(await flushPendingSave())) {
+    return false;
+  }
+  try {
+    await api.setActiveSchema(selectedConnection, schema);
+    activeSchema = schema;
+    queryResult = null;
+    errorMessage = null;
+    return true;
+  } catch (e) {
+    errorMessage = toErrorMessage(e);
+    return false;
   }
 };
 
@@ -232,9 +267,16 @@ export default {
   get dirty() {
     return dirty;
   },
+  get schemas() {
+    return schemas;
+  },
+  get activeSchema() {
+    return activeSchema;
+  },
   loadConnections,
   reloadConnections,
   selectConnection,
+  changeActiveSchema,
   selectFile,
   createFile,
   deleteFile,
