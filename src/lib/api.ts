@@ -136,6 +136,13 @@ export const getAiInfo = () => invoke<AiInfo>("get_ai_info");
 export const aiGenerateSql = (connection: string, instruction: string) =>
   invoke<string>("ai_generate_sql", { connection, instruction });
 
+/// 失敗した SQL とエラーメッセージから修正案の SQL を返す (実行はしない)。
+export const aiFixSql = (
+  connection: string,
+  sql: string,
+  errorMessage: string,
+) => invoke<string>("ai_fix_sql", { connection, sql, errorMessage });
+
 export const getConfigInfo = () => invoke<ConfigInfo>("get_config_info");
 
 /// config.yml が無ければテンプレートを作成する。作成した場合はそのパスを返す。

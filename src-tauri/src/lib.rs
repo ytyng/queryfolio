@@ -138,6 +138,41 @@ impl AppState {
             .await;
         Ok(map)
     }
+
+    /// AI コマンド (SQL 生成 / エラー修正) 共通のコンテキストを解決する:
+    /// AI 設定・接続設定・プロンプト用アクティブスキーマ名・スキーママップ。
+    /// AI 未設定時は案内メッセージのエラーを返す。
+    async fn resolve_ai_context(
+        &self,
+        connection: &str,
+    ) -> Result<
+        (
+            ai::AiConfig,
+            ServerConfig,
+            Option<String>,
+            std::collections::BTreeMap<String, Vec<String>>,
+        ),
+        AppError,
+    > {
+        let ai_config = self.resolve_ai_config().await?.ok_or_else(|| {
+            AppError::Ai(
+                "AI is not configured. Add an 'ai:' section (provider / api_key) \
+                 to config.yml or the connection YAML"
+                    .into(),
+            )
+        })?;
+        let server = self.find_server(connection).await?;
+        let schema_key = self.active_schema_key(&server).await;
+        let schema_map = self.resolve_schema_map(&server, &schema_key).await?;
+        // sqlite の schema はローカル DB ファイルパスなので、プロンプトには含めない
+        let is_sqlite = matches!(
+            server.engine.to_ascii_lowercase().as_str(),
+            "sqlite" | "sqlite3"
+        );
+        let active_schema =
+            (!is_sqlite && !schema_key.trim().is_empty()).then_some(schema_key);
+        Ok((ai_config, server, active_schema, schema_map))
+    }
 }
 
 #[tauri::command]
@@ -462,25 +497,38 @@ async fn ai_generate_sql(
     if instruction.trim().is_empty() {
         return Err(AppError::Ai("The instruction is empty".into()));
     }
-    let ai_config = state.resolve_ai_config().await?.ok_or_else(|| {
-        AppError::Ai(
-            "AI is not configured. Add an 'ai:' section (provider / api_key) \
-             to config.yml or the connection YAML"
-                .into(),
-        )
-    })?;
-    let server = state.find_server(&connection).await?;
-    let schema_key = state.active_schema_key(&server).await;
-    let schema_map = state.resolve_schema_map(&server, &schema_key).await?;
-    // sqlite の schema はローカル DB ファイルパスなので、プロンプトには含めない
-    let is_sqlite = matches!(
-        server.engine.to_ascii_lowercase().as_str(),
-        "sqlite" | "sqlite3"
-    );
-    let active_schema =
-        (!is_sqlite && !schema_key.trim().is_empty()).then_some(schema_key.as_str());
-    let system_prompt = ai::build_sql_system_prompt(&server.engine, active_schema, &schema_map);
+    let (ai_config, server, active_schema, schema_map) =
+        state.resolve_ai_context(&connection).await?;
+    let system_prompt =
+        ai::build_sql_system_prompt(&server.engine, active_schema.as_deref(), &schema_map);
     let response = ai::chat_complete(&ai_config, &system_prompt, &instruction).await?;
+    Ok(ai::strip_sql_fences(&response))
+}
+
+/// 失敗した SQL と DB のエラーメッセージから修正案の SQL を生成して返す。
+/// 実行はせず、エディタへの反映もユーザーの確認 (Apply) に任せる。
+/// LLM に送るのは失敗した SQL・エラーメッセージ・スキーマ情報
+/// (テーブル・カラム名)・エンジン方言・アクティブスキーマ名のみ。
+/// クエリの結果データや接続情報 (ホスト・認証情報) は送らない。
+#[tauri::command]
+async fn ai_fix_sql(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    sql: String,
+    error_message: String,
+) -> Result<String, AppError> {
+    if sql.trim().is_empty() {
+        return Err(AppError::Ai("The SQL statement is empty".into()));
+    }
+    if error_message.trim().is_empty() {
+        return Err(AppError::Ai("The error message is empty".into()));
+    }
+    let (ai_config, server, active_schema, schema_map) =
+        state.resolve_ai_context(&connection).await?;
+    let system_prompt =
+        ai::build_fix_sql_system_prompt(&server.engine, active_schema.as_deref(), &schema_map);
+    let user_prompt = ai::build_fix_sql_user_prompt(&sql, &error_message);
+    let response = ai::chat_complete(&ai_config, &system_prompt, &user_prompt).await?;
     Ok(ai::strip_sql_fences(&response))
 }
 
@@ -568,6 +616,7 @@ pub fn run() {
             get_schema_map,
             get_ai_info,
             ai_generate_sql,
+            ai_fix_sql,
             get_config_info,
             ensure_config_file,
         ])

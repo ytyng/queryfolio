@@ -22,6 +22,11 @@ export interface ResultTab {
   /// キャンセル要求で実行が中断された (エラーとは別の見た目で表示する)
   cancelled: boolean;
   running: boolean;
+  /// AI にエラー修正案を問い合わせ中 (スピナー表示・二重実行防止)
+  fixing: boolean;
+  /// AI が返した修正案の SQL (無ければ null)。自動実行はせず、
+  /// ユーザーの Apply でエディタに挿入する
+  fixSuggestion: string | null;
 }
 
 let connections = $state<ConnectionInfo[]>([]);
@@ -301,19 +306,20 @@ const updateEditorContent = (content: string) => {
 
 /// 履歴パネル・スキーマブラウザからの SQL 断片の挿入。
 /// 開いているファイルの末尾に追記する (既存の編集内容を上書きしないよう、
-/// 置換ではなく追記にする)。実行はしない。
+/// 置換ではなく追記にする)。実行はしない。挿入できたら true を返す。
 /// エディタへの反映は SqlEditor 側の $effect が行う。
-const insertSqlSnippet = (sql: string) => {
+const insertSqlSnippet = (sql: string): boolean => {
   if (!selectedConnection) {
     toast.warning("Select a connection first");
-    return;
+    return false;
   }
   if (!selectedFile) {
     toast.warning("Select or create a query file first");
-    return;
+    return false;
   }
   const trimmed = editorContent.replace(/\s+$/, "");
   updateEditorContent(trimmed ? `${trimmed}\n\n${sql}\n` : `${sql}\n`);
+  return true;
 };
 
 /// 自然言語の指示から AI で SQL を生成し、エディタに挿入する
@@ -352,6 +358,59 @@ const generateSql = async (instruction: string): Promise<boolean> => {
     return false;
   } finally {
     aiGenerating = false;
+  }
+};
+
+/// タブに記録された SQL とエラーメッセージから、AI に修正案を問い合わせて
+/// タブへ書き込む (自動実行はしない。ユーザーが Apply でエディタに挿入する)。
+const fixSqlWithAi = async (tabId: number) => {
+  const tab = resultTabs.find((t) => t.id === tabId);
+  if (!tab || !tab.error || !tab.sql.trim()) {
+    return;
+  }
+  // 二重実行防止 (ボタンも disabled にしているが防御的にガードする)
+  if (tab.fixing) {
+    return;
+  }
+  tab.fixing = true;
+  try {
+    const fixed = await api.aiFixSql(tab.connection, tab.sql, tab.error);
+    // 問い合わせ中に設定再読込などでタブが破棄されていたら結果を捨てる
+    if (!resultTabs.some((t) => t.id === tabId)) {
+      return;
+    }
+    if (!fixed.trim()) {
+      toast.warning("The AI returned an empty response");
+      return;
+    }
+    tab.fixSuggestion = fixed;
+  } catch (e) {
+    toast.error("Failed to get a fix suggestion", {
+      description: toErrorMessage(e),
+    });
+  } finally {
+    tab.fixing = false;
+  }
+};
+
+/// AI の修正案をエディタに挿入して提案表示を閉じる (実行はしない)。
+/// 挿入できなかった場合 (接続・ファイル未選択) は提案を残す。
+const applyFixSuggestion = (tabId: number) => {
+  const tab = resultTabs.find((t) => t.id === tabId);
+  if (!tab?.fixSuggestion) {
+    return;
+  }
+  if (insertSqlSnippet(tab.fixSuggestion)) {
+    toast.success("Fixed SQL inserted into the editor");
+    tab.fixSuggestion = null;
+  }
+};
+
+/// AI の修正案を破棄して提案表示を閉じる。
+const dismissFixSuggestion = (tabId: number) => {
+  const tab = resultTabs.find((t) => t.id === tabId);
+  if (tab) {
+    tab.fixSuggestion = null;
   }
 };
 
@@ -403,6 +462,8 @@ const prepareTargetTab = (): ResultTab | null => {
     error: null,
     cancelled: false,
     running: false,
+    fixing: false,
+    fixSuggestion: null,
   };
   resultTabs = [...resultTabs, tab];
   // 生のオブジェクトではなく $state プロキシ経由の参照を返す
@@ -417,6 +478,8 @@ const executeTab = async (tab: ResultTab) => {
   tab.result = null;
   tab.error = null;
   tab.cancelled = false;
+  // 前回エラーへの修正案は再実行で古くなるため破棄する
+  tab.fixSuggestion = null;
   tab.executedAt = Date.now();
   activeTabId = tab.id;
   let result: QueryResult | null = null;
@@ -623,6 +686,9 @@ export default {
   saveCurrentFile,
   updateEditorContent,
   insertSqlSnippet,
+  fixSqlWithAi,
+  applyFixSuggestion,
+  dismissFixSuggestion,
   isConnectionRunning,
   runQuery,
   cancelQuery,

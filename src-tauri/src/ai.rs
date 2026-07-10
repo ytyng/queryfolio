@@ -119,6 +119,17 @@ pub fn build_sql_system_prompt(
          the user's request, using only the tables and columns listed below.\n\
          Return ONLY the SQL statement, no markdown fences, no explanation.\n"
     );
+    push_schema_section(&mut prompt, active_schema, schema_map);
+    prompt
+}
+
+/// system prompt にアクティブスキーマ名とテーブル・カラム一覧を追記する
+/// (SQL 生成とエラー修正で共通)。
+fn push_schema_section(
+    prompt: &mut String,
+    active_schema: Option<&str>,
+    schema_map: &BTreeMap<String, Vec<String>>,
+) {
     if let Some(schema) = active_schema.filter(|s| !s.trim().is_empty()) {
         prompt.push_str(&format!("The active schema (database) is '{schema}'.\n"));
     }
@@ -129,7 +140,40 @@ pub fn build_sql_system_prompt(
     for (table, columns) in schema_map {
         prompt.push_str(&format!("- {table} ({})\n", columns.join(", ")));
     }
+}
+
+/// SQL エラー修正用の system prompt を組み立てる。
+/// LLM に送るのは失敗した SQL・DB のエラーメッセージ・スキーマ情報
+/// (テーブル名・カラム名)・方言・アクティブスキーマ名のみ。
+/// クエリの結果データや接続情報 (ホスト・認証情報) は絶対に含めない。
+pub fn build_fix_sql_system_prompt(
+    engine: &str,
+    active_schema: Option<&str>,
+    schema_map: &BTreeMap<String, Vec<String>>,
+) -> String {
+    let dialect = dialect_name(engine);
+    let mut prompt = format!(
+        "You are a SQL assistant for a {dialect} database. \
+         The user will provide a SQL statement that failed and the error \
+         message returned by the database. Fix the SQL statement so that it \
+         runs in the {dialect} dialect, using only the tables and columns \
+         listed below while preserving the intent of the original statement.\n\
+         Return ONLY the corrected SQL statement, no markdown fences, \
+         no explanation.\n"
+    );
+    push_schema_section(&mut prompt, active_schema, schema_map);
     prompt
+}
+
+/// SQL エラー修正用の user prompt を組み立てる
+/// (失敗した SQL と DB のエラーメッセージ)。
+pub fn build_fix_sql_user_prompt(sql: &str, error_message: &str) -> String {
+    format!(
+        "The following SQL statement failed:\n\n{}\n\n\
+         The database returned this error:\n\n{}",
+        sql.trim(),
+        error_message.trim()
+    )
 }
 
 /// LLM の応答が ```sql フェンス付きで返ってきた場合に中身を取り出す。
@@ -353,6 +397,43 @@ mod tests {
         let prompt = build_sql_system_prompt("mysql", Some(""), &BTreeMap::new());
         assert!(prompt.contains("MySQL"));
         assert!(!prompt.contains("active schema"));
+    }
+
+    #[test]
+    fn test_build_fix_sql_system_prompt() {
+        let mut schema_map = BTreeMap::new();
+        schema_map.insert(
+            "users".to_string(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+        let prompt = build_fix_sql_system_prompt("mysql", Some("app_db"), &schema_map);
+        assert!(prompt.contains("MySQL"));
+        assert!(prompt.contains("'app_db'"));
+        assert!(prompt.contains("- users (id, name)"));
+        assert!(prompt.contains("Return ONLY the corrected SQL statement"));
+    }
+
+    #[test]
+    fn test_build_fix_sql_system_prompt_no_schema() {
+        // アクティブスキーマ無し・テーブル無しでも壊れないこと
+        let prompt = build_fix_sql_system_prompt("sqlite", None, &BTreeMap::new());
+        assert!(prompt.contains("SQLite"));
+        assert!(prompt.contains("(no tables found)"));
+        assert!(!prompt.contains("active schema"));
+    }
+
+    #[test]
+    fn test_build_fix_sql_user_prompt() {
+        let prompt = build_fix_sql_user_prompt(
+            "SELECT * FROM userz;\n",
+            "  ERROR 1146: Table 'app.userz' doesn't exist ",
+        );
+        assert!(prompt.contains("The following SQL statement failed:\n\nSELECT * FROM userz;"));
+        assert!(prompt.contains(
+            "The database returned this error:\n\nERROR 1146: Table 'app.userz' doesn't exist"
+        ));
+        // 前後の空白は除去される
+        assert!(!prompt.ends_with(' '));
     }
 
     #[test]
