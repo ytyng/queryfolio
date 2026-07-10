@@ -271,7 +271,9 @@ pub async fn run_query(
     let limited_sql;
     let sql = match auto_limit {
         Some(limit) if limit > 0 && translated.is_none() && should_auto_limit(sql) => {
-            let body = sql.trim_end().trim_end_matches(';').trim_end();
+            // 末尾のコメント・セミコロンを除いた本体の直後に付与する
+            // (コメントの後ろに付けると LIMIT がコメントに飲み込まれる)
+            let body = &sql[..sql_body_end(sql)];
             limited_sql = format!("{body} LIMIT {limit}");
             applied_limit = Some(limit);
             limited_sql.as_str()
@@ -470,16 +472,63 @@ fn strip_sql_noise(sql: &str) -> String {
     result
 }
 
+/// SQL 本体 (末尾のコメント・セミコロン・空白を除く) の終了位置を返す。
+/// 自動 LIMIT を末尾コメントの中に付与してしまわないようにするための走査。
+/// 文字列リテラル内の文字はコードとして数える。
+fn sql_body_end(sql: &str) -> usize {
+    let mut end = 0;
+    let mut chars = sql.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\'' | '"' | '`' => {
+                let mut last = i + c.len_utf8();
+                while let Some((j, inner)) = chars.next() {
+                    last = j + inner.len_utf8();
+                    if inner == c {
+                        if chars.peek().map(|(_, n)| *n) == Some(c) {
+                            chars.next();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                end = last;
+            }
+            '-' if chars.peek().map(|(_, n)| *n) == Some('-') => {
+                for (_, inner) in chars.by_ref() {
+                    if inner == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek().map(|(_, n)| *n) == Some('*') => {
+                chars.next();
+                let mut prev = ' ';
+                for (_, inner) in chars.by_ref() {
+                    if prev == '*' && inner == '/' {
+                        break;
+                    }
+                    prev = inner;
+                }
+            }
+            _ if c.is_whitespace() || c == ';' => {}
+            _ => {
+                end = i + c.len_utf8();
+            }
+        }
+    }
+    end
+}
+
 /// デフォルト LIMIT を安全に付与できる文かを判定する。
 /// 対象は SELECT 系のみ。LIMIT / FETCH / OFFSET / FOR UPDATE / INTO /
 /// WITH ... INSERT 等の語を含む場合は、構文エラーや意味の変化を避けるため
 /// 付与しない (保守的側に倒す。スキップしてもクライアント側の max_rows
 /// 打ち切りが安全網になる)。
 fn should_auto_limit(sql: &str) -> bool {
-    if !matches!(
-        leading_keyword(sql).as_str(),
-        "select" | "with" | "values" | "table"
-    ) {
+    // VALUES (SQLite では LIMIT 不可) や TABLE は対象にせず、
+    // SELECT / WITH のみに限定する
+    if !matches!(leading_keyword(sql).as_str(), "select" | "with") {
         return false;
     }
     let cleaned = strip_sql_noise(sql);
@@ -807,6 +856,22 @@ mod tests {
     }
 
     #[test]
+    fn test_sql_body_end() {
+        let sql = "SELECT * FROM t -- note";
+        assert_eq!(&sql[..sql_body_end(sql)], "SELECT * FROM t");
+        let sql = "SELECT 1; -- note";
+        assert_eq!(&sql[..sql_body_end(sql)], "SELECT 1");
+        let sql = "SELECT 1 /* c */  ;  ";
+        assert_eq!(&sql[..sql_body_end(sql)], "SELECT 1");
+        // 文字列リテラル内の記号はコードとして残る
+        let sql = "SELECT 'a;-- b' FROM t;";
+        assert_eq!(&sql[..sql_body_end(sql)], "SELECT 'a;-- b' FROM t");
+        // コメントの後に続きがあるケース
+        let sql = "SELECT 1 -- c\n+ 2";
+        assert_eq!(&sql[..sql_body_end(sql)], "SELECT 1 -- c\n+ 2");
+    }
+
+    #[test]
     fn test_should_auto_limit() {
         assert!(should_auto_limit("SELECT * FROM users"));
         assert!(should_auto_limit("WITH x AS (SELECT 1) SELECT * FROM x"));
@@ -826,6 +891,8 @@ mod tests {
         // SELECT 系以外
         assert!(!should_auto_limit("SHOW TABLES"));
         assert!(!should_auto_limit("UPDATE t SET a = 1"));
+        // VALUES は SQLite で LIMIT 不可のため対象外
+        assert!(!should_auto_limit("VALUES (1)"));
     }
 
     #[test]
@@ -963,6 +1030,25 @@ mod tests {
 
         // メタコマンドには適用しない
         let result = run_query(&pool, "\\dt", 10, Some(2)).await.unwrap();
+        assert_eq!(result.applied_limit, None);
+
+        // 末尾コメント付きでも LIMIT がコメントに飲み込まれない
+        let result = run_query(
+            &pool,
+            "SELECT * FROM t ORDER BY id -- trailing note",
+            10,
+            Some(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.row_count, 2);
+        assert_eq!(result.applied_limit, Some(2));
+
+        // VALUES は自動 LIMIT の対象外 (SQLite では VALUES ... LIMIT が構文エラー)
+        let result = run_query(&pool, "VALUES (1), (2), (3)", 10, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(result.row_count, 3);
         assert_eq!(result.applied_limit, None);
     }
 }
