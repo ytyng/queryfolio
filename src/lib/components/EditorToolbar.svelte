@@ -5,9 +5,12 @@
   interface Props {
     engine: string | null;
     readonly: boolean;
+    /// Explain ボタン押下時の処理 (+page.svelte がエディタの
+    /// カーソル位置の文を取り出して appStore.explainQuery に渡す)
+    onExplain: () => void;
   }
 
-  let { engine, readonly }: Props = $props();
+  let { engine, readonly, onExplain }: Props = $props();
 
   const isSqlite = $derived(
     ["sqlite", "sqlite3"].includes((engine ?? "").toLowerCase()),
@@ -116,6 +119,17 @@
   {/if}
 
   <div class="ml-auto flex min-w-0 items-center gap-2">
+    <!-- カーソル位置の文をエンジン別 EXPLAIN で実行する (AI 不要の単体機能) -->
+    <button
+      type="button"
+      class="rounded border border-zinc-600 bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
+      data-annotate="button-explain"
+      title="Run EXPLAIN for the SELECT statement under the cursor"
+      disabled={appStore.running}
+      onclick={onExplain}
+    >
+      Explain
+    </button>
     {#if showAiInput}
       <form
         class="flex min-w-0 items-center gap-1"

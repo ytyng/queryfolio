@@ -36,14 +36,14 @@ pnpm tauri build        # リリースビルド
 | tunnel.rs | SSH ローカルポートフォワード (known_hosts 検証付き) |
 | query_files.rs | クエリファイル CRUD (パストラバーサル対策) |
 | schema_info.rs | テーブル・カラムのカタログ照会と SchemaCache (接続+スキーマ単位のキャッシュ。スキーマブラウザと SQL 補完用 get_schema_map で共有) |
-| ai.rs | AI 基盤 (AiConfig の解決・OpenAI Chat Completions 呼び出し chat_complete・SQL 生成プロンプト整形・フェンス剥がし)。API キーはフロントに渡さない (get_ai_info は configured / model のみ) |
+| ai.rs | AI 基盤 (AiConfig の解決・OpenAI Chat Completions 呼び出し chat_complete・SQL 生成 / EXPLAIN 解説プロンプト整形・フェンス剥がし)。API キーはフロントに渡さない (get_ai_info は configured / model のみ) |
 | error.rs | AppError (フロントには文字列でシリアライズ) |
 
 ### フロントエンド (src/)
 
 - `lib/api.ts` — invoke の型付きラッパー (バックエンドとの境界)
 - `lib/stores/app.svelte.ts` — Svelte 5 runes ストア (getter + メソッドを default export)
-- `lib/components/` — Toolbar / ConnectionsPane / FilesPane / HistoryPane / TablesPane (スキーマブラウザ) / SqlEditor / EditorToolbar / ResultsPane / CellInspector / ConfigInfoModal (読み取り専用の設定表示)
+- `lib/components/` — Toolbar / ConnectionsPane / FilesPane / HistoryPane / TablesPane (スキーマブラウザ) / SqlEditor / EditorToolbar / ResultsPane / CellInspector / ConfigInfoModal (読み取り専用の設定表示) / AiAnalysisModal (EXPLAIN の AI 解説表示)
 - `lib/export.ts` — CSV/TSV/JSON 変換 (formula injection 対策込み)
 
 ## 設定 (config.yml)
@@ -54,7 +54,7 @@ pnpm tauri build        # リリースビルド
 - ソース宣言は `command:` / `env:` / `file:` の**ちょうど 1 つ** (複数はエラー)。取得した YAML は sql-agent 互換フォーマットとしてパースされ、さらなるソース宣言の再帰は禁止。
 - `command` はシェル非経由 (shlex 分解) で実行。GUI 起動の最小 PATH 対策として /opt/homebrew/bin と /usr/local/bin を補完する。60 秒タイムアウト + kill_on_drop。
 - `default_limit` (任意、デフォルト 500、0 で無効) — LIMIT 未指定の SELECT に自動で `LIMIT n` を付与する (db.rs の should_auto_limit。サブクエリ LIMIT / FOR UPDATE 等は保守的にスキップ)。
-- `readonly: true` (任意、デフォルト false。sql-agent 互換フォーマットへの queryfolio 独自拡張) — その接続で書き込み系の文 (INSERT / UPDATE / DELETE / DDL 等) の実行を拒否する。判定は db.rs の is_readonly_allowed: leading_keyword が select / with / show / describe / desc / explain / pragma / values / table / call 以外なら拒否し、さらに WITH は CTE 付き DML (insert / update / delete / merge)、SELECT は SELECT INTO を、リテラル・コメント除去済みの単語境界判定で拒否する。メタコマンドは読み取り系のみなので常に許可。SELECT に副作用のある関数 (nextval 等) までは防げない、あくまで事故防止のガード。
+- `readonly: true` (任意、デフォルト false。sql-agent 互換フォーマットへの queryfolio 独自拡張) — その接続で書き込み系の文 (INSERT / UPDATE / DELETE / DDL 等) の実行を拒否する。判定は db.rs の is_readonly_allowed: leading_keyword が select / with / show / describe / desc / explain / pragma / values / table / call 以外なら拒否し、さらに WITH は CTE 付き DML (insert / update / delete / merge)、SELECT は SELECT INTO、EXPLAIN は EXPLAIN ANALYZE + DML (対象文を実際に実行するため) を、リテラル・コメント除去済みの単語境界判定で拒否する。メタコマンドは読み取り系のみなので常に許可。SELECT に副作用のある関数 (nextval 等) までは防げない、あくまで事故防止のガード。
 - `sqlfiles_dir` (任意) でクエリファイル保存先を変更できる。デフォルトは `~/.config/queryfolio/sqlfiles/<connection>/<name>.sql`。
 - `ai:` (任意) — AI SQL 生成の設定 (`provider: openai` / `api_key` / `model` 任意 / `base_url` 任意)。ローカル config.yml のトップレベルと、ソース宣言で取得する接続 YAML のトップレベルの両方に書ける。**両方ある場合は接続 YAML 側を優先** (API キーを 1Password に置ける)。provider は現状 openai のみで、不明値はエラー。AppState にセッションキャッシュされ reset_connections でクリア。
 - `QUERYFOLIO_CONFIG_YAML` 環境変数は設定ファイル全体を上書きする開発・テスト用フック (実機 E2E 検証で使用)。

@@ -136,6 +136,18 @@ export const getAiInfo = () => invoke<AiInfo>("get_ai_info");
 export const aiGenerateSql = (connection: string, instruction: string) =>
   invoke<string>("ai_generate_sql", { connection, instruction });
 
+/// エンジン別の EXPLAIN プレフィックスを付けた SQL を組み立てて返す
+/// (実行はしない)。SELECT / WITH 以外の文は reject される。
+export const buildExplainSql = (connection: string, sql: string) =>
+  invoke<string>("build_explain_sql", { connection, sql });
+
+/// EXPLAIN の実行計画を AI に解説させ、Markdown テキストを返す。
+export const aiExplainPlan = (
+  connection: string,
+  sql: string,
+  planText: string,
+) => invoke<string>("ai_explain_plan", { connection, sql, planText });
+
 export const getConfigInfo = () => invoke<ConfigInfo>("get_config_info");
 
 /// config.yml が無ければテンプレートを作成する。作成した場合はそのパスを返す。

@@ -484,6 +484,62 @@ async fn ai_generate_sql(
     Ok(ai::strip_sql_fences(&response))
 }
 
+/// エンジン別の EXPLAIN プレフィックスを付けた SQL を組み立てて返す。
+/// 実行はしない (フロントが通常の run_query 経路で実行する)。
+/// 対象は SELECT / WITH のみ (Postgres の EXPLAIN ANALYZE は対象文を
+/// 実際に実行するため、DML への付与はエラーで拒否する)。
+#[tauri::command]
+async fn build_explain_sql(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    sql: String,
+) -> Result<String, AppError> {
+    let server = state.find_server(&connection).await?;
+    db::build_explain_sql(&server.engine, &sql)
+}
+
+/// EXPLAIN の実行計画を AI に解説させ、ボトルネックの特定・インデックス
+/// 提案・書き直し案の Markdown を返す。LLM に送るのはスキーマ情報
+/// (テーブル・カラム名)・エンジン方言・アクティブスキーマ名・SQL・
+/// 実行計画テキストのみ (実行計画はクエリの結果データではなくプランナー
+/// 出力なので許容する)。接続情報 (ホスト・認証情報) は送らない。
+#[tauri::command]
+async fn ai_explain_plan(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    sql: String,
+    plan_text: String,
+) -> Result<String, AppError> {
+    if sql.trim().is_empty() {
+        return Err(AppError::Ai("The SQL statement is empty".into()));
+    }
+    if plan_text.trim().is_empty() {
+        return Err(AppError::Ai("The execution plan is empty".into()));
+    }
+    let ai_config = state.resolve_ai_config().await?.ok_or_else(|| {
+        AppError::Ai(
+            "AI is not configured. Add an 'ai:' section (provider / api_key) \
+             to config.yml or the connection YAML"
+                .into(),
+        )
+    })?;
+    let server = state.find_server(&connection).await?;
+    let schema_key = state.active_schema_key(&server).await;
+    let schema_map = state.resolve_schema_map(&server, &schema_key).await?;
+    // sqlite の schema はローカル DB ファイルパスなので、プロンプトには含めない
+    let is_sqlite = matches!(
+        server.engine.to_ascii_lowercase().as_str(),
+        "sqlite" | "sqlite3"
+    );
+    let active_schema =
+        (!is_sqlite && !schema_key.trim().is_empty()).then_some(schema_key.as_str());
+    let system_prompt =
+        ai::build_explain_system_prompt(&server.engine, active_schema, &schema_map);
+    let user_message = ai::build_explain_user_message(&sql, &plan_text);
+    let response = ai::chat_complete(&ai_config, &system_prompt, &user_message).await?;
+    Ok(response.trim().to_string())
+}
+
 /// 設定の解決結果を返す (情報表示用。機密を含まない)。
 #[tauri::command]
 fn get_config_info() -> ConfigInfo {
@@ -568,6 +624,8 @@ pub fn run() {
             get_schema_map,
             get_ai_info,
             ai_generate_sql,
+            build_explain_sql,
+            ai_explain_plan,
             get_config_info,
             ensure_config_file,
         ])
