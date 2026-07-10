@@ -11,6 +11,7 @@ SQL client desktop app built with Tauri 2 + SvelteKit. A lightweight alternative
 - Query files per connection, auto-saved (`~/.config/queryfolio/sqlfiles/<connection>/*.sql`)
 - CodeMirror 6 SQL editor with per-engine dialect, statement highlighting, and Cmd+Enter to run the statement under the cursor
 - Results grid with CSV / TSV / JSON copy (formula-injection safe)
+- psql-style meta commands (`\l` `\dt` `\dv` `\dn` `\du` `\d [table]`) translated to catalog queries, with MySQL / SQLite equivalents where possible
 
 ## Setup
 

@@ -101,10 +101,20 @@ impl DbManager {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Engine {
+pub(crate) enum Engine {
     MySql,
     Postgres,
     Sqlite,
+}
+
+impl DbPool {
+    pub(crate) fn engine(&self) -> Engine {
+        match self {
+            DbPool::MySql(_) => Engine::MySql,
+            DbPool::Postgres(_) => Engine::Postgres,
+            DbPool::Sqlite(_) => Engine::Sqlite,
+        }
+    }
 }
 
 fn parse_engine(engine: &str) -> Result<Engine, AppError> {
@@ -206,6 +216,10 @@ pub async fn run_query(
     sql: &str,
     max_rows: usize,
 ) -> Result<QueryResult, AppError> {
+    // psql 風メタコマンド (\l, \dt など) はカタログ照会 SQL に変換して実行する
+    let translated = crate::meta_commands::translate(pool.engine(), sql)?;
+    let sql = translated.as_deref().unwrap_or(sql);
+
     if leading_keyword(sql).is_empty() {
         return Err(AppError::Config("The SQL statement is empty".into()));
     }
@@ -721,5 +735,22 @@ mod tests {
         .unwrap();
         assert_eq!(result.columns, vec!["id", "name"]);
         assert_eq!(result.rows[0][1], serde_json::json!("dave"));
+
+        // psql 風メタコマンドが変換されて実行される
+        let result = run_query(&pool, "\\dt", 10).await.unwrap();
+        assert_eq!(result.row_count, 1);
+        assert_eq!(result.rows[0][0], serde_json::json!("t"));
+
+        let result = run_query(&pool, "\\d t", 10).await.unwrap();
+        // PRAGMA table_info は name カラム (index 1) にカラム名を返す
+        let column_names: Vec<&str> = result
+            .rows
+            .iter()
+            .filter_map(|row| row[1].as_str())
+            .collect();
+        assert_eq!(column_names, vec!["id", "name", "score"]);
+
+        // 未対応メタコマンドはエラー
+        assert!(run_query(&pool, "\\du", 10).await.is_err());
     }
 }

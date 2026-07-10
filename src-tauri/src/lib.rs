@@ -1,5 +1,6 @@
 mod config;
 mod db;
+mod meta_commands;
 mod error;
 mod query_files;
 mod tunnel;

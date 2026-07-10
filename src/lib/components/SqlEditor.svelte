@@ -74,6 +74,13 @@
   };
 
   const currentStatementText = (state: EditorState): string => {
+    // psql 風メタコマンド (\dt など) は SQL パーサが Statement として
+    // 認識しないため、カーソル行が \ 始まりの場合はその行を実行対象にする
+    const line = state.doc.lineAt(state.selection.main.head);
+    const lineText = state.sliceDoc(line.from, line.to).trim();
+    if (lineText.startsWith("\\")) {
+      return lineText;
+    }
     const range = statementRangeAt(state, state.selection.main.head);
     if (!range) {
       return "";
