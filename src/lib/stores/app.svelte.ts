@@ -604,15 +604,16 @@ const explainQuery = async (sql: string) => {
     toast.warning("There is no SQL statement to explain");
     return;
   }
-  let explainSql: string;
+  // 変数名は module 直下の explainSql アクションと被らないよう別名にする
+  let explainStatement: string;
   try {
-    explainSql = await api.buildExplainSql(selectedConnection, sql);
+    explainStatement = await api.buildExplainSql(selectedConnection, sql);
   } catch (e) {
     // 対象外の文 (DML 等) や不明エンジン。実行前の断りなので warning にする
     toast.warning(toErrorMessage(e));
     return;
   }
-  await runQuery(explainSql);
+  await runQuery(explainStatement);
 };
 
 /// EXPLAIN 結果を AI に渡すテキストに整形する (ヘッダ + タブ区切り行)。
