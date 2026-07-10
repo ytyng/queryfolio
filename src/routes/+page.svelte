@@ -111,6 +111,7 @@
             bind:this={editor}
             content={appStore.editorContent}
             engine={selectedEngine}
+            schemaMap={appStore.schemaMap}
             onChange={(content) => appStore.updateEditorContent(content)}
             onRun={(sql) => appStore.runQuery(sql)}
           />
