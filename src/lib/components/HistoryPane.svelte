@@ -4,11 +4,12 @@
   import appStore from "$lib/stores/app.svelte";
 
   interface Props {
-    /// FILES タブへの切り替え (タブ状態は +page.svelte が持つ)
+    /// FILES / TABLES タブへの切り替え (タブ状態は +page.svelte が持つ)
     onShowFiles: () => void;
+    onShowTables: () => void;
   }
 
-  let { onShowFiles }: Props = $props();
+  let { onShowFiles, onShowTables }: Props = $props();
 
   /// インクリメンタル検索のデバウンス時間
   const SEARCH_DEBOUNCE_MS = 250;
@@ -84,6 +85,14 @@
     </button>
     <span class="text-xs font-semibold tracking-wide text-zinc-400">HISTORY</span>
     <button
+      class="text-xs font-semibold tracking-wide text-zinc-600 hover:text-zinc-300"
+      title="Show tables"
+      data-annotate="tab-tables"
+      onclick={onShowTables}
+    >
+      TABLES
+    </button>
+    <button
       class="ml-auto rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
       title="Reload history"
       data-annotate="button-reload-history"
@@ -120,7 +129,7 @@
           class="block w-full border-b border-zinc-800 px-3 py-1.5 text-left hover:bg-zinc-800"
           title={entry.sql}
           data-annotate="button-history-entry-{index}"
-          onclick={() => appStore.insertSqlFromHistory(entry.sql)}
+          onclick={() => appStore.insertSqlSnippet(entry.sql)}
         >
           <span class="flex items-center gap-1 text-[10px] text-zinc-500">
             <span

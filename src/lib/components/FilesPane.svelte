@@ -2,11 +2,12 @@
   import appStore from "$lib/stores/app.svelte";
 
   interface Props {
-    /// HISTORY タブへの切り替え (タブ状態は +page.svelte が持つ)
+    /// HISTORY / TABLES タブへの切り替え (タブ状態は +page.svelte が持つ)
     onShowHistory: () => void;
+    onShowTables: () => void;
   }
 
-  let { onShowHistory }: Props = $props();
+  let { onShowHistory, onShowTables }: Props = $props();
 
   let creating = $state(false);
   let newFileName = $state("");
@@ -62,6 +63,14 @@
       onclick={onShowHistory}
     >
       HISTORY
+    </button>
+    <button
+      class="text-xs font-semibold tracking-wide text-zinc-600 hover:text-zinc-300"
+      title="Show tables"
+      data-annotate="tab-tables"
+      onclick={onShowTables}
+    >
+      TABLES
     </button>
     <button
       class="ml-auto rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"

@@ -9,14 +9,15 @@
   import ConnectionsPane from "$lib/components/ConnectionsPane.svelte";
   import FilesPane from "$lib/components/FilesPane.svelte";
   import HistoryPane from "$lib/components/HistoryPane.svelte";
+  import TablesPane from "$lib/components/TablesPane.svelte";
   import SqlEditor from "$lib/components/SqlEditor.svelte";
   import ResultsPane from "$lib/components/ResultsPane.svelte";
   import ConfigInfoModal from "$lib/components/ConfigInfoModal.svelte";
 
   let showSettings = $state(false);
   let editor: SqlEditor | undefined = $state();
-  /// 左ペイン 2 列目のタブ (クエリファイル一覧 / クエリ履歴)
-  let leftPaneTab = $state<"files" | "history">("files");
+  /// 左ペイン 2 列目のタブ (クエリファイル一覧 / クエリ履歴 / テーブル一覧)
+  let leftPaneTab = $state<"files" | "history" | "tables">("files");
 
   const selectedConnectionInfo = $derived(
     appStore.connections.find((c) => c.name === appStore.selectedConnection) ??
@@ -73,11 +74,26 @@
         onShowHistory={() => {
           leftPaneTab = "history";
         }}
+        onShowTables={() => {
+          leftPaneTab = "tables";
+        }}
       />
-    {:else}
+    {:else if leftPaneTab === "history"}
       <HistoryPane
         onShowFiles={() => {
           leftPaneTab = "files";
+        }}
+        onShowTables={() => {
+          leftPaneTab = "tables";
+        }}
+      />
+    {:else}
+      <TablesPane
+        onShowFiles={() => {
+          leftPaneTab = "files";
+        }}
+        onShowHistory={() => {
+          leftPaneTab = "history";
         }}
       />
     {/if}

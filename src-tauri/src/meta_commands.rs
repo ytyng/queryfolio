@@ -27,7 +27,8 @@ pub fn translate(engine: Engine, input: &str) -> Result<Option<String>, AppError
 
 /// テーブル名引数を検証する。SQL に埋め込むため、識別子として安全な文字のみ許可する。
 /// クォート付き識別子 (スペースや記号入り) は非対応。
-fn validate_relation_name(name: &str) -> Result<&str, AppError> {
+/// \d のほか、スキーマブラウザ (schema_info) のテーブル名検証にも使う。
+pub(crate) fn validate_relation_name(name: &str) -> Result<&str, AppError> {
     let parts: Vec<&str> = name.split('.').collect();
     let valid = !parts.is_empty()
         && parts.len() <= 2
@@ -38,7 +39,7 @@ fn validate_relation_name(name: &str) -> Result<&str, AppError> {
         });
     if !valid {
         return Err(AppError::Config(format!(
-            "Invalid table name for \\d: {name} \
+            "Invalid table name: {name} \
              (only simple identifiers like schema.table are supported)"
         )));
     }
