@@ -150,6 +150,8 @@ pub struct ConnectionInfo {
     pub description: Option<String>,
     pub engine: String,
     pub has_ssh_tunnel: bool,
+    /// 設定上のデフォルト database (スキーマ)
+    pub schema: Option<String>,
 }
 
 impl From<&ServerConfig> for ConnectionInfo {
@@ -159,6 +161,7 @@ impl From<&ServerConfig> for ConnectionInfo {
             description: server.description.clone(),
             engine: server.engine.clone(),
             has_ssh_tunnel: server.ssh_tunnel.is_some(),
+            schema: server.schema.clone(),
         }
     }
 }
