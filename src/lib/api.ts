@@ -47,6 +47,14 @@ export const resetConnections = () => invoke<void>("reset_connections");
 export const runQuery = (connection: string, sql: string, maxRows?: number) =>
   invoke<QueryResult>("run_query", { connection, sql, maxRows });
 
+/// 接続で実行中のクエリにキャンセルを要求する。実行中でなければ false。
+/// キャンセルされた run_query は CANCELLED_ERROR_MESSAGE のエラーで返る。
+export const cancelQuery = (connection: string) =>
+  invoke<boolean>("cancel_query", { connection });
+
+/// バックエンドの AppError::Cancelled が返す文字列 (キャンセル判定用)
+export const CANCELLED_ERROR_MESSAGE = "Query cancelled";
+
 /// クエリ実行履歴を新しい順に返す。search は SQL の部分一致 (大小無視)。
 export const listQueryHistory = (
   connection: string,

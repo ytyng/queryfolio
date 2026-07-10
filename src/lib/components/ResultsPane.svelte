@@ -206,6 +206,10 @@
       </span>
       {#if activeTab.running}
         <span class="text-blue-400">Running...</span>
+      {:else if activeTab.cancelled}
+        <span class="text-amber-400" data-annotate="text-result-cancelled">
+          Cancelled
+        </span>
       {:else if activeTab.result}
         {@const result = activeTab.result}
         {#if result.affected_rows !== null}
@@ -232,11 +236,21 @@
         <span>{result.elapsed_ms} ms</span>
       {/if}
       <span class="ml-auto flex items-center gap-1">
+        {#if activeTab.running}
+          <button
+            class="rounded border border-red-800 bg-red-900/40 px-1.5 py-0.5 text-red-300 hover:bg-red-800 hover:text-red-100"
+            title="Cancel the running query"
+            data-annotate="button-cancel-query"
+            onclick={() => appStore.cancelQuery(activeTab.id)}
+          >
+            ■ Cancel
+          </button>
+        {/if}
         <button
           class="rounded border border-zinc-700 px-1.5 py-0.5 hover:bg-zinc-700 hover:text-zinc-200 disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
           title="Run this tab's SQL again on {activeTab.connection}"
           data-annotate="button-rerun-tab"
-          disabled={activeTab.running}
+          disabled={appStore.isConnectionRunning(activeTab.connection)}
           onclick={() => appStore.rerunTab(activeTab.id)}
         >
           ↻ Re-run
@@ -268,6 +282,13 @@
         <pre
           class="whitespace-pre-wrap px-3 py-2 font-mono text-xs text-red-400"
           data-annotate="text-error-message">{activeTab.error}</pre>
+      {:else if activeTab?.cancelled}
+        <p
+          class="px-3 py-2 text-xs text-amber-400"
+          data-annotate="text-query-cancelled"
+        >
+          Query cancelled
+        </p>
       {:else if activeTab?.result && activeTab.result.columns.length > 0}
         {@const result = activeTab.result}
         <table class="min-w-full border-collapse font-mono text-xs">

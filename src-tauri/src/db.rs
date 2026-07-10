@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use base64::Engine as _;
@@ -19,6 +21,10 @@ pub const DEFAULT_MAX_ROWS: usize = 1000;
 
 const POOL_MAX_CONNECTIONS: u32 = 3;
 const ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// SQLite の progress handler を呼ぶ VM 命令数の間隔。
+/// 小さいほどキャンセルの反応が速いが、実行オーバーヘッドが増える。
+const SQLITE_PROGRESS_HANDLER_OPS: i32 = 1000;
 
 #[derive(Clone)]
 pub enum DbPool {
@@ -147,12 +153,178 @@ pub(crate) enum Engine {
     Sqlite,
 }
 
-impl DbPool {
-    pub(crate) fn engine(&self) -> Engine {
+/// プールから実行専用に確保した 1 本のコネクション。
+/// キャンセル対象 (backend PID 等) はセッション単位の情報のため、
+/// クエリはプール直ではなくこのコネクション上で実行する。
+enum DbConnection {
+    MySql(sqlx::pool::PoolConnection<sqlx::MySql>),
+    Postgres(sqlx::pool::PoolConnection<sqlx::Postgres>),
+    Sqlite(sqlx::pool::PoolConnection<sqlx::Sqlite>),
+}
+
+impl DbConnection {
+    async fn acquire(pool: &DbPool) -> Result<Self, AppError> {
+        Ok(match pool {
+            DbPool::MySql(p) => DbConnection::MySql(p.acquire().await?),
+            DbPool::Postgres(p) => DbConnection::Postgres(p.acquire().await?),
+            DbPool::Sqlite(p) => DbConnection::Sqlite(p.acquire().await?),
+        })
+    }
+
+    fn engine(&self) -> Engine {
         match self {
-            DbPool::MySql(_) => Engine::MySql,
-            DbPool::Postgres(_) => Engine::Postgres,
-            DbPool::Sqlite(_) => Engine::Sqlite,
+            DbConnection::MySql(_) => Engine::MySql,
+            DbConnection::Postgres(_) => Engine::Postgres,
+            DbConnection::Sqlite(_) => Engine::Sqlite,
+        }
+    }
+}
+
+/// キャンセル発行の手段 (エンジン別)。
+/// Postgres / MySQL はサーバー側で実行中の文を、プールの別コネクション
+/// から停止させる (接続自体は切断しないため、実行側のコネクションは
+/// 健全なままプールへ戻る)。SQLite は progress handler が cancelled
+/// フラグを監視して文を SQLITE_INTERRUPT で中断する。
+enum CancelTarget {
+    /// SELECT pg_cancel_backend($pid) を別接続から発行する
+    Postgres { pid: i32, pool: sqlx::PgPool },
+    /// KILL QUERY <connection_id> を別接続から発行する
+    MySql { connection_id: u64, pool: sqlx::MySqlPool },
+    /// cancelled フラグを立てるだけ (progress handler が中断する)
+    Sqlite,
+}
+
+/// 実行中クエリ 1 件分の登録情報
+struct RunningQuery {
+    /// 登録の世代識別子 (古いガードが新しい登録を消さないための照合用)
+    id: u64,
+    target: CancelTarget,
+    cancelled: Arc<AtomicBool>,
+}
+
+/// 実行中クエリのレジストリ (接続名単位)。
+/// 同一接続の並列実行はフロントエンド側で抑止している
+/// (app.svelte.ts の isConnectionRunning ガード) ため、接続ごとに
+/// 最後に登録された実行のみをキャンセル対象として保持すれば十分。
+#[derive(Default)]
+pub struct CancelRegistry {
+    running: std::sync::Mutex<HashMap<String, RunningQuery>>,
+    next_id: AtomicU64,
+}
+
+impl CancelRegistry {
+    /// 実行開始を登録する。返り値のガードの drop で登録が解除される。
+    fn register(
+        &self,
+        connection: &str,
+        target: CancelTarget,
+        cancelled: Arc<AtomicBool>,
+    ) -> RunningQueryGuard<'_> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.running.lock().unwrap().insert(
+            connection.to_string(),
+            RunningQuery {
+                id,
+                target,
+                cancelled: cancelled.clone(),
+            },
+        );
+        RunningQueryGuard {
+            registry: self,
+            connection: connection.to_string(),
+            id,
+            cancelled,
+        }
+    }
+
+    /// 接続で実行中のクエリにキャンセルを要求する。
+    /// 実行中のクエリが無ければ何もせず false を返す。
+    /// クエリが直前に完了していた場合でも、pg_cancel_backend / KILL QUERY
+    /// はアイドルなセッションへの no-op になるため安全 (接続を壊す
+    /// KILL CONNECTION は使わない)。
+    pub async fn cancel(&self, connection: &str) -> Result<bool, AppError> {
+        // Mutex ガードを await をまたいで保持しないよう、
+        // 発行に必要な情報だけ取り出してからロックを解放する
+        enum CancelAction {
+            Postgres { pid: i32, pool: sqlx::PgPool },
+            MySql { connection_id: u64, pool: sqlx::MySqlPool },
+            None,
+        }
+        let action = {
+            let running = self.running.lock().unwrap();
+            let Some(query) = running.get(connection) else {
+                return Ok(false);
+            };
+            query.cancelled.store(true, Ordering::SeqCst);
+            match &query.target {
+                CancelTarget::Postgres { pid, pool } => CancelAction::Postgres {
+                    pid: *pid,
+                    pool: pool.clone(),
+                },
+                CancelTarget::MySql {
+                    connection_id,
+                    pool,
+                } => CancelAction::MySql {
+                    connection_id: *connection_id,
+                    pool: pool.clone(),
+                },
+                CancelTarget::Sqlite => CancelAction::None,
+            }
+        };
+        match action {
+            CancelAction::Postgres { pid, pool } => {
+                sqlx::query("SELECT pg_cancel_backend($1)")
+                    .bind(pid)
+                    .execute(&pool)
+                    .await?;
+            }
+            CancelAction::MySql {
+                connection_id,
+                pool,
+            } => {
+                // KILL はプレースホルダを使えないが、connection_id は
+                // サーバーが返した数値なので直接埋め込んで問題ない
+                sqlx::query(&format!("KILL QUERY {connection_id}"))
+                    .execute(&pool)
+                    .await?;
+            }
+            CancelAction::None => {}
+        }
+        Ok(true)
+    }
+
+    /// (テスト用) 接続の実行が登録されているかを返す
+    #[cfg(test)]
+    fn is_running(&self, connection: &str) -> bool {
+        self.running.lock().unwrap().contains_key(connection)
+    }
+}
+
+/// 実行終了時にレジストリから登録を外すガード。
+/// 登録後に同じ接続で新しい実行が登録し直された場合 (id 不一致) は
+/// 新しい登録を消さないよう何もしない。
+struct RunningQueryGuard<'a> {
+    registry: &'a CancelRegistry,
+    connection: String,
+    id: u64,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl RunningQueryGuard<'_> {
+    /// この実行にキャンセル要求があったかを返す
+    fn was_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for RunningQueryGuard<'_> {
+    fn drop(&mut self) {
+        let mut running = self.registry.running.lock().unwrap();
+        if running
+            .get(&self.connection)
+            .is_some_and(|q| q.id == self.id)
+        {
+            running.remove(&self.connection);
         }
     }
 }
@@ -248,19 +420,115 @@ async fn connect(
     }
 }
 
-/// SQL を実行して結果を返す。
-/// 行を返す文 (SELECT 等) は max_rows 件まで取得し、
-/// それ以外 (INSERT / UPDATE 等) は affected_rows を返す。
-/// readonly が true の場合、読み取り系以外の文は実行せずエラーを返す。
-pub async fn run_query(
+/// SQL を実行して結果を返す (テスト用の非キャンセル版ラッパー)。
+/// アプリ本体はキャンセル対応の run_query_cancellable を使う。
+#[cfg(test)]
+async fn run_query(
     pool: &DbPool,
     sql: &str,
     max_rows: usize,
     auto_limit: Option<u64>,
     readonly: bool,
 ) -> Result<QueryResult, AppError> {
+    let mut conn = DbConnection::acquire(pool).await?;
+    run_query_on(&mut conn, sql, max_rows, auto_limit, readonly).await
+}
+
+/// SQL を実行して結果を返す (キャンセル対応版)。
+/// 実行専用のコネクションをプールから確保し、実行前にエンジン別の
+/// キャンセル対象 (Postgres は backend PID、MySQL は CONNECTION_ID、
+/// SQLite は中断フラグ付き progress handler) を registry に登録してから
+/// 実行する。キャンセル要求後にクエリがエラーで終わった場合は
+/// AppError::Cancelled を返す。キャンセルはサーバー側の文の停止のみで
+/// 接続は切断しないため、コネクションは健全なままプールへ戻り、
+/// 同じ接続で次のクエリを正常に実行できる。
+pub async fn run_query_cancellable(
+    pool: &DbPool,
+    registry: &CancelRegistry,
+    connection_name: &str,
+    sql: &str,
+    max_rows: usize,
+    auto_limit: Option<u64>,
+    readonly: bool,
+) -> Result<QueryResult, AppError> {
+    let mut conn = DbConnection::acquire(pool).await?;
+    let cancelled = Arc::new(AtomicBool::new(false));
+
+    // 実行前にキャンセル対象を控える
+    let target = match (&mut conn, pool) {
+        (DbConnection::Postgres(c), DbPool::Postgres(p)) => {
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut **c)
+                .await?;
+            CancelTarget::Postgres {
+                pid,
+                pool: p.clone(),
+            }
+        }
+        (DbConnection::MySql(c), DbPool::MySql(p)) => {
+            // CONNECTION_ID() は BIGINT UNSIGNED だが、実装差異に備えて
+            // i64 でのデコードにもフォールバックする
+            let row = sqlx::query("SELECT CONNECTION_ID()")
+                .fetch_one(&mut **c)
+                .await?;
+            let connection_id: u64 = match row.try_get::<u64, _>(0) {
+                Ok(id) => id,
+                Err(_) => row.try_get::<i64, _>(0)? as u64,
+            };
+            CancelTarget::MySql {
+                connection_id,
+                pool: p.clone(),
+            }
+        }
+        (DbConnection::Sqlite(c), _) => {
+            // フラグが立ったら progress handler が false を返し、
+            // 実行中の文が SQLITE_INTERRUPT で中断される
+            let flag = cancelled.clone();
+            c.lock_handle().await?.set_progress_handler(
+                SQLITE_PROGRESS_HANDLER_OPS,
+                move || !flag.load(Ordering::SeqCst),
+            );
+            CancelTarget::Sqlite
+        }
+        // acquire はプールと同じエンジンのコネクションしか返さない
+        _ => unreachable!("connection engine mismatch"),
+    };
+
+    let guard = registry.register(connection_name, target, cancelled);
+    let result = run_query_on(&mut conn, sql, max_rows, auto_limit, readonly).await;
+    let was_cancelled = guard.was_cancelled();
+    drop(guard);
+
+    // SQLite: progress handler をプールへ返す前に必ず外す。
+    // 外し損ねるとフラグの立ったハンドラが残り、このコネクションの
+    // 次のクエリが即座に中断されてしまう。
+    // (lock_handle が失敗するのはワーカースレッドが死んでいる場合のみで、
+    //  その場合コネクション自体が使えないためプール側で破棄される)
+    if let DbConnection::Sqlite(c) = &mut conn {
+        if let Ok(mut handle) = c.lock_handle().await {
+            handle.remove_progress_handler();
+        }
+    }
+
+    // キャンセル要求後のエラーは「キャンセルされた」として返す
+    // (キャンセルが間に合わずクエリが完了していた場合は成功結果を返す)
+    if was_cancelled && result.is_err() {
+        return Err(AppError::Cancelled);
+    }
+    result
+}
+
+/// run_query の本体。確保済みのコネクション上で実行する。
+async fn run_query_on(
+    conn: &mut DbConnection,
+    sql: &str,
+    max_rows: usize,
+    auto_limit: Option<u64>,
+    readonly: bool,
+) -> Result<QueryResult, AppError> {
+    let engine = conn.engine();
     // psql 風メタコマンド (\l, \dt など) はカタログ照会 SQL に変換して実行する
-    let translated = crate::meta_commands::translate(pool.engine(), sql)?;
+    let translated = crate::meta_commands::translate(engine, sql)?;
     let sql = translated.as_deref().unwrap_or(sql);
 
     if leading_keyword(sql).is_empty() {
@@ -270,7 +538,7 @@ pub async fn run_query(
     // readonly 接続では読み取り系の文のみ許可する。
     // メタコマンドは読み取り系のカタログ照会にしか変換されないため、
     // 変換後の SQL はこの判定を常に通る。
-    if readonly && !is_readonly_allowed(sql, pool.engine()) {
+    if readonly && !is_readonly_allowed(sql, engine) {
         return Err(AppError::Readonly(
             "This connection is read-only (readonly: true in config). \
              Statement was not executed."
@@ -286,11 +554,11 @@ pub async fn run_query(
         Some(limit)
             if limit > 0
                 && translated.is_none()
-                && should_auto_limit(sql, pool.engine()) =>
+                && should_auto_limit(sql, engine) =>
         {
             // 末尾のコメント・セミコロンを除いた本体の直後に付与する
             // (コメントの後ろに付けると LIMIT がコメントに飲み込まれる)
-            let body = &sql[..scan_sql(sql, pool.engine()).body_end];
+            let body = &sql[..scan_sql(sql, engine).body_end];
             limited_sql = format!("{body} LIMIT {limit}");
             applied_limit = Some(limit);
             limited_sql.as_str()
@@ -300,10 +568,10 @@ pub async fn run_query(
     let started = Instant::now();
 
     if !is_fetch_statement(sql) && !contains_returning(sql) {
-        let affected = match pool {
-            DbPool::MySql(p) => p.execute(sql).await?.rows_affected(),
-            DbPool::Postgres(p) => p.execute(sql).await?.rows_affected(),
-            DbPool::Sqlite(p) => p.execute(sql).await?.rows_affected(),
+        let affected = match &mut *conn {
+            DbConnection::MySql(c) => (&mut **c).execute(sql).await?.rows_affected(),
+            DbConnection::Postgres(c) => (&mut **c).execute(sql).await?.rows_affected(),
+            DbConnection::Sqlite(c) => (&mut **c).execute(sql).await?.rows_affected(),
         };
         return Ok(QueryResult {
             columns: vec![],
@@ -343,25 +611,25 @@ pub async fn run_query(
         }};
     }
 
-    let (mut columns, rows, truncated) = match pool {
-        DbPool::MySql(p) => fetch_rows!(p, mysql_value_to_json),
-        DbPool::Postgres(p) => fetch_rows!(p, pg_value_to_json),
-        DbPool::Sqlite(p) => fetch_rows!(p, sqlite_value_to_json),
+    let (mut columns, rows, truncated) = match &mut *conn {
+        DbConnection::MySql(c) => fetch_rows!(&mut **c, mysql_value_to_json),
+        DbConnection::Postgres(c) => fetch_rows!(&mut **c, pg_value_to_json),
+        DbConnection::Sqlite(c) => fetch_rows!(&mut **c, sqlite_value_to_json),
     };
 
     // 0 行の結果でも列ヘッダを表示できるよう、describe で列情報を補完する。
     // SHOW 等 prepare できない文では失敗することがあるため、エラーは無視する。
     if columns.is_empty() {
-        let described: Result<Vec<String>, sqlx::Error> = match pool {
-            DbPool::MySql(p) => p
+        let described: Result<Vec<String>, sqlx::Error> = match &mut *conn {
+            DbConnection::MySql(c) => (&mut **c)
                 .describe(sql)
                 .await
                 .map(|d| d.columns().iter().map(|c| c.name().to_string()).collect()),
-            DbPool::Postgres(p) => p
+            DbConnection::Postgres(c) => (&mut **c)
                 .describe(sql)
                 .await
                 .map(|d| d.columns().iter().map(|c| c.name().to_string()).collect()),
-            DbPool::Sqlite(p) => p
+            DbConnection::Sqlite(c) => (&mut **c)
                 .describe(sql)
                 .await
                 .map(|d| d.columns().iter().map(|c| c.name().to_string()).collect()),
@@ -1185,6 +1453,166 @@ mod tests {
             .unwrap();
         assert_eq!(result.row_count, 3);
         assert_eq!(result.applied_limit, None);
+    }
+
+    /// テスト用の 1 接続 SQLite プールを作る
+    async fn make_test_pool() -> DbPool {
+        // :memory: はコネクションごとに別 DB になるため、プールを 1 接続に固定する
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .in_memory(true),
+            )
+            .await
+            .unwrap();
+        DbPool::Sqlite(pool)
+    }
+
+    #[tokio::test]
+    async fn test_cancel_registry_no_running_query() {
+        let registry = CancelRegistry::default();
+        // 実行中のクエリが無ければ false
+        assert!(!registry.cancel("nothing").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_registry_register_and_cancel() {
+        let registry = CancelRegistry::default();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let guard = registry.register("conn-a", CancelTarget::Sqlite, cancelled.clone());
+        assert!(registry.is_running("conn-a"));
+        assert!(!guard.was_cancelled());
+
+        // キャンセル要求でフラグが立つ
+        assert!(registry.cancel("conn-a").await.unwrap());
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert!(guard.was_cancelled());
+
+        // 別接続には影響しない
+        assert!(!registry.cancel("conn-b").await.unwrap());
+
+        // ガードの drop で登録が外れる
+        drop(guard);
+        assert!(!registry.is_running("conn-a"));
+        assert!(!registry.cancel("conn-a").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_registry_stale_guard_keeps_newer_entry() {
+        let registry = CancelRegistry::default();
+        let old_guard = registry.register(
+            "conn-a",
+            CancelTarget::Sqlite,
+            Arc::new(AtomicBool::new(false)),
+        );
+        // 同じ接続で新しい実行が登録された場合、古いガードの drop で
+        // 新しい登録が消えてはならない
+        let new_flag = Arc::new(AtomicBool::new(false));
+        let new_guard = registry.register("conn-a", CancelTarget::Sqlite, new_flag.clone());
+        drop(old_guard);
+        assert!(registry.is_running("conn-a"));
+
+        // キャンセルは新しい実行に届く
+        assert!(registry.cancel("conn-a").await.unwrap());
+        assert!(new_flag.load(Ordering::SeqCst));
+        drop(new_guard);
+        assert!(!registry.is_running("conn-a"));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_sqlite_query_and_rerun_on_same_connection() {
+        let pool = make_test_pool().await;
+        let registry = Arc::new(CancelRegistry::default());
+
+        // 重いクエリ (WITH RECURSIVE の大量生成) を別タスクで実行する
+        let heavy_sql = "WITH RECURSIVE c(x) AS (\
+             SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 100000000\
+         ) SELECT count(*) FROM c";
+        let task_pool = pool.clone();
+        let task_registry = registry.clone();
+        let handle = tokio::spawn(async move {
+            run_query_cancellable(
+                &task_pool,
+                &task_registry,
+                "test-conn",
+                heavy_sql,
+                10,
+                None,
+                false,
+            )
+            .await
+        });
+
+        // 実行が登録されるまで待つ (登録はクエリ開始直前に行われる)
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while !registry.is_running("test-conn") {
+            assert!(Instant::now() < deadline, "query was not registered in time");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // キャンセル要求 → progress handler が中断し、Cancelled で返る
+        assert!(registry.cancel("test-conn").await.unwrap());
+        let result = handle.await.unwrap();
+        assert!(
+            matches!(result, Err(AppError::Cancelled)),
+            "expected Cancelled, got: {result:?}"
+        );
+        // フロントに渡る文字列表現も確認する
+        assert_eq!(AppError::Cancelled.to_string(), "Query cancelled");
+
+        // 実行終了で登録は解除されている
+        assert!(!registry.is_running("test-conn"));
+
+        // 同じ接続 (max_connections=1 なので同一コネクション) で
+        // 次のクエリが正常に実行できる = プールの接続が壊れていない
+        let result =
+            run_query_cancellable(&pool, &registry, "test-conn", "SELECT 1", 10, None, false)
+                .await
+                .unwrap();
+        assert_eq!(result.row_count, 1);
+        assert_eq!(result.rows[0][0], serde_json::json!(1));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_after_completion_does_not_affect_next_query() {
+        let pool = make_test_pool().await;
+        let registry = Arc::new(CancelRegistry::default());
+
+        // 完了済みのクエリ (登録解除済み) へのキャンセルは no-op
+        let result =
+            run_query_cancellable(&pool, &registry, "test-conn", "SELECT 1", 10, None, false)
+                .await
+                .unwrap();
+        assert_eq!(result.row_count, 1);
+        assert!(!registry.cancel("test-conn").await.unwrap());
+
+        // その後のクエリも正常に実行できる
+        let result =
+            run_query_cancellable(&pool, &registry, "test-conn", "SELECT 2", 10, None, false)
+                .await
+                .unwrap();
+        assert_eq!(result.rows[0][0], serde_json::json!(2));
+    }
+
+    #[tokio::test]
+    async fn test_run_query_cancellable_normal_error_is_not_cancelled() {
+        let pool = make_test_pool().await;
+        let registry = CancelRegistry::default();
+
+        // キャンセル要求無しの失敗は Cancelled にならず DB エラーのまま
+        let result = run_query_cancellable(
+            &pool,
+            &registry,
+            "test-conn",
+            "SELECT * FROM no_such_table",
+            10,
+            None,
+            false,
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::Db(_))), "got: {result:?}");
     }
 
     #[tokio::test]
