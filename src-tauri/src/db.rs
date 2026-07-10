@@ -35,6 +35,8 @@ pub struct QueryResult {
     pub affected_rows: Option<u64>,
     pub truncated: bool,
     pub elapsed_ms: u64,
+    /// 自動付与した LIMIT の値 (付与していなければ None)
+    pub applied_limit: Option<u64>,
 }
 
 /// 接続名ごとのプールと SSH トンネルを保持するマネージャ。
@@ -253,6 +255,7 @@ pub async fn run_query(
     pool: &DbPool,
     sql: &str,
     max_rows: usize,
+    auto_limit: Option<u64>,
 ) -> Result<QueryResult, AppError> {
     // psql 風メタコマンド (\l, \dt など) はカタログ照会 SQL に変換して実行する
     let translated = crate::meta_commands::translate(pool.engine(), sql)?;
@@ -261,6 +264,20 @@ pub async fn run_query(
     if leading_keyword(sql).is_empty() {
         return Err(AppError::Config("The SQL statement is empty".into()));
     }
+
+    // LIMIT 未指定の SELECT にはデフォルトの LIMIT を付与する
+    // (メタコマンド変換後の SQL には適用しない)
+    let mut applied_limit = None;
+    let limited_sql;
+    let sql = match auto_limit {
+        Some(limit) if limit > 0 && translated.is_none() && should_auto_limit(sql) => {
+            let body = sql.trim_end().trim_end_matches(';').trim_end();
+            limited_sql = format!("{body} LIMIT {limit}");
+            applied_limit = Some(limit);
+            limited_sql.as_str()
+        }
+        _ => sql,
+    };
     let started = Instant::now();
 
     if !is_fetch_statement(sql) && !contains_returning(sql) {
@@ -276,6 +293,7 @@ pub async fn run_query(
             affected_rows: Some(affected),
             truncated: false,
             elapsed_ms: started.elapsed().as_millis() as u64,
+            applied_limit: None,
         });
     }
 
@@ -341,6 +359,7 @@ pub async fn run_query(
         affected_rows: None,
         truncated,
         elapsed_ms: started.elapsed().as_millis() as u64,
+        applied_limit,
     })
 }
 
@@ -404,6 +423,73 @@ fn leading_keyword(sql: &str) -> String {
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
         .collect::<String>()
         .to_ascii_lowercase()
+}
+
+/// 文字列リテラル (' " `) とコメント (-- /* */) を除去した SQL を小文字で返す。
+/// キーワード判定の誤検知 (リテラル内の LIMIT 等) を防ぐための前処理。
+fn strip_sql_noise(sql: &str) -> String {
+    let mut result = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' | '`' => {
+                // 対応する引用符まで読み飛ばす ('' のような二重化エスケープ対応)
+                while let Some(inner) = chars.next() {
+                    if inner == c {
+                        if chars.peek() == Some(&c) {
+                            chars.next();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                result.push(' ');
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                for inner in chars.by_ref() {
+                    if inner == '\n' {
+                        break;
+                    }
+                }
+                result.push(' ');
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut prev = ' ';
+                for inner in chars.by_ref() {
+                    if prev == '*' && inner == '/' {
+                        break;
+                    }
+                    prev = inner;
+                }
+                result.push(' ');
+            }
+            _ => result.push(c.to_ascii_lowercase()),
+        }
+    }
+    result
+}
+
+/// デフォルト LIMIT を安全に付与できる文かを判定する。
+/// 対象は SELECT 系のみ。LIMIT / FETCH / OFFSET / FOR UPDATE / INTO /
+/// WITH ... INSERT 等の語を含む場合は、構文エラーや意味の変化を避けるため
+/// 付与しない (保守的側に倒す。スキップしてもクライアント側の max_rows
+/// 打ち切りが安全網になる)。
+fn should_auto_limit(sql: &str) -> bool {
+    if !matches!(
+        leading_keyword(sql).as_str(),
+        "select" | "with" | "values" | "table"
+    ) {
+        return false;
+    }
+    let cleaned = strip_sql_noise(sql);
+    let veto_words = [
+        "limit", "fetch", "offset", "for", "into", "insert", "update", "delete",
+        "lock", "returning",
+    ];
+    !cleaned
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|word| veto_words.contains(&word))
 }
 
 /// RETURNING 句を含むかを単語境界で判定する。
@@ -713,6 +799,36 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_sql_noise() {
+        assert_eq!(strip_sql_noise("SELECT 'limit' FROM t"), "select   from t");
+        assert_eq!(strip_sql_noise("SELECT a -- limit\nFROM t"), "select a  from t");
+        assert_eq!(strip_sql_noise("SELECT /* limit */ a"), "select   a");
+        assert_eq!(strip_sql_noise("SELECT 'it''s' FROM t"), "select   from t");
+    }
+
+    #[test]
+    fn test_should_auto_limit() {
+        assert!(should_auto_limit("SELECT * FROM users"));
+        assert!(should_auto_limit("WITH x AS (SELECT 1) SELECT * FROM x"));
+        // リテラル内の limit は無視して付与できる
+        assert!(should_auto_limit("SELECT 'limit' FROM t"));
+        // 単語境界: limits というテーブル名は veto しない
+        assert!(should_auto_limit("SELECT * FROM limits"));
+        // 既に LIMIT / FETCH / OFFSET がある
+        assert!(!should_auto_limit("SELECT * FROM t LIMIT 10"));
+        assert!(!should_auto_limit("SELECT * FROM t FETCH FIRST 10 ROWS ONLY"));
+        assert!(!should_auto_limit("SELECT * FROM t OFFSET 5"));
+        // サブクエリ内の LIMIT も保守的にスキップ
+        assert!(!should_auto_limit("SELECT * FROM (SELECT 1 LIMIT 3) s"));
+        // ロック句・DML 混じりの WITH
+        assert!(!should_auto_limit("SELECT * FROM t FOR UPDATE"));
+        assert!(!should_auto_limit("WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x"));
+        // SELECT 系以外
+        assert!(!should_auto_limit("SHOW TABLES"));
+        assert!(!should_auto_limit("UPDATE t SET a = 1"));
+    }
+
+    #[test]
     fn test_contains_returning() {
         assert!(contains_returning("INSERT INTO t (a) VALUES (1) RETURNING id"));
         assert!(contains_returning("DELETE FROM t returning *"));
@@ -761,6 +877,7 @@ mod tests {
             &pool,
             "CREATE TABLE t (id INTEGER, name TEXT, score REAL)",
             10,
+            None,
         )
         .await
         .unwrap();
@@ -770,12 +887,13 @@ mod tests {
             &pool,
             "INSERT INTO t VALUES (1, 'alice', 1.5), (2, 'bob', NULL)",
             10,
+            None,
         )
         .await
         .unwrap();
         assert_eq!(result.affected_rows, Some(2));
 
-        let result = run_query(&pool, "SELECT * FROM t ORDER BY id", 10)
+        let result = run_query(&pool, "SELECT * FROM t ORDER BY id", 10, None)
             .await
             .unwrap();
         assert_eq!(result.columns, vec!["id", "name", "score"]);
@@ -787,14 +905,14 @@ mod tests {
         assert!(!result.truncated);
 
         // max_rows での切り詰め
-        let result = run_query(&pool, "SELECT * FROM t ORDER BY id", 1)
+        let result = run_query(&pool, "SELECT * FROM t ORDER BY id", 1, None)
             .await
             .unwrap();
         assert_eq!(result.row_count, 1);
         assert!(result.truncated);
 
         // 0 行の SELECT でも列ヘッダが返る (describe による補完)
-        let result = run_query(&pool, "SELECT * FROM t WHERE id = -1", 10)
+        let result = run_query(&pool, "SELECT * FROM t WHERE id = -1", 10, None)
             .await
             .unwrap();
         assert_eq!(result.row_count, 0);
@@ -805,6 +923,7 @@ mod tests {
             &pool,
             "INSERT INTO t VALUES (3, 'dave', 2.0) RETURNING id, name",
             10,
+            None,
         )
         .await
         .unwrap();
@@ -812,11 +931,11 @@ mod tests {
         assert_eq!(result.rows[0][1], serde_json::json!("dave"));
 
         // psql 風メタコマンドが変換されて実行される
-        let result = run_query(&pool, "\\dt", 10).await.unwrap();
+        let result = run_query(&pool, "\\dt", 10, None).await.unwrap();
         assert_eq!(result.row_count, 1);
         assert_eq!(result.rows[0][0], serde_json::json!("t"));
 
-        let result = run_query(&pool, "\\d t", 10).await.unwrap();
+        let result = run_query(&pool, "\\d t", 10, None).await.unwrap();
         // PRAGMA table_info は name カラム (index 1) にカラム名を返す
         let column_names: Vec<&str> = result
             .rows
@@ -826,6 +945,24 @@ mod tests {
         assert_eq!(column_names, vec!["id", "name", "score"]);
 
         // 未対応メタコマンドはエラー
-        assert!(run_query(&pool, "\\du", 10).await.is_err());
+        assert!(run_query(&pool, "\\du", 10, None).await.is_err());
+
+        // 自動 LIMIT: LIMIT 未指定の SELECT に付与される (末尾 ; も処理)
+        let result = run_query(&pool, "SELECT * FROM t ORDER BY id;", 10, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(result.row_count, 2);
+        assert_eq!(result.applied_limit, Some(2));
+
+        // 既に LIMIT がある場合は付与しない
+        let result = run_query(&pool, "SELECT * FROM t LIMIT 1", 10, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(result.row_count, 1);
+        assert_eq!(result.applied_limit, None);
+
+        // メタコマンドには適用しない
+        let result = run_query(&pool, "\\dt", 10, Some(2)).await.unwrap();
+        assert_eq!(result.applied_limit, None);
     }
 }

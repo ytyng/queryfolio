@@ -44,6 +44,7 @@ sql_servers:
 
 # Optional
 sqlfiles_dir: ~/queries
+default_limit: 500   # auto-appended to SELECTs without LIMIT (0 = disabled)
 ```
 
 The `QUERYFOLIO_CONFIG_YAML` environment variable overrides the whole config file (for development; GUI apps launched from Finder do not inherit shell env vars).

@@ -246,6 +246,15 @@ impl AppConfig {
         Ok(yml)
     }
 
+    /// LIMIT 未指定の SELECT に自動付与する行数上限。
+    /// 省略時は 500。0 を指定すると無効。
+    pub fn default_limit(&self) -> u64 {
+        self.doc
+            .get("default_limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(500)
+    }
+
     /// クエリファイルの保存ディレクトリを解決する。
     pub fn resolve_sqlfiles_dir(&self) -> Result<PathBuf, AppError> {
         match self.doc.get("sqlfiles_dir").and_then(|v| v.as_str()) {
@@ -708,6 +717,16 @@ sql_servers:
         let result = config.resolve_servers().await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("recursive"));
+    }
+
+    #[test]
+    fn test_default_limit() {
+        let config = config_from_yaml("sql_servers: []\n");
+        assert_eq!(config.default_limit(), 500);
+        let config = config_from_yaml("sql_servers: []\ndefault_limit: 100\n");
+        assert_eq!(config.default_limit(), 100);
+        let config = config_from_yaml("sql_servers: []\ndefault_limit: 0\n");
+        assert_eq!(config.default_limit(), 0);
     }
 
     #[test]
