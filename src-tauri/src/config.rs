@@ -65,6 +65,19 @@ sql_servers: []
 # sqlfiles_dir: ~/queries
 "#;
 
+/// 実在する設定ファイルのパスを返す。config.yml / config.yaml のどちらも
+/// 無ければ None。
+pub fn existing_config_path() -> Result<Option<PathBuf>, AppError> {
+    let dir = app_config_dir()?;
+    for name in ["config.yml", "config.yaml"] {
+        let path = dir.join(name);
+        if path.exists() {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
 /// config.yml / config.yaml が無ければテンプレートを作成する。
 /// 作成した場合は Some(作成パス) を返す。既に存在する場合と、
 /// QUERYFOLIO_CONFIG_YAML 環境変数で上書き中の場合は None。

@@ -159,13 +159,58 @@ fn ensure_config_file() -> Result<Option<String>, AppError> {
     config::ensure_config_file()
 }
 
+/// config.yml (無ければ設定フォルダ) を Finder 等のファイルマネージャで表示する。
+fn reveal_config_folder() -> Result<(), AppError> {
+    let target = match config::existing_config_path()? {
+        Some(path) => path,
+        None => config::app_config_dir()?,
+    };
+    tauri_plugin_opener::reveal_item_in_dir(&target)
+        .map_err(|e| AppError::Config(format!("Failed to reveal {}: {e}", target.display())))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    use tauri::menu::{Menu, MenuItemBuilder, SubmenuBuilder};
+    use tauri::Emitter;
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         // 終了時のウインドウサイズ・位置を保存し、起動時に復元する
         .plugin(tauri_plugin_window_state::Builder::default().build())
+        .setup(|app| {
+            // デフォルトメニューに Config サブメニューを追加する
+            let menu = Menu::default(app.handle())?;
+            let reload_item = MenuItemBuilder::with_id("reload_config_file", "Reload config file")
+                .accelerator("CmdOrCtrl+R")
+                .build(app)?;
+            let reveal_item =
+                MenuItemBuilder::with_id("reveal_config_folder", "Reveal config folder")
+                    .build(app)?;
+            let config_menu = SubmenuBuilder::new(app, "Config")
+                .item(&reload_item)
+                .item(&reveal_item)
+                .build()?;
+            menu.append(&config_menu)?;
+            app.set_menu(menu)?;
+            Ok(())
+        })
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "reload_config_file" => {
+                // 再読込はフロントの状態 (選択・未保存編集) と連動するため、
+                // イベントで通知してフロント側の reloadConnections に任せる
+                if let Err(e) = app.emit("menu-reload-config", ()) {
+                    eprintln!("[menu] failed to emit reload event: {e}");
+                }
+            }
+            "reveal_config_folder" => {
+                if let Err(e) = reveal_config_folder() {
+                    eprintln!("[menu] {e}");
+                }
+            }
+            _ => {}
+        })
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             get_connections,
