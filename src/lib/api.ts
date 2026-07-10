@@ -52,6 +52,13 @@ export interface ColumnInfo {
   nullable: boolean;
 }
 
+/// AI 設定の情報 (バックエンドの ai::AiInfo に対応)。api_key は含まれない
+export interface AiInfo {
+  configured: boolean;
+  /// 使用モデル名 (未設定時は空文字)
+  model: string;
+}
+
 export interface ConfigInfo {
   config_path: string;
   config_exists: boolean;
@@ -120,6 +127,14 @@ export const listColumns = (connection: string, table: string) =>
 /// テーブル名 → カラム名リストのマップを返す (SQL 補完用)。
 export const getSchemaMap = (connection: string) =>
   invoke<Record<string, string[]>>("get_schema_map", { connection });
+
+/// AI 設定の情報を返す。`ai:` セクションが無い場合は configured: false。
+/// セクションはあるが不正 (不明 provider 等) な場合は reject される。
+export const getAiInfo = () => invoke<AiInfo>("get_ai_info");
+
+/// 自然言語の指示から SQL を生成して返す (実行はしない)。
+export const aiGenerateSql = (connection: string, instruction: string) =>
+  invoke<string>("ai_generate_sql", { connection, instruction });
 
 export const getConfigInfo = () => invoke<ConfigInfo>("get_config_info");
 

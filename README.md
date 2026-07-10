@@ -12,6 +12,7 @@ SQL client desktop app built with Tauri 2 + SvelteKit. A lightweight alternative
 - CodeMirror 6 SQL editor with per-engine dialect, statement highlighting, and Cmd+Enter to run the statement under the cursor
 - Results grid with CSV / TSV / JSON copy (formula-injection safe)
 - psql-style meta commands (`\l` `\dt` `\dv` `\dn` `\du` `\d [table]`) translated to catalog queries, with MySQL / SQLite equivalents where possible
+- AI SQL generation (OpenAI): describe the query in natural language and the generated SQL is inserted into the editor (never auto-executed). Only the schema (table / column names), engine dialect, and your instruction are sent — never query results
 
 ## Setup
 
@@ -45,7 +46,16 @@ sql_servers:
 # Optional
 sqlfiles_dir: ~/queries
 default_limit: 500   # auto-appended to SELECTs without LIMIT (0 = disabled)
+
+# Optional: AI SQL generation (OpenAI)
+ai:
+  provider: openai   # only openai is supported for now
+  api_key: sk-your-api-key
+  model: gpt-5.1     # optional (default: gpt-5.1)
+  base_url: https://api.openai.com/v1  # optional (for OpenAI-compatible APIs)
 ```
+
+The `ai:` section can live at the top level of the local config file, or at the top level of the connection YAML fetched via a source declaration. When both exist, the fetched YAML wins — so the API key can stay in 1Password together with the connection secrets.
 
 The `QUERYFOLIO_CONFIG_YAML` environment variable overrides the whole config file (for development; GUI apps launched from Finder do not inherit shell env vars).
 

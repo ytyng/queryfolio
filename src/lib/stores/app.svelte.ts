@@ -1,6 +1,6 @@
 import { toast } from "svelte-sonner";
 import * as api from "$lib/api";
-import type { ConnectionInfo, QueryResult } from "$lib/api";
+import type { AiInfo, ConnectionInfo, QueryResult } from "$lib/api";
 
 const AUTO_SAVE_DELAY_MS = 1000;
 
@@ -36,6 +36,12 @@ let loadingConnections = $state(false);
 let dirty = $state(false);
 let schemas = $state<string[]>([]);
 let activeSchema = $state<string | null>(null);
+/// AI 設定の情報 (未取得・取得失敗時は null)
+let aiInfo = $state<AiInfo | null>(null);
+/// AI 設定の解決エラー (不明 provider 等。ボタンの title で案内する)
+let aiError = $state<string | null>(null);
+/// AI で SQL 生成中 (ボタンのスピナー表示・二重送信防止)
+let aiGenerating = $state(false);
 /// SQL 補完用のテーブル名 → カラム名リストのマップ (未取得・取得失敗は null)
 let schemaMap = $state<Record<string, string[]> | null>(null);
 
@@ -56,11 +62,27 @@ const loadConnections = async () => {
   errorMessage = null;
   try {
     connections = await api.getConnections();
+    // 接続設定の解決結果はバックエンドにキャッシュ済みなので、
+    // AI 設定の取得はここでは軽い (取得コマンドの再実行は起きない)
+    await loadAiInfo();
   } catch (e) {
     errorMessage = toErrorMessage(e);
     connections = [];
   } finally {
     loadingConnections = false;
+  }
+};
+
+/// AI 設定の情報 (configured / model) を取得する。
+/// 未設定は configured: false で返り、設定の解決エラー
+/// (不明 provider 等) は aiError に入れて AI ボタンの title で案内する。
+const loadAiInfo = async () => {
+  try {
+    aiInfo = await api.getAiInfo();
+    aiError = null;
+  } catch (e) {
+    aiInfo = null;
+    aiError = toErrorMessage(e);
   }
 };
 
@@ -89,6 +111,8 @@ const reloadConnections = async (): Promise<boolean> => {
   dirty = false;
   schemas = [];
   activeSchema = null;
+  aiInfo = null;
+  aiError = null;
   // 実行中の取得が後から古いマップを書き込まないよう世代を進めて破棄する
   schemaMapGeneration++;
   schemaMap = null;
@@ -290,6 +314,45 @@ const insertSqlSnippet = (sql: string) => {
   }
   const trimmed = editorContent.replace(/\s+$/, "");
   updateEditorContent(trimmed ? `${trimmed}\n\n${sql}\n` : `${sql}\n`);
+};
+
+/// 自然言語の指示から AI で SQL を生成し、エディタに挿入する
+/// (自動実行はしない。ユーザーが内容を確認してから実行する)。
+/// 成功したら true を返す (入力欄を閉じる判定に使う)。
+const generateSql = async (instruction: string): Promise<boolean> => {
+  if (!selectedConnection) {
+    toast.warning("Select a connection first");
+    return false;
+  }
+  if (!selectedFile) {
+    toast.warning("Select or create a query file first");
+    return false;
+  }
+  if (!instruction.trim()) {
+    toast.warning("Enter an instruction for the SQL to generate");
+    return false;
+  }
+  if (aiGenerating) {
+    return false;
+  }
+  aiGenerating = true;
+  try {
+    const sql = await api.aiGenerateSql(selectedConnection, instruction);
+    if (!sql.trim()) {
+      toast.warning("The AI returned an empty response");
+      return false;
+    }
+    insertSqlSnippet(sql);
+    toast.success("Generated SQL inserted into the editor");
+    return true;
+  } catch (e) {
+    toast.error("Failed to generate SQL", {
+      description: toErrorMessage(e),
+    });
+    return false;
+  } finally {
+    aiGenerating = false;
+  }
 };
 
 /// 指定した接続でクエリ実行中のタブがあるかを返す。
@@ -534,11 +597,22 @@ export default {
   get activeSchema() {
     return activeSchema;
   },
+  get aiInfo() {
+    return aiInfo;
+  },
+  get aiError() {
+    return aiError;
+  },
+  get aiGenerating() {
+    return aiGenerating;
+  },
   /// SQL 補完用のテーブル名 → カラム名リストのマップ (未取得なら null)
   get schemaMap() {
     return schemaMap;
   },
   loadConnections,
+  loadAiInfo,
+  generateSql,
   loadSchemaMap,
   reloadConnections,
   selectConnection,

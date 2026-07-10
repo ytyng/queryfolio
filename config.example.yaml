@@ -89,6 +89,16 @@ sql_server_templates:
     user: shared_user
     password: shared_password
 
+# --- AI (自然言語 → SQL 生成) の設定 (任意) ---
+# ここ (ローカル config.yml のトップレベル)、またはソース宣言で取得する
+# 接続 YAML のトップレベルに書ける。両方にある場合は接続 YAML 側を優先する
+# (API キーを 1Password 内の YAML に置けば、ローカルに平文で残らない)。
+# ai:
+#   provider: openai   # 現状 openai のみ対応
+#   api_key: sk-your-api-key
+#   model: gpt-5.1     # 任意 (省略時 gpt-5.1)
+#   base_url: https://api.openai.com/v1  # 任意 (OpenAI 互換 API 用)
+
 # --- LIMIT 未指定の SELECT に自動付与する行数上限 (任意。デフォルト 500、0 で無効) ---
 # default_limit: 500
 
