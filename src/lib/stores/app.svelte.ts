@@ -1,3 +1,4 @@
+import { toast } from "svelte-sonner";
 import * as api from "$lib/api";
 import type { ConnectionInfo, QueryResult } from "$lib/api";
 
@@ -236,13 +237,14 @@ const updateEditorContent = (content: string) => {
 /// 実行結果の書き込み先タブを決める。
 /// アクティブな非ピン留めタブがあれば使い回し、無ければ新規タブを作る。
 /// 上限到達時は最も古い非ピン留めタブを破棄する。
-/// 全タブがピン留めで空きを作れない場合は null を返す (errorMessage 設定済み)。
+/// 全タブがピン留めで空きを作れない場合は null を返す (toast で通知済み)。
 const prepareTargetTab = (): ResultTab | null => {
   const current = resultTabs.find((t) => t.id === activeTabId);
   if (current && !current.pinned) {
     // 同じタブへの二重書き込みを防ぐ (Cmd+Enter 連打対策)
+    // タブ管理系の通知は結果ペインを覆わないよう toast で出す
     if (current.running) {
-      errorMessage = "A query is already running in this tab.";
+      toast.warning("A query is already running in this tab.");
       return null;
     }
     return current;
@@ -255,8 +257,9 @@ const prepareTargetTab = (): ResultTab | null => {
         null,
       );
     if (!oldest) {
-      errorMessage =
-        "All result tabs are pinned. Unpin or close a tab to run a new query.";
+      toast.warning(
+        "All result tabs are pinned. Unpin or close a tab to run a new query.",
+      );
       return null;
     }
     resultTabs = resultTabs.filter((t) => t.id !== oldest.id);
@@ -286,22 +289,31 @@ const executeTab = async (tab: ResultTab) => {
   tab.error = null;
   tab.executedAt = Date.now();
   activeTabId = tab.id;
+  let result: QueryResult | null = null;
+  let error: string | null = null;
   try {
-    tab.result = await api.runQuery(tab.connection, tab.sql);
+    result = await api.runQuery(tab.connection, tab.sql);
   } catch (e) {
-    tab.error = toErrorMessage(e);
-  } finally {
-    tab.running = false;
+    error = toErrorMessage(e);
   }
+  tab.running = false;
+  // 実行中に設定再読込などでタブが破棄されていた場合は、
+  // 存在しないタブ (detached なオブジェクト) へ書き込まず結果を捨てる
+  if (!resultTabs.some((t) => t.id === tab.id)) {
+    return;
+  }
+  tab.result = result;
+  tab.error = error;
 };
 
 const runQuery = async (sql: string) => {
+  // 実行前ガードの通知は、既存の結果タブを覆わないよう toast で出す
   if (!selectedConnection) {
-    errorMessage = "Select a connection first";
+    toast.warning("Select a connection first");
     return;
   }
   if (!sql.trim()) {
-    errorMessage = "There is no SQL statement to run";
+    toast.warning("There is no SQL statement to run");
     return;
   }
   if (!(await flushPendingSave())) {
@@ -344,6 +356,12 @@ const selectResultTab = (id: number) => {
 const closeResultTab = (id: number) => {
   const index = resultTabs.findIndex((t) => t.id === id);
   if (index < 0) {
+    return;
+  }
+  // 実行中のタブを閉じると in-flight のクエリ状態が UI から消えてしまうため拒否する
+  // (閉じるボタンも disabled にしているが、防御的にここでもガードする)
+  if (resultTabs[index].running) {
+    toast.warning("Cannot close a tab while its query is running.");
     return;
   }
   resultTabs = resultTabs.filter((t) => t.id !== id);

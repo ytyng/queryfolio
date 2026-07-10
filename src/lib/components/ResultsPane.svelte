@@ -104,9 +104,12 @@
               </svg>
             </button>
             <button
-              class="rounded px-0.5 text-zinc-500 hover:bg-zinc-700 hover:text-zinc-200"
-              title="Close this tab"
+              class="rounded px-0.5 text-zinc-500 hover:bg-zinc-700 hover:text-zinc-200 disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-zinc-500"
+              title={tab.running
+                ? "Cannot close while the query is running"
+                : "Close this tab"}
               data-annotate="button-result-tab-close-{tab.id}"
+              disabled={tab.running}
               onclick={() => appStore.closeResultTab(tab.id)}
             >
               ×
