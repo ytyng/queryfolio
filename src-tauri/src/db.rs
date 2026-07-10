@@ -11,7 +11,7 @@ use sqlx::{Column, Executor, Row, TypeInfo};
 
 use crate::config::ServerConfig;
 use crate::error::AppError;
-use crate::settings::expand_tilde;
+use crate::config::expand_tilde;
 use crate::tunnel::SshTunnel;
 
 /// 1 回のクエリで取得する行数の上限デフォルト。

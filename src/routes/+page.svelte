@@ -6,7 +6,7 @@
   import FilesPane from "$lib/components/FilesPane.svelte";
   import SqlEditor from "$lib/components/SqlEditor.svelte";
   import ResultsPane from "$lib/components/ResultsPane.svelte";
-  import SettingsModal from "$lib/components/SettingsModal.svelte";
+  import ConfigInfoModal from "$lib/components/ConfigInfoModal.svelte";
 
   let showSettings = $state(false);
   let editor: SqlEditor | undefined = $state();
@@ -59,7 +59,7 @@
 </div>
 
 {#if showSettings}
-  <SettingsModal
+  <ConfigInfoModal
     onClose={() => {
       showSettings = false;
     }}

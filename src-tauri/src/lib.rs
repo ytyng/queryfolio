@@ -2,13 +2,13 @@ mod config;
 mod db;
 mod error;
 mod query_files;
-mod settings;
 mod tunnel;
 
-use config::{ConnectionInfo, ServerConfig};
+use std::path::PathBuf;
+
+use config::{AppConfig, ConfigInfo, ConnectionInfo, ServerConfig};
 use db::{DbManager, DbPool, QueryResult, DEFAULT_MAX_ROWS};
 use error::AppError;
-use settings::AppSettings;
 
 /// アプリ全体の共有状態。
 #[derive(Default)]
@@ -23,8 +23,7 @@ impl AppState {
     async fn find_server(&self, connection: &str) -> Result<ServerConfig, AppError> {
         let mut servers = self.servers.lock().await;
         if servers.is_none() {
-            let app_settings = AppSettings::load()?;
-            *servers = Some(config::load_servers(&app_settings).await?);
+            *servers = Some(AppConfig::load()?.resolve_servers().await?);
         }
         servers
             .as_ref()
@@ -38,12 +37,15 @@ impl AppState {
     }
 }
 
+fn sqlfiles_dir() -> Result<PathBuf, AppError> {
+    AppConfig::load()?.resolve_sqlfiles_dir()
+}
+
 #[tauri::command]
 async fn get_connections(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<ConnectionInfo>, AppError> {
-    let app_settings = AppSettings::load()?;
-    let servers = config::load_servers(&app_settings).await?;
+    let servers = AppConfig::load()?.resolve_servers().await?;
     let infos = servers.iter().map(ConnectionInfo::from).collect();
     *state.servers.lock().await = Some(servers);
     Ok(infos)
@@ -72,14 +74,12 @@ async fn run_query(
 
 #[tauri::command]
 fn list_query_files(connection: String) -> Result<Vec<String>, AppError> {
-    let app_settings = AppSettings::load()?;
-    query_files::list_query_files(&app_settings, &connection)
+    query_files::list_query_files(&sqlfiles_dir()?, &connection)
 }
 
 #[tauri::command]
 fn read_query_file(connection: String, file_name: String) -> Result<String, AppError> {
-    let app_settings = AppSettings::load()?;
-    query_files::read_query_file(&app_settings, &connection, &file_name)
+    query_files::read_query_file(&sqlfiles_dir()?, &connection, &file_name)
 }
 
 #[tauri::command]
@@ -88,30 +88,23 @@ fn write_query_file(
     file_name: String,
     content: String,
 ) -> Result<(), AppError> {
-    let app_settings = AppSettings::load()?;
-    query_files::write_query_file(&app_settings, &connection, &file_name, &content)
+    query_files::write_query_file(&sqlfiles_dir()?, &connection, &file_name, &content)
 }
 
 #[tauri::command]
 fn create_query_file(connection: String, file_name: String) -> Result<String, AppError> {
-    let app_settings = AppSettings::load()?;
-    query_files::create_query_file(&app_settings, &connection, &file_name)
+    query_files::create_query_file(&sqlfiles_dir()?, &connection, &file_name)
 }
 
 #[tauri::command]
 fn delete_query_file(connection: String, file_name: String) -> Result<(), AppError> {
-    let app_settings = AppSettings::load()?;
-    query_files::delete_query_file(&app_settings, &connection, &file_name)
+    query_files::delete_query_file(&sqlfiles_dir()?, &connection, &file_name)
 }
 
+/// 設定の解決結果を返す (情報表示用。機密を含まない)。
 #[tauri::command]
-fn get_settings() -> Result<AppSettings, AppError> {
-    AppSettings::load()
-}
-
-#[tauri::command]
-fn save_settings(settings: AppSettings) -> Result<(), AppError> {
-    settings.save()
+fn get_config_info() -> ConfigInfo {
+    config::config_info()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -129,8 +122,7 @@ pub fn run() {
             write_query_file,
             create_query_file,
             delete_query_file,
-            get_settings,
-            save_settings,
+            get_config_info,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,8 +1,7 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::AppError;
-use crate::settings::AppSettings;
 
 /// パス要素として安全な名前かを検証して返す。
 /// パストラバーサルや不可視ファイルを防ぐ。
@@ -35,26 +34,26 @@ fn normalize_file_name(name: &str) -> Result<String, AppError> {
 }
 
 /// 接続名に対応するクエリファイル保存ディレクトリを返す。
-fn connection_dir(settings: &AppSettings, connection: &str) -> Result<PathBuf, AppError> {
+fn connection_dir(sqlfiles_dir: &Path, connection: &str) -> Result<PathBuf, AppError> {
     let connection = validate_component(connection)?;
-    Ok(settings.resolve_sqlfiles_dir()?.join(connection))
+    Ok(sqlfiles_dir.join(connection))
 }
 
 fn file_path(
-    settings: &AppSettings,
+    sqlfiles_dir: &Path,
     connection: &str,
     file_name: &str,
 ) -> Result<PathBuf, AppError> {
     let file_name = normalize_file_name(file_name)?;
-    Ok(connection_dir(settings, connection)?.join(file_name))
+    Ok(connection_dir(sqlfiles_dir, connection)?.join(file_name))
 }
 
 /// 接続のクエリファイル一覧を返す (名前昇順)。
 pub fn list_query_files(
-    settings: &AppSettings,
+    sqlfiles_dir: &Path,
     connection: &str,
 ) -> Result<Vec<String>, AppError> {
-    let dir = connection_dir(settings, connection)?;
+    let dir = connection_dir(sqlfiles_dir, connection)?;
     if !dir.exists() {
         return Ok(vec![]);
     }
@@ -69,11 +68,11 @@ pub fn list_query_files(
 }
 
 pub fn read_query_file(
-    settings: &AppSettings,
+    sqlfiles_dir: &Path,
     connection: &str,
     file_name: &str,
 ) -> Result<String, AppError> {
-    let path = file_path(settings, connection, file_name)?;
+    let path = file_path(sqlfiles_dir, connection, file_name)?;
     if !path.exists() {
         return Err(AppError::QueryFile(format!(
             "ファイルが見つかりません: {}",
@@ -84,12 +83,12 @@ pub fn read_query_file(
 }
 
 pub fn write_query_file(
-    settings: &AppSettings,
+    sqlfiles_dir: &Path,
     connection: &str,
     file_name: &str,
     content: &str,
 ) -> Result<(), AppError> {
-    let path = file_path(settings, connection, file_name)?;
+    let path = file_path(sqlfiles_dir, connection, file_name)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -99,12 +98,12 @@ pub fn write_query_file(
 
 /// 空のクエリファイルを新規作成し、正規化されたファイル名を返す。
 pub fn create_query_file(
-    settings: &AppSettings,
+    sqlfiles_dir: &Path,
     connection: &str,
     file_name: &str,
 ) -> Result<String, AppError> {
     let normalized = normalize_file_name(file_name)?;
-    let path = file_path(settings, connection, &normalized)?;
+    let path = file_path(sqlfiles_dir, connection, &normalized)?;
     if path.exists() {
         return Err(AppError::QueryFile(format!(
             "同名のファイルが既に存在します: {normalized}"
@@ -118,11 +117,11 @@ pub fn create_query_file(
 }
 
 pub fn delete_query_file(
-    settings: &AppSettings,
+    sqlfiles_dir: &Path,
     connection: &str,
     file_name: &str,
 ) -> Result<(), AppError> {
-    let path = file_path(settings, connection, file_name)?;
+    let path = file_path(sqlfiles_dir, connection, file_name)?;
     if !path.exists() {
         return Err(AppError::QueryFile(format!(
             "ファイルが見つかりません: {}",
@@ -137,16 +136,12 @@ pub fn delete_query_file(
 mod tests {
     use super::*;
 
-    fn test_settings() -> AppSettings {
-        let dir = std::env::temp_dir().join(format!(
+    fn test_dir() -> PathBuf {
+        std::env::temp_dir().join(format!(
             "queryfolio-test-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
-        ));
-        AppSettings {
-            sqlfiles_dir: Some(dir.to_string_lossy().to_string()),
-            ..Default::default()
-        }
+        ))
     }
 
     #[test]
@@ -171,33 +166,38 @@ mod tests {
 
     #[test]
     fn test_query_file_crud() {
-        let settings = test_settings();
+        let dir = test_dir();
         let connection = "test-conn";
 
-        assert_eq!(list_query_files(&settings, connection).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            list_query_files(&dir, connection).unwrap(),
+            Vec::<String>::new()
+        );
 
-        let name = create_query_file(&settings, connection, "my query").unwrap();
+        let name = create_query_file(&dir, connection, "my query").unwrap();
         assert_eq!(name, "my query.sql");
 
         // 同名の再作成はエラー
-        assert!(create_query_file(&settings, connection, "my query").is_err());
+        assert!(create_query_file(&dir, connection, "my query").is_err());
 
-        write_query_file(&settings, connection, &name, "SELECT 1;").unwrap();
+        write_query_file(&dir, connection, &name, "SELECT 1;").unwrap();
         assert_eq!(
-            read_query_file(&settings, connection, &name).unwrap(),
+            read_query_file(&dir, connection, &name).unwrap(),
             "SELECT 1;"
         );
 
         assert_eq!(
-            list_query_files(&settings, connection).unwrap(),
+            list_query_files(&dir, connection).unwrap(),
             vec!["my query.sql"]
         );
 
-        delete_query_file(&settings, connection, &name).unwrap();
-        assert_eq!(list_query_files(&settings, connection).unwrap(), Vec::<String>::new());
+        delete_query_file(&dir, connection, &name).unwrap();
+        assert_eq!(
+            list_query_files(&dir, connection).unwrap(),
+            Vec::<String>::new()
+        );
 
         // 後始末
-        let dir = settings.resolve_sqlfiles_dir().unwrap();
-        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

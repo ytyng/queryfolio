@@ -16,10 +16,11 @@ export interface QueryResult {
   elapsed_ms: number;
 }
 
-export interface AppSettings {
-  config_yaml_path: string | null;
-  config_yaml_getter_command: string | null;
-  sqlfiles_dir: string | null;
+export interface ConfigInfo {
+  config_path: string;
+  config_exists: boolean;
+  source: string;
+  sqlfiles_dir: string;
 }
 
 export const getConnections = () =>
@@ -48,7 +49,4 @@ export const createQueryFile = (connection: string, fileName: string) =>
 export const deleteQueryFile = (connection: string, fileName: string) =>
   invoke<void>("delete_query_file", { connection, fileName });
 
-export const getSettings = () => invoke<AppSettings>("get_settings");
-
-export const saveSettings = (settings: AppSettings) =>
-  invoke<void>("save_settings", { settings });
+export const getConfigInfo = () => invoke<ConfigInfo>("get_config_info");

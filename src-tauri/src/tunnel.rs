@@ -9,7 +9,7 @@ use ssh2::Session;
 
 use crate::config::SshTunnelConfig;
 use crate::error::AppError;
-use crate::settings::expand_tilde;
+use crate::config::expand_tilde;
 
 /// SSH の blocking 操作 (handshake / auth 等) のタイムアウト (ミリ秒)。
 const SSH_TIMEOUT_MS: u32 = 30_000;

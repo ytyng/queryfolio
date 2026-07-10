@@ -1,12 +1,10 @@
-# queryfolio 接続設定のサンプル。
-# sql-agent-mcp-server の config.yaml と互換のフォーマット。
+# queryfolio 設定ファイルのサンプル。
+# ~/.config/queryfolio/config.yml (または config.yaml) に置く。
 #
-# 解決順:
-#   1. QUERYFOLIO_CONFIG_YAML 環境変数 (YAML 文字列リテラル)
-#   2. QUERYFOLIO_CONFIG_YAML_GETTER_COMMAND 環境変数 (実行して stdout を使う)
-#      例: export QUERYFOLIO_CONFIG_YAML_GETTER_COMMAND='op read "op://development/queryfolio/config-yaml"'
-#   3. アプリ設定 (設定画面) の getter command
-#   4. ~/.config/queryfolio/config.yaml (このフォーマットのファイル)
+# 開発・テスト用に QUERYFOLIO_CONFIG_YAML 環境変数でこのファイル全体の内容を
+# 上書きできる (GUI を Finder / Dock から起動した場合、shell の環境変数は渡らない)。
+
+# --- sql_servers: 形式 A (サーバー直書き。sql-agent-mcp-server 互換) ---
 
 sql_servers:
   - name: dev-postgres
@@ -49,7 +47,24 @@ sql_servers:
       private_key_path: ~/.ssh/id_rsa
       # private_key_passphrase: key_passphrase
 
-# 接続情報の雛形。sql_servers 側で template: <名前> を指定して継承できる。
+# --- sql_servers: 形式 B (ソース宣言。command / env / file のどれか 1 つだけ) ---
+# 取得した YAML は sql-agent-mcp-server 互換フォーマット
+# (sql_servers リスト + sql_server_templates) としてパースされる。
+#
+# 1Password から取得 (シェル非経由で実行。パイプ等は使えない):
+# sql_servers:
+#   command: op read "op://development/queryfolio/config-yaml"
+#
+# 環境変数から取得 (GUI 起動では環境変数が渡らないため実質 dev 専用):
+# sql_servers:
+#   env: QUERYFOLIO_CONNECTIONS_YAML
+#
+# 別ファイルから取得:
+# sql_servers:
+#   file: ~/secrets/sql-servers.yaml
+
+# --- 接続情報の雛形 (形式 A の時のみ有効) ---
+# sql_servers 側で template: <名前> を指定して継承できる。
 # サーバー側で指定したキーはテンプレートの同名キーを上書きする (シャローマージ)。
 sql_server_templates:
   - name: my-awesome-sql-host
@@ -59,10 +74,5 @@ sql_server_templates:
     user: shared_user
     password: shared_password
 
-# 上のテンプレートを使う例:
-#
-# sql_servers:
-#   - template: my-awesome-sql-host
-#     name: my-app-db
-#     description: "アプリ本体の DB"
-#     schema: app_db
+# --- クエリファイルの保存先 (任意。デフォルト ~/.config/queryfolio/sqlfiles) ---
+# sqlfiles_dir: ~/queries
