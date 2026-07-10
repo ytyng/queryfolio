@@ -74,5 +74,8 @@ sql_server_templates:
     user: shared_user
     password: shared_password
 
+# --- LIMIT 未指定の SELECT に自動付与する行数上限 (任意。デフォルト 500、0 で無効) ---
+# default_limit: 500
+
 # --- クエリファイルの保存先 (任意。デフォルト ~/.config/queryfolio/sqlfiles) ---
 # sqlfiles_dir: ~/queries

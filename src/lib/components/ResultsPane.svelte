@@ -51,6 +51,15 @@
         </span>
       {:else}
         <span data-annotate="text-row-count">{result.row_count} rows</span>
+        {#if result.applied_limit !== null}
+          <span
+            class="text-zinc-500"
+            title="LIMIT was added automatically (default_limit in config.yml)"
+            data-annotate="text-applied-limit"
+          >
+            LIMIT {result.applied_limit} (auto)
+          </span>
+        {/if}
         {#if result.truncated}
           <span class="text-amber-400" title="Truncated at the row limit">
             (truncated)

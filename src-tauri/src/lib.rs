@@ -17,6 +17,8 @@ struct AppState {
     /// 接続設定のキャッシュ。get_connections で更新される。
     /// パスワード等の機密を含むためフロントエンドには渡さない。
     servers: tokio::sync::Mutex<Option<Vec<ServerConfig>>>,
+    /// default_limit のセッションキャッシュ (Reload config でクリア)。
+    default_limit: tokio::sync::Mutex<Option<u64>>,
     /// クエリファイル保存ディレクトリのセッションキャッシュ。
     /// config.yml は手編集されるため、開いているファイルの保存中に
     /// sqlfiles_dir が変わると未保存内容が新ディレクトリへ書かれてしまう。
@@ -27,6 +29,16 @@ struct AppState {
 }
 
 impl AppState {
+    async fn resolve_default_limit(&self) -> Result<u64, AppError> {
+        let mut cached = self.default_limit.lock().await;
+        if let Some(limit) = *cached {
+            return Ok(limit);
+        }
+        let limit = AppConfig::load()?.default_limit();
+        *cached = Some(limit);
+        Ok(limit)
+    }
+
     async fn resolve_sqlfiles_dir(&self) -> Result<PathBuf, AppError> {
         let mut cached = self.sqlfiles_dir.lock().await;
         if let Some(dir) = cached.as_ref() {
@@ -70,6 +82,7 @@ async fn get_connections(
 async fn reset_connections(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
     *state.servers.lock().await = None;
     *state.sqlfiles_dir.lock().await = None;
+    *state.default_limit.lock().await = None;
     state.db.reset().await;
     Ok(())
 }
@@ -83,7 +96,11 @@ async fn run_query(
 ) -> Result<QueryResult, AppError> {
     let server = state.find_server(&connection).await?;
     let pool: DbPool = state.db.get_pool(&server).await?;
-    db::run_query(&pool, &sql, max_rows.unwrap_or(DEFAULT_MAX_ROWS)).await
+    let auto_limit = match state.resolve_default_limit().await? {
+        0 => None,
+        limit => Some(limit),
+    };
+    db::run_query(&pool, &sql, max_rows.unwrap_or(DEFAULT_MAX_ROWS), auto_limit).await
 }
 
 #[tauri::command]
