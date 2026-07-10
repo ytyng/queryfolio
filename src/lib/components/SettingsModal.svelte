@@ -29,6 +29,11 @@
   });
 
   const submit = async () => {
+    // sqlfiles_dir 変更前に未保存の編集を旧設定のパスへ確定させる
+    if (!(await appStore.flushPendingSave())) {
+      saveError = "未保存の編集を保存できなかったため、設定の保存を中断しました";
+      return;
+    }
     const settings: AppSettings = {
       config_yaml_path: configYamlPath.trim() || null,
       config_yaml_getter_command: configYamlGetterCommand.trim() || null,

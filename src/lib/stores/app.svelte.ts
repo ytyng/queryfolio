@@ -229,6 +229,7 @@ export default {
   },
   loadConnections,
   reloadConnections,
+  flushPendingSave,
   selectConnection,
   selectFile,
   createFile,

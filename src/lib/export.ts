@@ -21,6 +21,10 @@ const escapeFormulaInjection = (value: unknown, text: string): string => {
   return text;
 };
 
+// ヘッダ (カラム名 / エイリアス) は常に文字列なので無条件に判定する
+const escapeHeaderFormula = (header: string): string =>
+  FORMULA_TRIGGER.test(header) ? `'${header}` : header;
+
 const escapeCsvField = (field: string): string => {
   if (/[",\n\r]/.test(field)) {
     return `"${field.replace(/"/g, '""')}"`;
@@ -29,7 +33,9 @@ const escapeCsvField = (field: string): string => {
 };
 
 export const toCsv = (result: QueryResult): string => {
-  const lines = [result.columns.map(escapeCsvField).join(",")];
+  const lines = [
+    result.columns.map((c) => escapeCsvField(escapeHeaderFormula(c))).join(","),
+  ];
   for (const row of result.rows) {
     lines.push(
       row
@@ -43,7 +49,9 @@ export const toCsv = (result: QueryResult): string => {
 export const toTsv = (result: QueryResult): string => {
   const sanitize = (field: string) =>
     field.replace(/\t/g, " ").replace(/\r?\n/g, " ");
-  const lines = [result.columns.map(sanitize).join("\t")];
+  const lines = [
+    result.columns.map((c) => sanitize(escapeHeaderFormula(c))).join("\t"),
+  ];
   for (const row of result.rows) {
     lines.push(
       row
