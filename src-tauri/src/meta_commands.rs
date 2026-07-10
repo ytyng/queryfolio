@@ -116,7 +116,9 @@ fn relation_list_sql(relkinds: &str) -> String {
 fn mysql_meta(command: &str, arg: Option<&str>) -> Result<String, AppError> {
     let sql = match (command, arg) {
         ("\\l" | "\\list", _) => "SHOW DATABASES".to_string(),
-        ("\\dt", _) | ("\\d", None) => "SHOW TABLES".to_string(),
+        // SHOW TABLES はビューも含むため、\dt はベーステーブルに絞る
+        ("\\dt", _) => "SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'".to_string(),
+        ("\\d", None) => "SHOW TABLES".to_string(),
         ("\\dv", _) => "SHOW FULL TABLES WHERE Table_type = 'VIEW'".to_string(),
         ("\\d", Some(name)) => {
             let name = validate_relation_name(name)?;
@@ -145,13 +147,13 @@ fn sqlite_meta(command: &str, arg: Option<&str>) -> Result<String, AppError> {
     let sql = match (command, arg) {
         ("\\l" | "\\list", _) => "PRAGMA database_list".to_string(),
         ("\\dt", _) => "SELECT name, type FROM sqlite_master \
-             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+             WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name"
             .to_string(),
         ("\\dv", _) => "SELECT name, type FROM sqlite_master \
              WHERE type = 'view' ORDER BY name"
             .to_string(),
         ("\\d", None) => "SELECT name, type FROM sqlite_master \
-             WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' \
+             WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
              ORDER BY type, name"
             .to_string(),
         ("\\d", Some(name)) => {
@@ -203,6 +205,10 @@ mod tests {
         );
         assert_eq!(
             translate(Engine::MySql, "\\dt").unwrap().unwrap(),
+            "SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'"
+        );
+        assert_eq!(
+            translate(Engine::MySql, "\\d").unwrap().unwrap(),
             "SHOW TABLES"
         );
         assert_eq!(
@@ -219,6 +225,8 @@ mod tests {
     fn test_sqlite_meta() {
         let sql = translate(Engine::Sqlite, "\\dt").unwrap().unwrap();
         assert!(sql.contains("sqlite_master"));
+        // _ が LIKE ワイルドカード扱いされないよう ESCAPE 句付き
+        assert!(sql.contains("ESCAPE"));
         assert_eq!(
             translate(Engine::Sqlite, "\\d users").unwrap().unwrap(),
             "PRAGMA table_info(\"users\")"
