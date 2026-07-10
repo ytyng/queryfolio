@@ -108,6 +108,7 @@
             appStore.explainQuery(editor?.getCurrentStatement() ?? "")}
           onExplainSql={() =>
             appStore.explainSql(editor?.getCurrentStatement() ?? "")}
+          onFormat={() => editor?.formatCurrentStatement()}
         />
       {/if}
       <div class="min-h-0 flex-[3] border-b border-zinc-700">
