@@ -270,9 +270,7 @@ pub async fn run_query(
     // readonly 接続では読み取り系の文のみ許可する。
     // メタコマンドは読み取り系のカタログ照会にしか変換されないため、
     // 変換後の SQL はこの判定を常に通る。
-    // 弱点: SELECT に副作用のある関数 (nextval 等) までは防げない。
-    // あくまで事故防止のガードである。
-    if readonly && !is_fetch_statement(sql) {
+    if readonly && !is_readonly_allowed(sql, pool.engine()) {
         return Err(AppError::Readonly(
             "This connection is read-only (readonly: true in config). \
              Statement was not executed."
@@ -604,6 +602,32 @@ fn contains_returning(sql: &str) -> bool {
     false
 }
 
+/// readonly 接続で実行を許可する文かを判定する。
+/// 先頭キーワードが読み取り系 (is_fetch_statement) であることに加えて:
+/// - WITH: CTE 本体が DML (WITH ... DELETE 等) の場合を拒否するため、
+///   文字列リテラル・コメントを除去した cleaned に insert / update /
+///   delete / merge の単語が含まれたら拒否する
+/// - SELECT: SELECT INTO (Postgres ではテーブル作成、MySQL では
+///   INTO OUTFILE 等) を拒否するため、into の単語が含まれたら拒否する
+/// リテラル内の単語は scan_sql が除去し、カラム名等への部分一致は
+/// 単語境界の分割で誤検知しない。
+/// 弱点: SELECT に副作用のある関数 (nextval 等) や CALL のプロシージャ内の
+/// 書き込みまでは防げない。あくまで事故防止のガードである。
+fn is_readonly_allowed(sql: &str, engine: Engine) -> bool {
+    if !is_fetch_statement(sql) {
+        return false;
+    }
+    let veto_words: &[&str] = match leading_keyword(sql).as_str() {
+        "with" => &["insert", "update", "delete", "merge"],
+        "select" => &["into"],
+        _ => return true,
+    };
+    let cleaned = scan_sql(sql, engine).cleaned;
+    !cleaned
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|word| veto_words.contains(&word))
+}
+
 /// 行を返す文かどうかを先頭キーワードで判定する。
 fn is_fetch_statement(sql: &str) -> bool {
     matches!(
@@ -863,6 +887,38 @@ mod tests {
         assert!(!is_fetch_statement("UPDATE t SET a = 1"));
         assert!(!is_fetch_statement("DELETE FROM t"));
         assert!(!is_fetch_statement("CREATE TABLE t (a int)"));
+    }
+
+    #[test]
+    fn test_is_readonly_allowed() {
+        let f = |s: &str| is_readonly_allowed(s, Engine::Sqlite);
+        // 読み取り系は許可
+        assert!(f("SELECT * FROM t"));
+        assert!(f("WITH x AS (SELECT 1) SELECT * FROM x"));
+        assert!(f("EXPLAIN SELECT 1"));
+        assert!(f("SHOW TABLES"));
+        assert!(f("PRAGMA table_info(t)"));
+        // 書き込み系は拒否
+        assert!(!f("UPDATE t SET a = 1"));
+        assert!(!f("INSERT INTO t VALUES (1)"));
+        assert!(!f("DROP TABLE t"));
+        // CTE 付き DML は先頭が with でも拒否
+        assert!(!f("WITH old AS (SELECT id FROM t) DELETE FROM t WHERE id IN (SELECT id FROM old)"));
+        assert!(!f("WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x"));
+        assert!(!f("WITH x AS (SELECT 1) UPDATE t SET a = 1"));
+        assert!(!f("with x as (select 1)\nmerge into t using x on true"));
+        // SELECT INTO (Postgres のテーブル作成 / MySQL の INTO OUTFILE) は拒否
+        assert!(!is_readonly_allowed("SELECT * INTO new_table FROM t", Engine::Postgres));
+        assert!(!is_readonly_allowed(
+            "SELECT * FROM t INTO OUTFILE '/tmp/x'",
+            Engine::MySql
+        ));
+        // リテラル内の単語は scan_sql が除去するので誤検知しない
+        assert!(f("WITH x AS (SELECT 'delete') SELECT * FROM x"));
+        assert!(f("SELECT 'into' FROM t"));
+        // 単語境界: 部分一致では拒否しない
+        assert!(f("WITH x AS (SELECT id FROM deleted_items) SELECT * FROM x"));
+        assert!(f("SELECT * FROM intolerant"));
     }
 
     #[test]
@@ -1194,6 +1250,9 @@ mod tests {
             "INSERT INTO t VALUES (3, 'carol') RETURNING id",
             // 先頭コメントの後ろの DML も拒否される
             "-- comment\nUPDATE t SET name = 'y'",
+            // CTE 付き DML は先頭が WITH でも拒否される
+            "WITH x AS (SELECT id FROM t) DELETE FROM t WHERE id IN (SELECT id FROM x)",
+            "WITH x AS (SELECT 9) INSERT INTO t SELECT 9, 'eve' FROM x",
         ] {
             let err = run_query(&pool, sql, 10, None, true).await.unwrap_err();
             let message = err.to_string();

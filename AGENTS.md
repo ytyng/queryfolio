@@ -52,7 +52,7 @@ pnpm tauri build        # リリースビルド
 - ソース宣言は `command:` / `env:` / `file:` の**ちょうど 1 つ** (複数はエラー)。取得した YAML は sql-agent 互換フォーマットとしてパースされ、さらなるソース宣言の再帰は禁止。
 - `command` はシェル非経由 (shlex 分解) で実行。GUI 起動の最小 PATH 対策として /opt/homebrew/bin と /usr/local/bin を補完する。60 秒タイムアウト + kill_on_drop。
 - `default_limit` (任意、デフォルト 500、0 で無効) — LIMIT 未指定の SELECT に自動で `LIMIT n` を付与する (db.rs の should_auto_limit。サブクエリ LIMIT / FOR UPDATE 等は保守的にスキップ)。
-- `readonly: true` (任意、デフォルト false。sql-agent 互換フォーマットへの queryfolio 独自拡張) — その接続で行を返さない文 (INSERT / UPDATE / DELETE / DDL 等) の実行を拒否する。判定は db.rs の leading_keyword ベース (select / with / show / describe / desc / explain / pragma / values / table / call 以外を拒否。メタコマンドは読み取り系のみなので常に許可)。SELECT に副作用のある関数 (nextval 等) までは防げない、あくまで事故防止のガード。
+- `readonly: true` (任意、デフォルト false。sql-agent 互換フォーマットへの queryfolio 独自拡張) — その接続で書き込み系の文 (INSERT / UPDATE / DELETE / DDL 等) の実行を拒否する。判定は db.rs の is_readonly_allowed: leading_keyword が select / with / show / describe / desc / explain / pragma / values / table / call 以外なら拒否し、さらに WITH は CTE 付き DML (insert / update / delete / merge)、SELECT は SELECT INTO を、リテラル・コメント除去済みの単語境界判定で拒否する。メタコマンドは読み取り系のみなので常に許可。SELECT に副作用のある関数 (nextval 等) までは防げない、あくまで事故防止のガード。
 - `sqlfiles_dir` (任意) でクエリファイル保存先を変更できる。デフォルトは `~/.config/queryfolio/sqlfiles/<connection>/<name>.sql`。
 - `QUERYFOLIO_CONFIG_YAML` 環境変数は設定ファイル全体を上書きする開発・テスト用フック (実機 E2E 検証で使用)。
 

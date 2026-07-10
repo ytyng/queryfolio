@@ -32,9 +32,10 @@ sql_servers:
     schema: ~/data/example.sqlite3
 
   # queryfolio 拡張: readonly: true (省略時 false) を指定すると、
-  # 行を返さない文 (INSERT / UPDATE / DELETE / DDL 等) の実行を拒否する。
-  # 先頭キーワードで判定するため、SELECT に副作用のある関数 (nextval 等)
-  # までは防げない。あくまで事故防止のガード。
+  # 書き込み系の文 (INSERT / UPDATE / DELETE / DDL、CTE 付き DML、
+  # SELECT INTO 等) の実行を拒否する。
+  # SELECT に副作用のある関数 (nextval 等) までは防げない。
+  # あくまで事故防止のガード。
   - name: production-replica
     description: "本番レプリカ (読み取り専用)"
     engine: mysql
