@@ -36,14 +36,14 @@ pnpm tauri build        # リリースビルド
 | tunnel.rs | SSH ローカルポートフォワード (known_hosts 検証付き) |
 | query_files.rs | クエリファイル CRUD (パストラバーサル対策) |
 | schema_info.rs | テーブル・カラムのカタログ照会と SchemaCache (接続+スキーマ単位のキャッシュ。スキーマブラウザと SQL 補完用 get_schema_map で共有) |
-| ai.rs | AI 基盤 (AiConfig の解決・OpenAI Chat Completions 呼び出し chat_complete・SQL 生成 / EXPLAIN 解説プロンプト整形・フェンス剥がし)。API キーはフロントに渡さない (get_ai_info は configured / model のみ) |
+| ai.rs | AI 基盤 (AiConfig の解決・OpenAI Chat Completions 呼び出し chat_complete・SQL 生成 / EXPLAIN 解説 / 選択 SQL 解説プロンプト整形・フェンス剥がし)。API キーはフロントに渡さない (get_ai_info は configured / model のみ) |
 | error.rs | AppError (フロントには文字列でシリアライズ) |
 
 ### フロントエンド (src/)
 
 - `lib/api.ts` — invoke の型付きラッパー (バックエンドとの境界)
 - `lib/stores/app.svelte.ts` — Svelte 5 runes ストア (getter + メソッドを default export)
-- `lib/components/` — Toolbar / ConnectionsPane / FilesPane / HistoryPane / TablesPane (スキーマブラウザ) / SqlEditor / EditorToolbar / ResultsPane / CellInspector / ConfigInfoModal (読み取り専用の設定表示) / AiAnalysisModal (EXPLAIN の AI 解説表示)
+- `lib/components/` — Toolbar / ConnectionsPane / FilesPane / HistoryPane / TablesPane (スキーマブラウザ) / SqlEditor / EditorToolbar / ResultsPane / CellInspector / ConfigInfoModal (読み取り専用の設定表示) / AiAnalysisModal (EXPLAIN / 選択 SQL の AI 解説表示)
 - `lib/export.ts` — CSV/TSV/JSON 変換 (formula injection 対策込み)
 
 ## 設定 (config.yml)

@@ -13,6 +13,7 @@
   import SqlEditor from "$lib/components/SqlEditor.svelte";
   import ResultsPane from "$lib/components/ResultsPane.svelte";
   import ConfigInfoModal from "$lib/components/ConfigInfoModal.svelte";
+  import AiAnalysisModal from "$lib/components/AiAnalysisModal.svelte";
 
   let showSettings = $state(false);
   let editor: SqlEditor | undefined = $state();
@@ -105,6 +106,8 @@
           readonly={selectedConnectionInfo?.readonly ?? false}
           onExplain={() =>
             appStore.explainQuery(editor?.getCurrentStatement() ?? "")}
+          onExplainSql={() =>
+            appStore.explainSql(editor?.getCurrentStatement() ?? "")}
         />
       {/if}
       <div class="min-h-0 flex-[3] border-b border-zinc-700">
@@ -137,5 +140,14 @@
     onClose={() => {
       showSettings = false;
     }}
+  />
+{/if}
+
+<!-- AI による選択 SQL 解説のモーダル (EXPLAIN 解説モーダルを見出し違いで再利用) -->
+{#if appStore.aiExplanation !== null}
+  <AiAnalysisModal
+    title="AI SQL Explanation"
+    text={appStore.aiExplanation}
+    onClose={() => appStore.closeAiExplanation()}
   />
 {/if}

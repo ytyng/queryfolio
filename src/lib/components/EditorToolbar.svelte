@@ -8,9 +8,12 @@
     /// Explain ボタン押下時の処理 (+page.svelte がエディタの
     /// カーソル位置の文を取り出して appStore.explainQuery に渡す)
     onExplain: () => void;
+    /// Explain SQL ボタン押下時の処理 (+page.svelte がエディタの
+    /// カーソル位置の文を取り出して appStore.explainSql に渡す)
+    onExplainSql: () => void;
   }
 
-  let { engine, readonly, onExplain }: Props = $props();
+  let { engine, readonly, onExplain, onExplainSql }: Props = $props();
 
   const isSqlite = $derived(
     ["sqlite", "sqlite3"].includes((engine ?? "").toLowerCase()),
@@ -27,6 +30,18 @@
   const aiButtonTitle = $derived(
     aiConfigured
       ? `Generate SQL with AI (${appStore.aiInfo?.model})`
+      : appStore.aiError
+        ? `AI is unavailable: ${appStore.aiError}`
+        : "AI is not configured. Add an 'ai:' section (provider: openai, " +
+          "api_key: ...) to config.yml or the connection YAML.",
+  );
+
+  /// Explain SQL ボタンの title (未設定・エラー時は設定方法を案内する)
+  const explainSqlButtonTitle = $derived(
+    aiConfigured
+      ? "Explain the SQL statement under the cursor with AI " +
+          `(${appStore.aiInfo?.model}). Sends the SQL and schema info ` +
+          "(table/column names), not your data."
       : appStore.aiError
         ? `AI is unavailable: ${appStore.aiError}`
         : "AI is not configured. Add an 'ai:' section (provider: openai, " +
@@ -129,6 +144,26 @@
       onclick={onExplain}
     >
       Explain
+    </button>
+    <!-- カーソル位置の文を AI に平易に解説させる (AI 設定済みのときのみ有効) -->
+    <button
+      type="button"
+      class="flex items-center gap-1 rounded border border-zinc-600 bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
+      data-annotate="button-ai-explain-sql"
+      title={explainSqlButtonTitle}
+      disabled={!aiConfigured || appStore.aiExplaining}
+      onclick={onExplainSql}
+    >
+      {#if appStore.aiExplaining}
+        <!-- 解説の生成中スピナー -->
+        <span
+          class="inline-block size-3 animate-spin rounded-full border-2 border-zinc-300 border-t-transparent"
+          data-annotate="spinner-ai-explaining"
+        ></span>
+        Explaining...
+      {:else}
+        ✨ Explain SQL
+      {/if}
     </button>
     {#if showAiInput}
       <form

@@ -155,6 +155,11 @@ export const aiExplainPlan = (
   planText: string,
 ) => invoke<string>("ai_explain_plan", { connection, sql, planText });
 
+/// カーソル位置の SQL 文を AI に平易に解説させ、Markdown テキストを返す
+/// (実行はしない)。
+export const aiExplainSql = (connection: string, sql: string) =>
+  invoke<string>("ai_explain_sql", { connection, sql });
+
 export const getConfigInfo = () => invoke<ConfigInfo>("get_config_info");
 
 /// config.yml が無ければテンプレートを作成する。作成した場合はそのパスを返す。

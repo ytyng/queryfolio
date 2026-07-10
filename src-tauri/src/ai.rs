@@ -304,7 +304,41 @@ pub fn build_explain_user_message(sql: &str, plan_text: &str) -> String {
     )
 }
 
-/// LLM の応答が ```sql フェンス付きで返ってきた場合に中身を取り出す。
+/// 選択 SQL の解説用の system prompt を組み立てる。
+/// LLM に送るのはスキーマ情報 (テーブル名・カラム名)・方言・アクティブ
+/// スキーマ名のみ (SQL は user message 側)。クエリの結果データや接続情報
+/// (ホスト・認証情報) は絶対に含めない。
+pub fn build_explain_sql_system_prompt(
+    engine: &str,
+    active_schema: Option<&str>,
+    schema_map: &BTreeMap<String, Vec<String>>,
+) -> String {
+    let dialect = dialect_name(engine);
+    let mut prompt = format!(
+        "You are a SQL assistant for a {dialect} database. The user provides \
+         a SQL statement. Explain in plain language what it does, for a \
+         reader who did not write it.\n\
+         Respond in Markdown with the following sections:\n\
+         1. **Summary** — one or two sentences describing what the statement \
+         returns or changes.\n\
+         2. **Step by step** — walk through each clause (FROM / JOINs, \
+         WHERE, GROUP BY, window functions, subqueries / CTEs, \
+         ORDER BY / LIMIT, etc.) and explain its role in this statement.\n\
+         3. **Caveats** — pitfalls to be aware of (NULL handling, implicit \
+         type conversions, row duplication from joins, missing filters, \
+         performance concerns). If there are none, say so.\n\
+         Be specific and concise. Use fenced code blocks for SQL fragments. \
+         Use the tables and columns listed below as reference when they \
+         appear in the statement.\n"
+    );
+    push_schema_section(&mut prompt, active_schema, schema_map);
+    prompt
+}
+
+/// 選択 SQL の解説用の user message (SQL のみ) を組み立てる。
+pub fn build_explain_sql_user_message(sql: &str) -> String {
+    format!("SQL:\n```sql\n{}\n```", sql.trim())
+}
 
 #[cfg(test)]
 mod tests {
@@ -512,6 +546,43 @@ mod tests {
         assert!(prompt.contains("SQLite"));
         assert!(prompt.contains("(no tables found)"));
         assert!(!prompt.contains("active schema"));
+    }
+
+    #[test]
+    fn test_build_explain_sql_system_prompt() {
+        let mut schema_map = BTreeMap::new();
+        schema_map.insert(
+            "users".to_string(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+        let prompt = build_explain_sql_system_prompt("postgres", Some("app_db"), &schema_map);
+        assert!(prompt.contains("PostgreSQL"));
+        assert!(prompt.contains("'app_db'"));
+        assert!(prompt.contains("- users (id, name)"));
+        assert!(prompt.contains("Summary"));
+        assert!(prompt.contains("Step by step"));
+        assert!(prompt.contains("Caveats"));
+        assert!(prompt.contains("Respond in Markdown"));
+    }
+
+    #[test]
+    fn test_build_explain_sql_system_prompt_no_schema() {
+        // アクティブスキーマ無し・テーブル無しでも壊れないこと
+        let prompt = build_explain_sql_system_prompt("sqlite", None, &BTreeMap::new());
+        assert!(prompt.contains("SQLite"));
+        assert!(prompt.contains("(no tables found)"));
+        assert!(!prompt.contains("active schema"));
+        // 空文字のスキーマ名は含めない
+        let prompt = build_explain_sql_system_prompt("mysql", Some(""), &BTreeMap::new());
+        assert!(prompt.contains("MySQL"));
+        assert!(!prompt.contains("active schema"));
+    }
+
+    #[test]
+    fn test_build_explain_sql_user_message() {
+        // SQL は前後の空白を除去してフェンスに入れる
+        let message = build_explain_sql_user_message("  SELECT * FROM users\n");
+        assert_eq!(message, "SQL:\n```sql\nSELECT * FROM users\n```");
     }
 
     #[test]
