@@ -11,6 +11,8 @@ pub fn translate(engine: Engine, input: &str) -> Result<Option<String>, AppError
     if !trimmed.starts_with('\\') {
         return Ok(None);
     }
+    // SQL の癖で末尾に ; を付けても動くよう、末尾のセミコロンは無視する
+    let trimmed = trimmed.trim_end_matches(|c: char| c == ';' || c.is_whitespace());
     let mut parts = trimmed.split_whitespace();
     let command = parts.next().unwrap_or("");
     let arg = parts.next();
@@ -170,6 +172,16 @@ fn sqlite_meta(command: &str, arg: Option<&str>) -> Result<String, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_trailing_semicolon_is_ignored() {
+        let sql = translate(Engine::Postgres, "\\dt;").unwrap().unwrap();
+        assert!(sql.contains("pg_catalog.pg_class"));
+        let sql = translate(Engine::Postgres, "\\d users;").unwrap().unwrap();
+        assert!(sql.contains("'users'::regclass"));
+        let sql = translate(Engine::MySql, "\\l ;;").unwrap().unwrap();
+        assert_eq!(sql, "SHOW DATABASES");
+    }
 
     #[test]
     fn test_non_meta_returns_none() {
