@@ -221,10 +221,6 @@
     "&": {
       height: "100%",
       fontSize: "13px",
-      backgroundColor: "#111111",
-    },
-    ".cm-gutters": {
-      backgroundColor: "#111111",
     },
     ".cm-scroller": {
       fontFamily:
@@ -309,6 +305,15 @@
 
 <div
   bind:this={editorElement}
-  class="h-full min-h-0 overflow-hidden"
+  class="sql-editor-host h-full min-h-0 overflow-hidden"
   data-annotate="editor-sql"
 ></div>
+
+<style>
+  /* oneDark テーマの背景指定は CodeMirror のテーマ優先順位で
+     EditorView.theme の上書きに勝つことがあるため、CSS で確実に上書きする */
+  .sql-editor-host :global(.cm-editor),
+  .sql-editor-host :global(.cm-gutters) {
+    background-color: #111111 !important;
+  }
+</style>
