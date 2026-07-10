@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
   import { toast } from "svelte-sonner";
   import { ensureConfigFile } from "$lib/api";
   import appStore from "$lib/stores/app.svelte";
@@ -18,20 +19,37 @@
       ?.engine ?? null,
   );
 
-  onMount(async () => {
-    try {
-      const createdPath = await ensureConfigFile();
-      if (createdPath) {
-        toast.info("Created a config file", {
-          description: `Edit ${createdPath} to add your connections`,
+  onMount(() => {
+    // メニューの Reload config file からの通知を受けて再読込する
+    const unlistenPromise = listen("menu-reload-config", async () => {
+      if (await appStore.reloadConnections()) {
+        toast.success("Config reloaded");
+      } else {
+        toast.error("Failed to reload the config", {
+          description: appStore.errorMessage ?? undefined,
         });
       }
-    } catch (e) {
-      toast.error("Failed to create the config file", {
-        description: String(e),
-      });
-    }
-    await appStore.loadConnections();
+    });
+
+    void (async () => {
+      try {
+        const createdPath = await ensureConfigFile();
+        if (createdPath) {
+          toast.info("Created a config file", {
+            description: `Edit ${createdPath} to add your connections`,
+          });
+        }
+      } catch (e) {
+        toast.error("Failed to create the config file", {
+          description: String(e),
+        });
+      }
+      await appStore.loadConnections();
+    })();
+
+    return () => {
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
   });
 </script>
 
