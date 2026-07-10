@@ -4,6 +4,7 @@ mod history;
 mod meta_commands;
 mod error;
 mod query_files;
+mod schema_info;
 mod tunnel;
 
 use std::path::PathBuf;
@@ -29,6 +30,9 @@ struct AppState {
     db: DbManager,
     /// クエリ実行履歴の記録 (接続ごとの行数キャッシュを保持)。
     history: history::HistoryManager,
+    /// スキーマ情報 (テーブル・カラム) のキャッシュ。
+    /// スキーマブラウザと SQL 補完 (get_schema_map) で共有する。
+    schema_cache: schema_info::SchemaCache,
 }
 
 impl AppState {
@@ -67,6 +71,15 @@ impl AppState {
                 AppError::Config(format!("Connection '{connection}' is not defined in the config"))
             })
     }
+
+    /// スキーマキャッシュのキーになるアクティブスキーマ名を返す
+    /// (オーバーライド > 設定のデフォルト > 空文字)。
+    async fn active_schema_key(&self, server: &ServerConfig) -> String {
+        match self.db.schema_override(&server.name).await {
+            Some(schema) => schema,
+            None => server.schema.clone().unwrap_or_default(),
+        }
+    }
 }
 
 #[tauri::command]
@@ -87,6 +100,7 @@ async fn reset_connections(state: tauri::State<'_, AppState>) -> Result<(), AppE
     *state.sqlfiles_dir.lock().await = None;
     *state.default_limit.lock().await = None;
     state.db.reset().await;
+    state.schema_cache.clear().await;
     Ok(())
 }
 
@@ -252,6 +266,8 @@ async fn set_active_schema(
     // 接続名の実在確認 (存在しない接続へのオーバーライド蓄積を防ぐ)
     state.find_server(&connection).await?;
     state.db.set_schema_override(&connection, schema).await;
+    // 切替後に古いスキーマ情報を返さないよう、接続単位でキャッシュを破棄する
+    state.schema_cache.invalidate_connection(&connection).await;
     Ok(())
 }
 
@@ -266,6 +282,94 @@ async fn get_active_schema(
     }
     let server = state.find_server(&connection).await?;
     Ok(server.schema)
+}
+
+/// 接続先のテーブル / ビューの一覧を返す (キャッシュあり)。
+/// refresh = true でキャッシュを破棄して再取得する (リロードボタン用)。
+#[tauri::command]
+async fn list_tables(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    refresh: Option<bool>,
+) -> Result<Vec<schema_info::TableInfo>, AppError> {
+    let server = state.find_server(&connection).await?;
+    let schema_key = state.active_schema_key(&server).await;
+    if refresh.unwrap_or(false) {
+        // カラムのキャッシュも古い可能性があるため、スキーマ単位で丸ごと破棄する
+        state
+            .schema_cache
+            .invalidate_schema(&connection, &schema_key)
+            .await;
+    } else if let Some(tables) = state.schema_cache.get_tables(&connection, &schema_key).await {
+        return Ok(tables);
+    }
+    let pool = state.db.get_pool(&server).await?;
+    let tables = schema_info::fetch_tables(&pool).await?;
+    state
+        .schema_cache
+        .put_tables(&connection, &schema_key, &tables)
+        .await;
+    Ok(tables)
+}
+
+/// テーブルのカラム一覧を返す (キャッシュあり。ツリー展開時の遅延ロード用)。
+/// table は list_tables が返す qualified_name を渡す。
+#[tauri::command]
+async fn list_columns(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    table: String,
+) -> Result<Vec<schema_info::ColumnInfo>, AppError> {
+    let server = state.find_server(&connection).await?;
+    let schema_key = state.active_schema_key(&server).await;
+    if let Some(columns) = state
+        .schema_cache
+        .get_columns(&connection, &schema_key, &table)
+        .await
+    {
+        return Ok(columns);
+    }
+    let pool = state.db.get_pool(&server).await?;
+    let columns = schema_info::fetch_columns(&pool, &table).await?;
+    state
+        .schema_cache
+        .put_columns(&connection, &schema_key, &table, &columns)
+        .await;
+    Ok(columns)
+}
+
+/// テーブル名 → カラム名リストのマップを返す (SQL 補完の強化用)。
+/// キャッシュに全テーブル分のカラムが無ければ一括取得してキャッシュする。
+#[tauri::command]
+async fn get_schema_map(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, AppError> {
+    let server = state.find_server(&connection).await?;
+    let schema_key = state.active_schema_key(&server).await;
+    if let Some(map) = state
+        .schema_cache
+        .get_schema_map(&connection, &schema_key)
+        .await
+    {
+        return Ok(map);
+    }
+    let pool = state.db.get_pool(&server).await?;
+    let all = schema_info::fetch_all_columns(&pool).await?;
+    let map = all
+        .iter()
+        .map(|(table, columns)| {
+            (
+                table.clone(),
+                columns.iter().map(|c| c.name.clone()).collect(),
+            )
+        })
+        .collect();
+    state
+        .schema_cache
+        .put_all_columns(&connection, &schema_key, all)
+        .await;
+    Ok(map)
 }
 
 /// 設定の解決結果を返す (情報表示用。機密を含まない)。
@@ -346,6 +450,9 @@ pub fn run() {
             list_schemas,
             set_active_schema,
             get_active_schema,
+            list_tables,
+            list_columns,
+            get_schema_map,
             get_config_info,
             ensure_config_file,
         ])
