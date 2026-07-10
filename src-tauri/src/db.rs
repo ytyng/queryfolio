@@ -270,10 +270,14 @@ pub async fn run_query(
     let mut applied_limit = None;
     let limited_sql;
     let sql = match auto_limit {
-        Some(limit) if limit > 0 && translated.is_none() && should_auto_limit(sql) => {
+        Some(limit)
+            if limit > 0
+                && translated.is_none()
+                && should_auto_limit(sql, pool.engine()) =>
+        {
             // 末尾のコメント・セミコロンを除いた本体の直後に付与する
             // (コメントの後ろに付けると LIMIT がコメントに飲み込まれる)
-            let body = &sql[..sql_body_end(sql)];
+            let body = &sql[..scan_sql(sql, pool.engine()).body_end];
             limited_sql = format!("{body} LIMIT {limit}");
             applied_limit = Some(limit);
             limited_sql.as_str()
@@ -427,97 +431,117 @@ fn leading_keyword(sql: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// 文字列リテラル (' " `) とコメント (-- /* */) を除去した SQL を小文字で返す。
-/// キーワード判定の誤検知 (リテラル内の LIMIT 等) を防ぐための前処理。
-fn strip_sql_noise(sql: &str) -> String {
-    let mut result = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' | '"' | '`' => {
-                // 対応する引用符まで読み飛ばす ('' のような二重化エスケープ対応)
-                while let Some(inner) = chars.next() {
-                    if inner == c {
-                        if chars.peek() == Some(&c) {
-                            chars.next();
-                            continue;
-                        }
-                        break;
-                    }
-                }
-                result.push(' ');
-            }
-            '-' if chars.peek() == Some(&'-') => {
-                for inner in chars.by_ref() {
-                    if inner == '\n' {
-                        break;
-                    }
-                }
-                result.push(' ');
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                let mut prev = ' ';
-                for inner in chars.by_ref() {
-                    if prev == '*' && inner == '/' {
-                        break;
-                    }
-                    prev = inner;
-                }
-                result.push(' ');
-            }
-            _ => result.push(c.to_ascii_lowercase()),
-        }
-    }
-    result
+/// SQL の走査結果。cleaned はキーワード判定用 (文字列リテラルとコメントを
+/// 空白化して小文字化したもの)、body_end は自動 LIMIT の挿入位置
+/// (末尾のコメント・セミコロン・空白を除いた本体の終了位置)。
+struct SqlScan {
+    cleaned: String,
+    body_end: usize,
 }
 
-/// SQL 本体 (末尾のコメント・セミコロン・空白を除く) の終了位置を返す。
-/// 自動 LIMIT を末尾コメントの中に付与してしまわないようにするための走査。
-/// 文字列リテラル内の文字はコードとして数える。
-fn sql_body_end(sql: &str) -> usize {
-    let mut end = 0;
-    let mut chars = sql.char_indices().peekable();
-    while let Some((i, c)) = chars.next() {
-        match c {
-            '\'' | '"' | '`' => {
-                let mut last = i + c.len_utf8();
-                while let Some((j, inner)) = chars.next() {
-                    last = j + inner.len_utf8();
-                    if inner == c {
-                        if chars.peek().map(|(_, n)| *n) == Some(c) {
-                            chars.next();
-                            continue;
+/// エンジンごとのコメント・クォート規則で SQL を 1 パス走査する。
+/// - 文字列リテラル: ' " ` (二重化エスケープ対応)。Postgres はドル引用
+///   ($tag$ ... $tag$) にも対応 (# は Postgres では XOR 演算子なので
+///   コメント扱いしない)
+/// - コメント: -- と /* */。MySQL は # 行コメントも対象
+fn scan_sql(sql: &str, engine: Engine) -> SqlScan {
+    let hash_comments = matches!(engine, Engine::MySql);
+    let dollar_quotes = matches!(engine, Engine::Postgres);
+    let chars: Vec<char> = sql.chars().collect();
+    let mut cleaned = String::with_capacity(sql.len());
+    let mut body_end = 0;
+    let mut byte_pos = 0;
+    let mut i = 0;
+
+    // i 番目の文字を消費して byte 位置を進める
+    macro_rules! advance {
+        () => {{
+            byte_pos += chars[i].len_utf8();
+            i += 1;
+        }};
+    }
+
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' || c == '"' || c == '`' {
+            advance!();
+            while i < chars.len() {
+                let inner = chars[i];
+                advance!();
+                if inner == c {
+                    if i < chars.len() && chars[i] == c {
+                        advance!();
+                        continue;
+                    }
+                    break;
+                }
+            }
+            cleaned.push(' ');
+            body_end = byte_pos;
+        } else if dollar_quotes && c == '$' {
+            // $tag$ ... $tag$ のドル引用を検出する
+            let mut j = i + 1;
+            while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                j += 1;
+            }
+            if j < chars.len() && chars[j] == '$' {
+                let tag: String = chars[i..=j].iter().collect();
+                let tag_chars = j - i + 1;
+                for _ in 0..tag_chars {
+                    advance!();
+                }
+                // 閉じタグを探す
+                loop {
+                    if i >= chars.len() {
+                        break;
+                    }
+                    if chars[i] == '$' && chars[i..].starts_with(&tag.chars().collect::<Vec<_>>()[..]) {
+                        for _ in 0..tag_chars {
+                            advance!();
                         }
                         break;
                     }
+                    advance!();
                 }
-                end = last;
+                cleaned.push(' ');
+                body_end = byte_pos;
+            } else {
+                cleaned.push('$');
+                advance!();
+                body_end = byte_pos;
             }
-            '-' if chars.peek().map(|(_, n)| *n) == Some('-') => {
-                for (_, inner) in chars.by_ref() {
-                    if inner == '\n' {
-                        break;
-                    }
+        } else if c == '-' && i + 1 < chars.len() && chars[i + 1] == '-' {
+            while i < chars.len() && chars[i] != '\n' {
+                advance!();
+            }
+            cleaned.push(' ');
+        } else if hash_comments && c == '#' {
+            while i < chars.len() && chars[i] != '\n' {
+                advance!();
+            }
+            cleaned.push(' ');
+        } else if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            advance!();
+            advance!();
+            while i < chars.len() {
+                if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                    advance!();
+                    advance!();
+                    break;
                 }
+                advance!();
             }
-            '/' if chars.peek().map(|(_, n)| *n) == Some('*') => {
-                chars.next();
-                let mut prev = ' ';
-                for (_, inner) in chars.by_ref() {
-                    if prev == '*' && inner == '/' {
-                        break;
-                    }
-                    prev = inner;
-                }
-            }
-            _ if c.is_whitespace() || c == ';' => {}
-            _ => {
-                end = i + c.len_utf8();
+            cleaned.push(' ');
+        } else {
+            let is_code = !c.is_whitespace() && c != ';';
+            cleaned.push(c.to_ascii_lowercase());
+            advance!();
+            if is_code {
+                body_end = byte_pos;
             }
         }
     }
-    end
+    SqlScan { cleaned, body_end }
 }
 
 /// デフォルト LIMIT を安全に付与できる文かを判定する。
@@ -525,13 +549,13 @@ fn sql_body_end(sql: &str) -> usize {
 /// WITH ... INSERT 等の語を含む場合は、構文エラーや意味の変化を避けるため
 /// 付与しない (保守的側に倒す。スキップしてもクライアント側の max_rows
 /// 打ち切りが安全網になる)。
-fn should_auto_limit(sql: &str) -> bool {
+fn should_auto_limit(sql: &str, engine: Engine) -> bool {
     // VALUES (SQLite では LIMIT 不可) や TABLE は対象にせず、
     // SELECT / WITH のみに限定する
     if !matches!(leading_keyword(sql).as_str(), "select" | "with") {
         return false;
     }
-    let cleaned = strip_sql_noise(sql);
+    let cleaned = scan_sql(sql, engine).cleaned;
     let veto_words = [
         "limit", "fetch", "offset", "for", "into", "insert", "update", "delete",
         "lock", "returning",
@@ -848,51 +872,87 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_sql_noise() {
-        assert_eq!(strip_sql_noise("SELECT 'limit' FROM t"), "select   from t");
-        assert_eq!(strip_sql_noise("SELECT a -- limit\nFROM t"), "select a  from t");
-        assert_eq!(strip_sql_noise("SELECT /* limit */ a"), "select   a");
-        assert_eq!(strip_sql_noise("SELECT 'it''s' FROM t"), "select   from t");
+    fn test_scan_sql_cleaned() {
+        let scan = |s: &str, e| scan_sql(s, e).cleaned;
+        assert_eq!(scan("SELECT 'limit' FROM t", Engine::Sqlite), "select   from t");
+        assert_eq!(scan("SELECT a -- limit\nFROM t", Engine::Sqlite), "select a  \nfrom t");
+        assert_eq!(scan("SELECT /* limit */ a", Engine::Sqlite), "select   a");
+        assert_eq!(scan("SELECT 'it''s' FROM t", Engine::Sqlite), "select   from t");
+        // MySQL の # 行コメント
+        assert_eq!(scan("SELECT a # limit\nFROM t", Engine::MySql), "select a  \nfrom t");
+        // Postgres では # は演算子なのでコメント扱いしない
+        assert_eq!(scan("SELECT a # b", Engine::Postgres), "select a # b");
+        // Postgres のドル引用は文字列として除去
+        assert_eq!(
+            scan("SELECT $$--not a comment$$ AS s", Engine::Postgres),
+            "select   as s"
+        );
+        assert_eq!(
+            scan("SELECT $fn$limit$fn$ AS s", Engine::Postgres),
+            "select   as s"
+        );
     }
 
     #[test]
-    fn test_sql_body_end() {
-        let sql = "SELECT * FROM t -- note";
-        assert_eq!(&sql[..sql_body_end(sql)], "SELECT * FROM t");
-        let sql = "SELECT 1; -- note";
-        assert_eq!(&sql[..sql_body_end(sql)], "SELECT 1");
-        let sql = "SELECT 1 /* c */  ;  ";
-        assert_eq!(&sql[..sql_body_end(sql)], "SELECT 1");
+    fn test_scan_sql_body_end() {
+        fn body(s: &str, e: Engine) -> &str {
+            &s[..scan_sql(s, e).body_end]
+        }
+        assert_eq!(body("SELECT * FROM t -- note", Engine::Sqlite), "SELECT * FROM t");
+        assert_eq!(body("SELECT 1; -- note", Engine::Sqlite), "SELECT 1");
+        assert_eq!(body("SELECT 1 /* c */  ;  ", Engine::Sqlite), "SELECT 1");
         // 文字列リテラル内の記号はコードとして残る
-        let sql = "SELECT 'a;-- b' FROM t;";
-        assert_eq!(&sql[..sql_body_end(sql)], "SELECT 'a;-- b' FROM t");
+        assert_eq!(
+            body("SELECT 'a;-- b' FROM t;", Engine::Sqlite),
+            "SELECT 'a;-- b' FROM t"
+        );
         // コメントの後に続きがあるケース
-        let sql = "SELECT 1 -- c\n+ 2";
-        assert_eq!(&sql[..sql_body_end(sql)], "SELECT 1 -- c\n+ 2");
+        assert_eq!(body("SELECT 1 -- c\n+ 2", Engine::Sqlite), "SELECT 1 -- c\n+ 2");
+        // MySQL の # コメントも除去される
+        assert_eq!(
+            body("SELECT * FROM t # inspect", Engine::MySql),
+            "SELECT * FROM t"
+        );
+        // Postgres のドル引用内の -- は切らない
+        assert_eq!(
+            body("SELECT $$--not a comment$$ AS s", Engine::Postgres),
+            "SELECT $$--not a comment$$ AS s"
+        );
     }
 
     #[test]
     fn test_should_auto_limit() {
-        assert!(should_auto_limit("SELECT * FROM users"));
-        assert!(should_auto_limit("WITH x AS (SELECT 1) SELECT * FROM x"));
+        let f = |s: &str| should_auto_limit(s, Engine::Sqlite);
+        assert!(f("SELECT * FROM users"));
+        assert!(f("WITH x AS (SELECT 1) SELECT * FROM x"));
         // リテラル内の limit は無視して付与できる
-        assert!(should_auto_limit("SELECT 'limit' FROM t"));
+        assert!(f("SELECT 'limit' FROM t"));
         // 単語境界: limits というテーブル名は veto しない
-        assert!(should_auto_limit("SELECT * FROM limits"));
+        assert!(f("SELECT * FROM limits"));
         // 既に LIMIT / FETCH / OFFSET がある
-        assert!(!should_auto_limit("SELECT * FROM t LIMIT 10"));
-        assert!(!should_auto_limit("SELECT * FROM t FETCH FIRST 10 ROWS ONLY"));
-        assert!(!should_auto_limit("SELECT * FROM t OFFSET 5"));
+        assert!(!f("SELECT * FROM t LIMIT 10"));
+        assert!(!f("SELECT * FROM t FETCH FIRST 10 ROWS ONLY"));
+        assert!(!f("SELECT * FROM t OFFSET 5"));
         // サブクエリ内の LIMIT も保守的にスキップ
-        assert!(!should_auto_limit("SELECT * FROM (SELECT 1 LIMIT 3) s"));
+        assert!(!f("SELECT * FROM (SELECT 1 LIMIT 3) s"));
         // ロック句・DML 混じりの WITH
-        assert!(!should_auto_limit("SELECT * FROM t FOR UPDATE"));
-        assert!(!should_auto_limit("WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x"));
+        assert!(!f("SELECT * FROM t FOR UPDATE"));
+        assert!(!f("WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x"));
         // SELECT 系以外
-        assert!(!should_auto_limit("SHOW TABLES"));
-        assert!(!should_auto_limit("UPDATE t SET a = 1"));
+        assert!(!f("SHOW TABLES"));
+        assert!(!f("UPDATE t SET a = 1"));
         // VALUES は SQLite で LIMIT 不可のため対象外
-        assert!(!should_auto_limit("VALUES (1)"));
+        assert!(!f("VALUES (1)"));
+        // Postgres: ドル引用内の limit は veto しない
+        assert!(should_auto_limit(
+            "SELECT $$limit$$ AS s",
+            Engine::Postgres
+        ));
+        // MySQL: # コメント内の limit は veto しない (本体には付与できる)
+        assert!(should_auto_limit(
+            "SELECT * FROM t # limit note",
+            Engine::MySql
+        ));
     }
 
     #[test]
