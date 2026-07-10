@@ -118,10 +118,13 @@
 
   const aiConfigured = $derived(appStore.aiInfo?.configured ?? false);
 
-  /// Fix with AI ボタンの title (未設定・エラー時は設定方法を案内する)
+  /// Fix with AI ボタンの title (未設定・エラー時は設定方法を案内する)。
+  /// DB エラーメッセージには値が含まれ得るため、送信内容を明示する
   const aiFixButtonTitle = $derived(
     aiConfigured
-      ? `Ask AI to fix this SQL (${appStore.aiInfo?.model})`
+      ? `Ask AI to fix this SQL (${appStore.aiInfo?.model}). ` +
+          "Sends the failed SQL, the database error message, and " +
+          "table/column names to the AI provider (never the query results)."
       : appStore.aiError
         ? `AI is unavailable: ${appStore.aiError}`
         : "AI is not configured. Add an 'ai:' section (provider: openai, " +

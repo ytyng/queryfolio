@@ -348,7 +348,11 @@ const generateSql = async (instruction: string): Promise<boolean> => {
       toast.warning("The AI returned an empty response");
       return false;
     }
-    insertSqlSnippet(sql);
+    // 生成中に接続・ファイルの選択が外れた場合は挿入されない
+    // (insertSqlSnippet が warning を出す) ため、成功時のみ通知する
+    if (!insertSqlSnippet(sql)) {
+      return false;
+    }
     toast.success("Generated SQL inserted into the editor");
     return true;
   } catch (e) {
@@ -372,11 +376,16 @@ const fixSqlWithAi = async (tabId: number) => {
   if (tab.fixing) {
     return;
   }
+  // 問い合わせ中に Re-run されて別の実行結果になった場合に、
+  // 古いエラーへの修正案を書き込まないよう実行時刻を控えておく
+  const requestedExecutedAt = tab.executedAt;
   tab.fixing = true;
   try {
     const fixed = await api.aiFixSql(tab.connection, tab.sql, tab.error);
-    // 問い合わせ中に設定再読込などでタブが破棄されていたら結果を捨てる
-    if (!resultTabs.some((t) => t.id === tabId)) {
+    // 問い合わせ中に設定再読込などでタブが破棄された・再実行で
+    // 結果が入れ替わった場合は、古い修正案を捨てる
+    const current = resultTabs.find((t) => t.id === tabId);
+    if (!current || current.executedAt !== requestedExecutedAt) {
       return;
     }
     if (!fixed.trim()) {
@@ -394,10 +403,18 @@ const fixSqlWithAi = async (tabId: number) => {
 };
 
 /// AI の修正案をエディタに挿入して提案表示を閉じる (実行はしない)。
-/// 挿入できなかった場合 (接続・ファイル未選択) は提案を残す。
+/// 挿入できなかった場合 (接続・ファイル未選択・接続の切替) は提案を残す。
 const applyFixSuggestion = (tabId: number) => {
   const tab = resultTabs.find((t) => t.id === tabId);
   if (!tab?.fixSuggestion) {
+    return;
+  }
+  // 結果タブは接続をまたいで残るため、提案表示中に接続を切り替えると
+  // 別接続 (別方言) のファイルに挿入されてしまう。誤挿入を防ぐ
+  if (selectedConnection !== tab.connection) {
+    toast.warning(
+      `This suggestion is for '${tab.connection}'. Switch back to that connection to apply it.`,
+    );
     return;
   }
   if (insertSqlSnippet(tab.fixSuggestion)) {
