@@ -13,8 +13,11 @@
 
   /// 接続・スキーマ切替の連続変化をまとめるデバウンス時間
   const RELOAD_DEBOUNCE_MS = 150;
-  /// シングルクリック (名前挿入) とダブルクリック (SELECT 挿入) の判別時間
-  const CLICK_DELAY_MS = 250;
+  /// シングルクリック (名前挿入) とダブルクリック (SELECT 挿入) の判別時間。
+  /// OS のダブルクリック間隔 (macOS デフォルト約 500ms) より短いと
+  /// ダブルクリック時に名前と SELECT の両方が挿入されてしまうため、
+  /// 余裕を持たせた値にする
+  const CLICK_DELAY_MS = 500;
 
   /// 展開中テーブルのカラム取得状態 (キーは qualified_name)
   interface ExpandedEntry {
@@ -30,10 +33,15 @@
 
   let clickTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /// 実行中の load の世代番号。接続・スキーマの連続切替やリロード連打で
+  /// 古い応答が後から解決しても、最新の load の結果だけを反映するために使う
+  let loadGeneration = 0;
+
   const toErrorMessage = (e: unknown): string =>
     typeof e === "string" ? e : String(e);
 
   const load = async (connection: string | null, refresh = false) => {
+    const generation = ++loadGeneration;
     // 接続やスキーマが変わったら展開状態は意味を失うためリセットする
     expanded = {};
     if (!connection) {
@@ -43,13 +51,23 @@
     }
     loading = true;
     try {
-      tables = await api.listTables(connection, refresh);
+      const result = await api.listTables(connection, refresh);
+      // より新しい load が始まっていたら、古い応答は捨てる
+      if (generation !== loadGeneration) {
+        return;
+      }
+      tables = result;
       loadError = null;
     } catch (e) {
+      if (generation !== loadGeneration) {
+        return;
+      }
       loadError = toErrorMessage(e);
       tables = [];
     } finally {
-      loading = false;
+      if (generation === loadGeneration) {
+        loading = false;
+      }
     }
   };
 
@@ -92,7 +110,12 @@
 
   /// シングルクリック: テーブル名をエディタに挿入。
   /// ダブルクリックと区別するため少し待ってから確定する。
-  const onTableClick = (table: TableInfo) => {
+  const onTableClick = (table: TableInfo, event: MouseEvent) => {
+    // ダブルクリックの 2 打目 (detail > 1) ではタイマーを張り直さない
+    // (直後の dblclick ハンドラが 1 打目のタイマーを取り消して処理する)
+    if (event.detail > 1) {
+      return;
+    }
     if (clickTimer) {
       clearTimeout(clickTimer);
     }
@@ -169,7 +192,7 @@
             class="flex min-w-0 flex-1 items-center gap-1 py-1 pr-2 text-left text-sm text-zinc-200"
             title="Click: insert the table name / Double-click: insert SELECT * FROM ... LIMIT 100"
             data-annotate="button-table-{table.qualified_name}"
-            onclick={() => onTableClick(table)}
+            onclick={(e) => onTableClick(table, e)}
             ondblclick={() => onTableDblClick(table)}
           >
             <span class="truncate">{table.qualified_name}</span>
