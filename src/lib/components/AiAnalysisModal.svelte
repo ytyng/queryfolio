@@ -1,0 +1,104 @@
+<script lang="ts">
+  import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+
+  interface Props {
+    /// AI 解説の Markdown テキスト
+    text: string;
+    onClose: () => void;
+  }
+
+  let { text, onClose }: Props = $props();
+
+  let copied = $state(false);
+
+  /// Markdown の表示区間 (完全なレンダラは持たず、コードブロックの
+  /// 装飾 + テキストの pre-wrap 表示のみ行う)
+  interface Segment {
+    type: "text" | "code";
+    content: string;
+  }
+
+  // ``` フェンスでコードブロックとテキストを分割する。
+  // split の偶数番目がテキスト、奇数番目がコード (閉じフェンスが無い
+  // 末尾の区間もコードとして表示する)
+  const segments = $derived.by((): Segment[] => {
+    const result: Segment[] = [];
+    text.split("```").forEach((part, i) => {
+      if (i % 2 === 0) {
+        if (part.trim()) {
+          result.push({ type: "text", content: part.trim() });
+        }
+        return;
+      }
+      // コードブロック先頭行の言語タグ (sql 等) を取り除く
+      const newline = part.indexOf("\n");
+      const firstLine = newline >= 0 ? part.slice(0, newline).trim() : "";
+      const content =
+        newline >= 0 && /^[\w-]*$/.test(firstLine)
+          ? part.slice(newline + 1)
+          : part;
+      result.push({ type: "code", content: content.replace(/\s+$/, "") });
+    });
+    return result;
+  });
+
+  const copy = async () => {
+    // navigator.clipboard は Tauri 2 で OS のパーミッションプロンプトが
+    // 出ることがあるため、公式プラグイン経由で書き込む
+    await writeText(text);
+    copied = true;
+    setTimeout(() => {
+      copied = false;
+    }, 1500);
+  };
+</script>
+
+<div
+  class="fixed inset-0 z-10 flex items-center justify-center bg-black/60"
+  role="presentation"
+  data-annotate="backdrop-ai-analysis-modal"
+  onclick={(e) => {
+    if (e.target === e.currentTarget) {
+      onClose();
+    }
+  }}
+>
+  <div
+    class="flex max-h-[85vh] w-[720px] max-w-[90vw] flex-col gap-3 rounded-lg border border-zinc-700 bg-zinc-900 p-4 shadow-xl"
+  >
+    <h2 class="text-sm font-semibold text-zinc-200">AI Plan Analysis</h2>
+
+    <div
+      class="flex min-h-0 flex-col gap-2 overflow-y-auto"
+      data-annotate="text-ai-analysis"
+    >
+      {#each segments as segment, i (i)}
+        {#if segment.type === "code"}
+          <pre
+            class="overflow-x-auto rounded border border-zinc-700 bg-zinc-950 p-2 font-mono text-xs leading-relaxed text-emerald-300">{segment.content}</pre>
+        {:else}
+          <p class="whitespace-pre-wrap text-xs leading-relaxed text-zinc-300">
+            {segment.content}
+          </p>
+        {/if}
+      {/each}
+    </div>
+
+    <div class="flex justify-end gap-2">
+      <button
+        class="rounded border border-zinc-600 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-800"
+        data-annotate="button-ai-analysis-copy"
+        onclick={copy}
+      >
+        {copied ? "Copied!" : "Copy"}
+      </button>
+      <button
+        class="rounded bg-blue-600 px-3 py-1 text-xs text-white hover:bg-blue-500"
+        data-annotate="button-ai-analysis-close"
+        onclick={onClose}
+      >
+        Close
+      </button>
+    </div>
+  </div>
+</div>

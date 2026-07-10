@@ -846,6 +846,40 @@ fn should_auto_limit(sql: &str, engine: Engine) -> bool {
         .any(|word| veto_words.contains(&word))
 }
 
+/// エンジン別の EXPLAIN プレフィックスを付けた SQL を組み立てる。
+/// 対象は SELECT / WITH のみ (should_auto_limit と同じ leading_keyword 判定)。
+/// Postgres の EXPLAIN ANALYZE は対象文を実際に実行するため、DML に付けると
+/// 書き込みが走ってしまう。安全側に倒して SELECT 系以外は一律エラーにする。
+///
+/// MySQL は EXPLAIN FORMAT=JSON を選ぶ。EXPLAIN ANALYZE (8.0.18+) は
+/// 対象文を実際に実行するうえ MariaDB では未対応のため、実行を伴わずに
+/// コスト・行数見積もりが得られる FORMAT=JSON の方が安全で互換性も広い。
+pub fn build_explain_sql(engine: &str, sql: &str) -> Result<String, AppError> {
+    let engine = parse_engine(engine)?;
+    if !matches!(leading_keyword(sql).as_str(), "select" | "with") {
+        return Err(AppError::Explain(
+            "Explain is available only for SELECT / WITH statements".into(),
+        ));
+    }
+    // EXPLAIN ANALYZE は対象文を実際に実行するため、先頭が SELECT / WITH
+    // でも書き込みを伴い得る文 (SELECT INTO / CTE 付き DML) は対象外にする
+    // (is_readonly_allowed と同じ保守的な単語判定を流用する)
+    if !is_readonly_allowed(sql, engine) {
+        return Err(AppError::Explain(
+            "Explain is not available for statements that may write data \
+             (SELECT INTO / WITH ... INSERT / UPDATE / DELETE)"
+                .into(),
+        ));
+    }
+    let prefix = match engine {
+        // ANALYZE で実測時間、BUFFERS でバッファアクセス統計も取得する
+        Engine::Postgres => "EXPLAIN (ANALYZE, BUFFERS)",
+        Engine::MySql => "EXPLAIN FORMAT=JSON",
+        Engine::Sqlite => "EXPLAIN QUERY PLAN",
+    };
+    Ok(format!("{prefix}\n{sql}"))
+}
+
 /// RETURNING 句を含むかを単語境界で判定する。
 /// INSERT / UPDATE / DELETE ... RETURNING (Postgres / SQLite) の結果行を
 /// 取りこぼさないための判定。文字列リテラル内の単語にも反応する可能性が
@@ -877,6 +911,11 @@ fn contains_returning(sql: &str) -> bool {
 ///   delete / merge の単語が含まれたら拒否する
 /// - SELECT: SELECT INTO (Postgres ではテーブル作成、MySQL では
 ///   INTO OUTFILE 等) を拒否するため、into の単語が含まれたら拒否する
+/// - EXPLAIN: EXPLAIN ANALYZE (Postgres / MySQL 8.0.19+) は対象文を
+///   実際に実行するため、analyze と DML / into の単語が両方含まれたら
+///   拒否する (SELECT INTO のテーブル作成や INTO OUTFILE のファイル
+///   書き込みも実行されてしまうため)。ANALYZE 無しの EXPLAIN は実行を
+///   伴わないので DML でも許可する
 /// リテラル内の単語は scan_sql が除去し、カラム名等への部分一致は
 /// 単語境界の分割で誤検知しない。
 /// 弱点: SELECT に副作用のある関数 (nextval 等) や CALL のプロシージャ内の
@@ -885,15 +924,24 @@ fn is_readonly_allowed(sql: &str, engine: Engine) -> bool {
     if !is_fetch_statement(sql) {
         return false;
     }
-    let veto_words: &[&str] = match leading_keyword(sql).as_str() {
-        "with" => &["insert", "update", "delete", "merge"],
-        "select" => &["into"],
-        _ => return true,
-    };
     let cleaned = scan_sql(sql, engine).cleaned;
-    !cleaned
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .any(|word| veto_words.contains(&word))
+    let has_word = |target: &str| {
+        cleaned
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .any(|word| word == target)
+    };
+    const DML_WORDS: &[&str] = &["insert", "update", "delete", "merge"];
+    match leading_keyword(sql).as_str() {
+        "with" => !DML_WORDS.iter().any(|w| has_word(w)),
+        "select" => !has_word("into"),
+        "explain" => {
+            !(has_word("analyze")
+                && (has_word("into")
+                    || has_word("replace")
+                    || DML_WORDS.iter().any(|w| has_word(w))))
+        }
+        _ => true,
+    }
 }
 
 /// 行を返す文かどうかを先頭キーワードで判定する。
@@ -1187,6 +1235,101 @@ mod tests {
         // 単語境界: 部分一致では拒否しない
         assert!(f("WITH x AS (SELECT id FROM deleted_items) SELECT * FROM x"));
         assert!(f("SELECT * FROM intolerant"));
+        // EXPLAIN ANALYZE の対象が SELECT 系なら許可
+        assert!(is_readonly_allowed(
+            "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM t",
+            Engine::Postgres
+        ));
+        assert!(is_readonly_allowed(
+            "EXPLAIN ANALYZE SELECT * FROM t",
+            Engine::MySql
+        ));
+        // EXPLAIN ANALYZE は対象の DML を実際に実行するため拒否
+        assert!(!is_readonly_allowed(
+            "EXPLAIN ANALYZE DELETE FROM t",
+            Engine::Postgres
+        ));
+        assert!(!is_readonly_allowed(
+            "EXPLAIN (ANALYZE) UPDATE t SET a = 1",
+            Engine::Postgres
+        ));
+        assert!(!is_readonly_allowed(
+            "EXPLAIN ANALYZE INSERT INTO t VALUES (1)",
+            Engine::Postgres
+        ));
+        assert!(!is_readonly_allowed(
+            "explain analyze replace into t values (1)",
+            Engine::MySql
+        ));
+        // EXPLAIN ANALYZE + SELECT INTO はテーブル作成 (Postgres) や
+        // INTO OUTFILE のファイル書き込み (MySQL) が実行されるため拒否
+        assert!(!is_readonly_allowed(
+            "EXPLAIN (ANALYZE, BUFFERS) SELECT * INTO new_table FROM t",
+            Engine::Postgres
+        ));
+        assert!(!is_readonly_allowed(
+            "EXPLAIN ANALYZE SELECT * FROM t INTO OUTFILE '/tmp/x'",
+            Engine::MySql
+        ));
+        // ANALYZE 無しの EXPLAIN は実行を伴わないため DML でも許可
+        assert!(is_readonly_allowed("EXPLAIN DELETE FROM t", Engine::Postgres));
+        // テーブル名への部分一致・リテラル内の単語は誤検知しない
+        assert!(is_readonly_allowed(
+            "EXPLAIN ANALYZE SELECT * FROM delete_log",
+            Engine::Postgres
+        ));
+        assert!(is_readonly_allowed(
+            "EXPLAIN ANALYZE SELECT * FROM t WHERE op = 'delete'",
+            Engine::Postgres
+        ));
+    }
+
+    #[test]
+    fn test_build_explain_sql() {
+        // エンジン別のプレフィックス
+        assert_eq!(
+            build_explain_sql("postgres", "SELECT * FROM t").unwrap(),
+            "EXPLAIN (ANALYZE, BUFFERS)\nSELECT * FROM t"
+        );
+        assert_eq!(
+            build_explain_sql("mysql", "SELECT * FROM t").unwrap(),
+            "EXPLAIN FORMAT=JSON\nSELECT * FROM t"
+        );
+        assert_eq!(
+            build_explain_sql("sqlite", "SELECT * FROM t").unwrap(),
+            "EXPLAIN QUERY PLAN\nSELECT * FROM t"
+        );
+        // エンジン名の別表記
+        assert!(build_explain_sql("PostgreSQL", "SELECT 1").is_ok());
+        assert!(build_explain_sql("mariadb", "SELECT 1").is_ok());
+        // WITH (CTE) と先頭コメント付きも対象
+        assert!(build_explain_sql("sqlite", "WITH x AS (SELECT 1) SELECT * FROM x").is_ok());
+        assert!(build_explain_sql("sqlite", "-- note\nSELECT 1").is_ok());
+        // SELECT / WITH 以外は拒否 (EXPLAIN ANALYZE が DML を実行するため)
+        assert!(build_explain_sql("postgres", "UPDATE t SET a = 1").is_err());
+        assert!(build_explain_sql("postgres", "DELETE FROM t").is_err());
+        assert!(build_explain_sql("mysql", "SHOW TABLES").is_err());
+        assert!(build_explain_sql("sqlite", "").is_err());
+        // 先頭が SELECT / WITH でも書き込みを伴い得る文は拒否
+        // (Postgres の EXPLAIN ANALYZE が実際に実行してしまうため)
+        assert!(build_explain_sql("postgres", "SELECT * INTO new_table FROM t").is_err());
+        assert!(
+            build_explain_sql("mysql", "SELECT * FROM t INTO OUTFILE '/tmp/x'").is_err()
+        );
+        assert!(build_explain_sql(
+            "postgres",
+            "WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x"
+        )
+        .is_err());
+        // リテラル内の into / delete は誤検知しない
+        assert!(build_explain_sql("postgres", "SELECT 'into' FROM t").is_ok());
+        assert!(
+            build_explain_sql("postgres", "WITH x AS (SELECT 'delete') SELECT * FROM x").is_ok()
+        );
+        // メタコマンドも対象外
+        assert!(build_explain_sql("sqlite", "\\dt").is_err());
+        // 不明エンジンはエラー
+        assert!(build_explain_sql("oracle", "SELECT 1").is_err());
     }
 
     #[test]
@@ -1452,6 +1595,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.row_count, 3);
+        assert_eq!(result.applied_limit, None);
+
+        // build_explain_sql で組み立てた EXPLAIN QUERY PLAN が実行できる
+        // (readonly 接続でも許可される)
+        let explain_sql = build_explain_sql("sqlite", "SELECT * FROM t ORDER BY id").unwrap();
+        let result = run_query(&pool, &explain_sql, 10, Some(2), true)
+            .await
+            .unwrap();
+        assert!(result.row_count >= 1);
+        assert!(result.columns.contains(&"detail".to_string()));
+        // EXPLAIN には自動 LIMIT を付与しない (先頭キーワードが explain のため)
         assert_eq!(result.applied_limit, None);
     }
 

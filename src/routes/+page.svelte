@@ -103,6 +103,8 @@
         <EditorToolbar
           engine={selectedEngine}
           readonly={selectedConnectionInfo?.readonly ?? false}
+          onExplain={() =>
+            appStore.explainQuery(editor?.getCurrentStatement() ?? "")}
         />
       {/if}
       <div class="min-h-0 flex-[3] border-b border-zinc-700">

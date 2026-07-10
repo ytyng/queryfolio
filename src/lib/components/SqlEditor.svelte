@@ -225,13 +225,16 @@
 
   // ツールバーの Run ボタンから呼ぶための公開メソッド
   export function runCurrentStatement() {
-    if (!view) {
-      return;
-    }
-    const statement = currentStatementText(view.state);
+    const statement = getCurrentStatement();
     if (statement.trim()) {
       onRun(statement);
     }
+  }
+
+  // カーソル位置の文 (実行対象と同じ範囲) を返す公開メソッド。
+  // ツールバーの Explain ボタンが EXPLAIN の対象文を取るのに使う
+  export function getCurrentStatement(): string {
+    return view ? currentStatementText(view.state) : "";
   }
 
   const runKeymap = keymap.of([

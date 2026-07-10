@@ -1,13 +1,23 @@
 <script lang="ts">
   import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-  import appStore from "$lib/stores/app.svelte";
+  import appStore, { isExplainSql } from "$lib/stores/app.svelte";
   import type { ResultTab } from "$lib/stores/app.svelte";
   import { toCsv, toJson, toTsv } from "$lib/export";
   import CellInspector from "./CellInspector.svelte";
+  import AiAnalysisModal from "./AiAnalysisModal.svelte";
 
   let copiedFormat = $state<string | null>(null);
 
   const activeTab = $derived(appStore.activeResultTab);
+
+  /// Analyze with AI ボタンの表示条件: EXPLAIN 由来のタブに結果があり、
+  /// AI が設定済みであること
+  const canAnalyzePlan = $derived(
+    activeTab !== null &&
+      activeTab.result !== null &&
+      isExplainSql(activeTab.sql) &&
+      (appStore.aiInfo?.configured ?? false),
+  );
 
   // インスペクタで表示中のセル。どのタブのセルかを tabId で覚えておき、
   // タブ切替・タブクローズ時に別タブのセルを表示し続けないようにする
@@ -270,6 +280,27 @@
         >
           ↻ Re-run
         </button>
+        {#if canAnalyzePlan}
+          <!-- EXPLAIN の実行計画を AI に解説させる (AI 設定済みのタブのみ) -->
+          <button
+            class="flex items-center gap-1 rounded border border-blue-500/50 bg-blue-500/15 px-1.5 py-0.5 text-blue-300 hover:bg-blue-500/25 disabled:cursor-not-allowed disabled:opacity-50"
+            title="Explain the plan with AI ({appStore.aiInfo?.model})"
+            data-annotate="button-analyze-plan"
+            disabled={appStore.aiAnalyzing}
+            onclick={() => appStore.analyzeExplainTab(activeTab.id)}
+          >
+            {#if appStore.aiAnalyzing}
+              <!-- 解説中スピナー -->
+              <span
+                class="inline-block size-3 animate-spin rounded-full border-2 border-blue-300 border-t-transparent"
+                data-annotate="spinner-ai-analyzing"
+              ></span>
+              Analyzing...
+            {:else}
+              ✨ Analyze with AI
+            {/if}
+          </button>
+        {/if}
         {#if activeTab.result && activeTab.result.columns.length > 0}
           {#each ["csv", "tsv", "json"] as const as format (format)}
             <button
@@ -443,3 +474,11 @@
     {/if}
   </div>
 </div>
+
+<!-- AI による実行計画解説のモーダル -->
+{#if appStore.aiAnalysis !== null}
+  <AiAnalysisModal
+    text={appStore.aiAnalysis}
+    onClose={() => appStore.closeAiAnalysis()}
+  />
+{/if}

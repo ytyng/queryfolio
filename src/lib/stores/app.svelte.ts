@@ -29,6 +29,12 @@ export interface ResultTab {
   fixSuggestion: string | null;
 }
 
+/// タブの SQL が EXPLAIN 由来かを判定する (Analyze with AI ボタンの表示用)。
+/// Explain ボタンで組み立てた SQL は必ず EXPLAIN で始まるため、
+/// 先頭キーワードの一致で判定する (手入力の EXPLAIN も対象になる)
+export const isExplainSql = (sql: string): boolean =>
+  sql.trimStart().toLowerCase().startsWith("explain");
+
 let connections = $state<ConnectionInfo[]>([]);
 let selectedConnection = $state<string | null>(null);
 let files = $state<string[]>([]);
@@ -47,6 +53,10 @@ let aiInfo = $state<AiInfo | null>(null);
 let aiError = $state<string | null>(null);
 /// AI で SQL 生成中 (ボタンのスピナー表示・二重送信防止)
 let aiGenerating = $state(false);
+/// AI で実行計画を解説中 (ボタンのスピナー表示・二重送信防止)
+let aiAnalyzing = $state(false);
+/// AI による実行計画解説の Markdown (モーダル表示中のみ非 null)
+let aiAnalysis = $state<string | null>(null);
 /// SQL 補完用のテーブル名 → カラム名リストのマップ (未取得・取得失敗は null)
 let schemaMap = $state<Record<string, string[]> | null>(null);
 
@@ -118,6 +128,7 @@ const reloadConnections = async (): Promise<boolean> => {
   activeSchema = null;
   aiInfo = null;
   aiError = null;
+  aiAnalysis = null;
   // 実行中の取得が後から古いマップを書き込まないよう世代を進めて破棄する
   schemaMapGeneration++;
   schemaMap = null;
@@ -576,6 +587,74 @@ const runQuery = async (sql: string) => {
   await executeTab(tab);
 };
 
+/// カーソル位置の文にエンジン別の EXPLAIN プレフィックスを付けて実行する。
+/// プレフィックスの組み立てと対象判定 (SELECT / WITH のみ) はバックエンドの
+/// build_explain_sql が行い、対象外の文は toast で断る。
+const explainQuery = async (sql: string) => {
+  if (!selectedConnection) {
+    toast.warning("Select a connection first");
+    return;
+  }
+  if (!sql.trim()) {
+    toast.warning("There is no SQL statement to explain");
+    return;
+  }
+  let explainSql: string;
+  try {
+    explainSql = await api.buildExplainSql(selectedConnection, sql);
+  } catch (e) {
+    // 対象外の文 (DML 等) や不明エンジン。実行前の断りなので warning にする
+    toast.warning(toErrorMessage(e));
+    return;
+  }
+  await runQuery(explainSql);
+};
+
+/// EXPLAIN 結果を AI に渡すテキストに整形する (ヘッダ + タブ区切り行)。
+/// 渡すのは実行計画テキストのみ (EXPLAIN 出力なので結果データではない)
+const formatPlanText = (result: QueryResult): string => {
+  const cellText = (value: unknown): string =>
+    value === null || value === undefined
+      ? "NULL"
+      : typeof value === "object"
+        ? JSON.stringify(value)
+        : String(value);
+  const lines = result.rows.map((row) => row.map(cellText).join("\t"));
+  return [result.columns.join("\t"), ...lines].join("\n");
+};
+
+/// EXPLAIN 結果のタブを AI に解説させ、Markdown をモーダルに表示する
+const analyzeExplainTab = async (id: number) => {
+  const tab = resultTabs.find((t) => t.id === id);
+  if (!tab || !tab.result || aiAnalyzing) {
+    return;
+  }
+  aiAnalyzing = true;
+  try {
+    const text = await api.aiExplainPlan(
+      tab.connection,
+      tab.sql,
+      formatPlanText(tab.result),
+    );
+    if (!text.trim()) {
+      toast.warning("The AI returned an empty response");
+      return;
+    }
+    aiAnalysis = text;
+  } catch (e) {
+    toast.error("Failed to analyze the execution plan", {
+      description: toErrorMessage(e),
+    });
+  } finally {
+    aiAnalyzing = false;
+  }
+};
+
+/// AI 解説モーダルを閉じる
+const closeAiAnalysis = () => {
+  aiAnalysis = null;
+};
+
 /// タブに記録された SQL を同じ接続で再実行する
 const rerunTab = async (id: number) => {
   const tab = resultTabs.find((t) => t.id === id);
@@ -686,6 +765,13 @@ export default {
   get aiGenerating() {
     return aiGenerating;
   },
+  get aiAnalyzing() {
+    return aiAnalyzing;
+  },
+  /// AI による実行計画解説の Markdown (モーダル表示中のみ非 null)
+  get aiAnalysis() {
+    return aiAnalysis;
+  },
   /// SQL 補完用のテーブル名 → カラム名リストのマップ (未取得なら null)
   get schemaMap() {
     return schemaMap;
@@ -708,6 +794,9 @@ export default {
   dismissFixSuggestion,
   isConnectionRunning,
   runQuery,
+  explainQuery,
+  analyzeExplainTab,
+  closeAiAnalysis,
   cancelQuery,
   rerunTab,
   selectResultTab,

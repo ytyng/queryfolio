@@ -24,6 +24,10 @@ pub enum AppError {
     #[error("AI error: {0}")]
     Ai(String),
 
+    /// EXPLAIN の対象にできない文 (SELECT / WITH 以外) が指定された
+    #[error("{0}")]
+    Explain(String),
+
     /// ユーザーのキャンセル要求でクエリが中断された。
     /// フロントエンドはこの文字列 ("Query cancelled") との一致で
     /// エラーではなくキャンセルとして表示を分ける。
