@@ -36,9 +36,15 @@ let loadingConnections = $state(false);
 let dirty = $state(false);
 let schemas = $state<string[]>([]);
 let activeSchema = $state<string | null>(null);
+/// SQL 補完用のテーブル名 → カラム名リストのマップ (未取得・取得失敗は null)
+let schemaMap = $state<Record<string, string[]> | null>(null);
 
 // タブ ID の連番 (セッション内で一意なら十分なので永続化しない)
 let nextTabId = 1;
+
+/// 実行中の loadSchemaMap の世代番号。接続・スキーマの連続切替で
+/// 古い応答が後から解決しても、最新の要求の結果だけを反映するために使う
+let schemaMapGeneration = 0;
 
 let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -83,6 +89,9 @@ const reloadConnections = async (): Promise<boolean> => {
   dirty = false;
   schemas = [];
   activeSchema = null;
+  // 実行中の取得が後から古いマップを書き込まないよう世代を進めて破棄する
+  schemaMapGeneration++;
+  schemaMap = null;
   await loadConnections();
   if (errorMessage) {
     return false;
@@ -94,6 +103,28 @@ const reloadConnections = async (): Promise<boolean> => {
     await selectConnection(previousConnection);
   }
   return true;
+};
+
+/// SQL 補完用のスキーママップをバックグラウンドで再取得する。
+/// 補完はあくまで補助機能のため、失敗しても通知せず補完なしで続行する。
+const loadSchemaMap = async () => {
+  const connection = selectedConnection;
+  const generation = ++schemaMapGeneration;
+  if (!connection) {
+    schemaMap = null;
+    return;
+  }
+  // 取得中に古いスキーマの候補を出さないよう先にクリアする
+  schemaMap = null;
+  try {
+    const map = await api.getSchemaMap(connection);
+    // より新しい要求が始まっていたら、古い応答は捨てる
+    if (generation === schemaMapGeneration) {
+      schemaMap = map;
+    }
+  } catch {
+    // 補完なしで黙って続行 (toast も errorMessage も出さない)
+  }
 };
 
 // 保留中の自動保存を確定させる。保存に失敗した場合は false を返す。
@@ -122,6 +153,10 @@ const selectConnection = async (name: string) => {
   activeSchema =
     connections.find((c) => c.name === name)?.schema ?? null;
   schemas = [];
+  // 接続確立を待つ間、前の接続の補完候補を出さないよう先にクリアする
+  // (世代も進め、実行中の古い取得が後から書き込むのを防ぐ)
+  schemaMapGeneration++;
+  schemaMap = null;
   try {
     files = await api.listQueryFiles(name);
   } catch (e) {
@@ -136,6 +171,8 @@ const selectConnection = async (name: string) => {
   } catch {
     schemas = activeSchema ? [activeSchema] : [];
   }
+  // SQL 補完用のスキーママップをバックグラウンドで取得する (待たない)
+  void loadSchemaMap();
 };
 
 // アクティブスキーマ (database) を切り替える。成功したら true。
@@ -150,6 +187,8 @@ const changeActiveSchema = async (schema: string): Promise<boolean> => {
     await api.setActiveSchema(selectedConnection, schema);
     activeSchema = schema;
     errorMessage = null;
+    // 切替先スキーマの補完候補をバックグラウンドで取得する (待たない)
+    void loadSchemaMap();
     return true;
   } catch (e) {
     errorMessage = toErrorMessage(e);
@@ -495,7 +534,12 @@ export default {
   get activeSchema() {
     return activeSchema;
   },
+  /// SQL 補完用のテーブル名 → カラム名リストのマップ (未取得なら null)
+  get schemaMap() {
+    return schemaMap;
+  },
   loadConnections,
+  loadSchemaMap,
   reloadConnections,
   selectConnection,
   changeActiveSchema,

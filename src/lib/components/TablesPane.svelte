@@ -71,6 +71,14 @@
     }
   };
 
+  /// リロードボタン: キャッシュを破棄してテーブル一覧を再取得し、
+  /// SQL 補完用のスキーママップも追従させる (list_tables の refresh が
+  /// バックエンドのカラムキャッシュも破棄するため、再取得で反映される)
+  const reload = async () => {
+    await load(appStore.selectedConnection, true);
+    void appStore.loadSchemaMap();
+  };
+
   // 接続・アクティブスキーマの変化で再読込する (初回マウント時も走る)。
   // スキーマ切替 (changeActiveSchema) 後のツリー更新もこの購読で行われる。
   // 接続選択直後は activeSchema が複数回変化するためデバウンスする。
@@ -161,7 +169,7 @@
       title="Reload tables"
       data-annotate="button-reload-tables"
       disabled={!appStore.selectedConnection || loading}
-      onclick={() => void load(appStore.selectedConnection, true)}
+      onclick={() => void reload()}
     >
       ↻
     </button>

@@ -16,20 +16,27 @@
   import { syntaxTree } from "@codemirror/language";
   import { autocompletion, completionKeymap } from "@codemirror/autocomplete";
   import { sql, MySQL, PostgreSQL, SQLite } from "@codemirror/lang-sql";
+  import type { SQLNamespace } from "@codemirror/lang-sql";
   import { oneDark } from "@codemirror/theme-one-dark";
 
   interface Props {
     content: string;
     engine: string | null;
+    /// スキーマベース補完用のテーブル名 → カラム名リスト (未取得なら null)
+    schemaMap: Record<string, string[]> | null;
     onChange: (content: string) => void;
     onRun: (sql: string) => void;
   }
 
-  let { content, engine, onChange, onRun }: Props = $props();
+  let { content, engine, schemaMap, onChange, onRun }: Props = $props();
 
   let editorElement: HTMLDivElement;
   let view: EditorView | null = null;
   const languageCompartment = new Compartment();
+
+  /// スキーマ補完に使うテーブル数の上限。超えた場合はカラムを渡さず
+  /// テーブル名のみにする (補完候補の構築コストとメモリの抑制)
+  const MAX_SCHEMA_TABLES_WITH_COLUMNS = 2000;
 
   const dialectFor = (engineName: string | null) => {
     switch ((engineName ?? "").toLowerCase()) {
@@ -46,6 +53,29 @@
         return PostgreSQL;
     }
   };
+
+  // スキーママップを lang-sql の schema オプションへ変換する。
+  // Record<string, string[]> はそのまま SQLNamespace として渡せる
+  // (PostgreSQL の "schema.table" のようなドット付きキーは lang-sql 側で
+  // 階層に分解される)。巨大スキーマではカラムを省いてテーブル名のみにする。
+  const schemaNamespace = (
+    map: Record<string, string[]> | null,
+  ): SQLNamespace | undefined => {
+    if (!map) {
+      return undefined;
+    }
+    const tables = Object.keys(map);
+    if (tables.length <= MAX_SCHEMA_TABLES_WITH_COLUMNS) {
+      return map;
+    }
+    return Object.fromEntries(tables.map((table) => [table, []]));
+  };
+
+  // languageCompartment に入れる SQL 言語拡張 (方言 + スキーマ補完)
+  const languageExtension = (
+    engineName: string | null,
+    map: Record<string, string[]> | null,
+  ) => sql({ dialect: dialectFor(engineName), schema: schemaNamespace(map) });
 
   // カーソル位置を含む Statement ノードの範囲を返す。
   // カーソルが文と文の間にある場合は直前の文を返す (DataGrip と同様の挙動)。
@@ -257,7 +287,7 @@
             ...completionKeymap,
             indentWithTab,
           ]),
-          languageCompartment.of(sql({ dialect: dialectFor(engine) })),
+          languageCompartment.of(languageExtension(engine, schemaMap)),
           oneDark,
           editorTheme,
           statementHighlight,
@@ -291,14 +321,15 @@
     }
   });
 
-  // エンジン変更時に SQL 方言を差し替える
+  // エンジン・スキーママップ変更時に SQL 方言と補完スキーマを差し替える
   $effect(() => {
-    const dialect = dialectFor(engine);
+    // view のガードより先に評価し、両方をリアクティブ依存として追跡させる
+    const extension = languageExtension(engine, schemaMap);
     if (!view) {
       return;
     }
     view.dispatch({
-      effects: languageCompartment.reconfigure(sql({ dialect })),
+      effects: languageCompartment.reconfigure(extension),
     });
   });
 </script>
