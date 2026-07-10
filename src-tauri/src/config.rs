@@ -188,6 +188,17 @@ enum ServersSource {
     File(String),
 }
 
+/// resolve_servers の結果。サーバー一覧に加えて、ソース宣言で取得した
+/// YAML のトップレベル `ai:` セクション (未検証の生値) も返す。
+/// AI 設定の検証・解決は ai::resolve_ai_config が行う
+/// (ローカル config.yml 側の ai は AppConfig::local_ai で取る)。
+#[derive(Debug)]
+pub struct ResolvedServers {
+    pub servers: Vec<ServerConfig>,
+    /// 取得 YAML のトップレベル ai セクション。インライン定義の場合は None
+    pub fetched_ai: Option<serde_yaml::Value>,
+}
+
 /// フロントエンドの情報表示用。設定の解決結果 (機密を含まない)。
 #[derive(Debug, Serialize)]
 pub struct ConfigInfo {
@@ -319,8 +330,14 @@ impl AppConfig {
         }
     }
 
+    /// ローカル config.yml トップレベルの `ai:` セクション (未検証の生値)。
+    pub fn local_ai(&self) -> Option<serde_yaml::Value> {
+        self.doc.get("ai").cloned()
+    }
+
     /// 接続サーバー一覧を解決する。ソース宣言の場合は取得を伴う。
-    pub async fn resolve_servers(&self) -> Result<Vec<ServerConfig>, AppError> {
+    /// 取得した YAML のトップレベル ai セクションもあわせて返す。
+    pub async fn resolve_servers(&self) -> Result<ResolvedServers, AppError> {
         match self.servers_source()? {
             ServersSource::Inline => {
                 let servers = self
@@ -335,7 +352,10 @@ impl AppConfig {
                     .and_then(|v| v.as_sequence())
                     .cloned()
                     .unwrap_or_default();
-                parse_server_entries(&servers, &templates, "config (inline)")
+                Ok(ResolvedServers {
+                    servers: parse_server_entries(&servers, &templates, "config (inline)")?,
+                    fetched_ai: None,
+                })
             }
             ServersSource::Command(command) => {
                 let yaml = run_source_command(&command).await?;
@@ -422,11 +442,12 @@ fn parse_mapping(yaml_text: &str, source: &str) -> Result<serde_yaml::Mapping, A
 
 /// ソース宣言で取得した YAML をパースする。
 /// sql-agent-mcp-server 互換フォーマット (sql_servers リスト + sql_server_templates)。
+/// トップレベルに `ai:` セクションがあればあわせて返す (queryfolio 独自拡張)。
 /// 取得先でさらにソース宣言を使う再帰は禁止 (ループ防止のため深さ 1 まで)。
 fn parse_fetched_servers(
     yaml_text: &str,
     source: &str,
-) -> Result<Vec<ServerConfig>, AppError> {
+) -> Result<ResolvedServers, AppError> {
     let mapping = parse_mapping(yaml_text, source)?;
     let servers_value = mapping.get("sql_servers").ok_or_else(|| {
         AppError::Config(format!("{source} has no sql_servers key"))
@@ -442,7 +463,10 @@ fn parse_fetched_servers(
         .and_then(|v| v.as_sequence())
         .cloned()
         .unwrap_or_default();
-    parse_server_entries(servers, &templates, source)
+    Ok(ResolvedServers {
+        servers: parse_server_entries(servers, &templates, source)?,
+        fetched_ai: mapping.get("ai").cloned(),
+    })
 }
 
 fn parse_server_entries(
@@ -604,7 +628,7 @@ sql_servers:
     password: secret
 "#,
         );
-        let servers = config.resolve_servers().await.unwrap();
+        let servers = config.resolve_servers().await.unwrap().servers;
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "dev-postgres");
         assert_eq!(servers[0].port, Some(5432));
@@ -626,7 +650,7 @@ sql_servers:
     readonly: true
 "#,
         );
-        let servers = config.resolve_servers().await.unwrap();
+        let servers = config.resolve_servers().await.unwrap().servers;
         assert!(!servers[0].readonly);
         assert!(servers[1].readonly);
         assert!(!ConnectionInfo::from(&servers[0]).readonly);
@@ -654,7 +678,7 @@ sql_server_templates:
     password: shared_password
 "#,
         );
-        let servers = config.resolve_servers().await.unwrap();
+        let servers = config.resolve_servers().await.unwrap().servers;
         assert_eq!(servers.len(), 2);
         assert_eq!(servers[0].engine, "mysql");
         assert_eq!(servers[0].host.as_deref(), Some("db.example.com"));
@@ -672,7 +696,7 @@ sql_servers:
   command: '/bin/echo "sql_servers: [{name: from-command, engine: sqlite, schema: /tmp/x.db}]"'
 "#,
         );
-        let servers = config.resolve_servers().await.unwrap();
+        let servers = config.resolve_servers().await.unwrap().servers;
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "from-command");
     }
@@ -689,7 +713,7 @@ sql_servers:
   env: QUERYFOLIO_TEST_SERVERS_YAML
 "#,
         );
-        let servers = config.resolve_servers().await.unwrap();
+        let servers = config.resolve_servers().await.unwrap().servers;
         assert_eq!(servers[0].name, "from-env");
     }
 
@@ -708,9 +732,65 @@ sql_servers:
             "sql_servers:\n  file: {}",
             path.display()
         ));
-        let servers = config.resolve_servers().await.unwrap();
+        let servers = config.resolve_servers().await.unwrap().servers;
         assert_eq!(servers[0].name, "from-file");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_inline_has_no_fetched_ai_and_local_ai_is_returned() {
+        // インライン定義では fetched_ai は無く、ローカルの ai は local_ai で取れる
+        let config = config_from_yaml(
+            r#"
+sql_servers:
+  - name: x
+    engine: sqlite
+    schema: /tmp/x.db
+ai:
+  provider: openai
+  api_key: sk-local
+"#,
+        );
+        let resolved = config.resolve_servers().await.unwrap();
+        assert!(resolved.fetched_ai.is_none());
+        let local = config.local_ai().unwrap();
+        assert_eq!(
+            local.get("api_key").and_then(|v| v.as_str()),
+            Some("sk-local")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetched_yaml_ai_is_extracted() {
+        // ソース宣言で取得した YAML のトップレベル ai が fetched_ai として返る
+        let config = config_from_yaml(
+            r#"
+sql_servers:
+  command: '/bin/echo "{sql_servers: [{name: x, engine: sqlite, schema: /tmp/x.db}], ai: {provider: openai, api_key: sk-fetched}}"'
+"#,
+        );
+        let resolved = config.resolve_servers().await.unwrap();
+        assert_eq!(resolved.servers.len(), 1);
+        let fetched = resolved.fetched_ai.unwrap();
+        assert_eq!(
+            fetched.get("api_key").and_then(|v| v.as_str()),
+            Some("sk-fetched")
+        );
+        // ローカル側には ai が無い
+        assert!(config.local_ai().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fetched_yaml_without_ai() {
+        // 取得 YAML に ai が無ければ fetched_ai は None
+        let config = config_from_yaml(
+            r#"
+sql_servers:
+  command: '/bin/echo "sql_servers: [{name: x, engine: sqlite, schema: /tmp/x.db}]"'
+"#,
+        );
+        let resolved = config.resolve_servers().await.unwrap();
+        assert!(resolved.fetched_ai.is_none());
     }
 
     #[tokio::test]
@@ -793,7 +873,7 @@ sql_servers:
     async fn test_config_template_is_valid() {
         // テンプレートはそのままで有効な設定 (接続 0 件) としてパースできること
         let config = config_from_yaml(CONFIG_TEMPLATE);
-        let servers = config.resolve_servers().await.unwrap();
+        let servers = config.resolve_servers().await.unwrap().servers;
         assert!(servers.is_empty());
         config.resolve_sqlfiles_dir().unwrap();
     }

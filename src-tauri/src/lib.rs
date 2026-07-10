@@ -1,3 +1,4 @@
+mod ai;
 mod config;
 mod db;
 mod history;
@@ -35,6 +36,10 @@ struct AppState {
     /// スキーマ情報 (テーブル・カラム) のキャッシュ。
     /// スキーマブラウザと SQL 補完 (get_schema_map) で共有する。
     schema_cache: schema_info::SchemaCache,
+    /// AI 設定のセッションキャッシュ (reset_connections でクリア)。
+    /// 外側の None は未解決を表す。api_key を含むためフロントには渡さず、
+    /// get_ai_info で configured / model のみを返す。
+    ai: tokio::sync::Mutex<Option<Option<ai::AiConfig>>>,
 }
 
 impl AppState {
@@ -61,7 +66,7 @@ impl AppState {
     async fn find_server(&self, connection: &str) -> Result<ServerConfig, AppError> {
         let mut servers = self.servers.lock().await;
         if servers.is_none() {
-            *servers = Some(AppConfig::load()?.resolve_servers().await?);
+            *servers = Some(AppConfig::load()?.resolve_servers().await?.servers);
         }
         servers
             .as_ref()
@@ -82,15 +87,74 @@ impl AppState {
             None => server.schema.clone().unwrap_or_default(),
         }
     }
+
+    /// AI 設定を解決する (キャッシュあり)。未設定なら Ok(None)。
+    /// ローカル config.yml と接続 YAML (ソース宣言で取得) の両方の
+    /// トップレベル `ai:` を見て、接続 YAML 側を優先する。
+    /// 解決エラー (不明 provider 等) はキャッシュせず毎回返す
+    /// (設定修正 + リロードで直せるように)。
+    async fn resolve_ai_config(&self) -> Result<Option<ai::AiConfig>, AppError> {
+        let mut cached = self.ai.lock().await;
+        if let Some(ai_config) = cached.as_ref() {
+            return Ok(ai_config.clone());
+        }
+        let config = AppConfig::load()?;
+        let resolved = config.resolve_servers().await?;
+        let ai_config =
+            ai::resolve_ai_config(config.local_ai().as_ref(), resolved.fetched_ai.as_ref())?;
+        // 同じ取得結果からサーバー一覧も得られるのでキャッシュしておく
+        *self.servers.lock().await = Some(resolved.servers);
+        *cached = Some(ai_config.clone());
+        Ok(ai_config)
+    }
+
+    /// テーブル → カラム名リストのマップを解決する (キャッシュあり)。
+    /// SQL 補完 (get_schema_map) と AI の SQL 生成コンテキストで共有する。
+    async fn resolve_schema_map(
+        &self,
+        server: &ServerConfig,
+        schema_key: &str,
+    ) -> Result<std::collections::BTreeMap<String, Vec<String>>, AppError> {
+        if let Some(map) = self
+            .schema_cache
+            .get_schema_map(&server.name, schema_key)
+            .await
+        {
+            return Ok(map);
+        }
+        let pool = self.db.get_pool(server).await?;
+        let all = schema_info::fetch_all_columns(&pool).await?;
+        let map = all
+            .iter()
+            .map(|(table, columns)| {
+                (
+                    table.clone(),
+                    columns.iter().map(|c| c.name.clone()).collect(),
+                )
+            })
+            .collect();
+        self.schema_cache
+            .put_all_columns(&server.name, schema_key, all)
+            .await;
+        Ok(map)
+    }
 }
 
 #[tauri::command]
 async fn get_connections(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<ConnectionInfo>, AppError> {
-    let servers = AppConfig::load()?.resolve_servers().await?;
-    let infos = servers.iter().map(ConnectionInfo::from).collect();
-    *state.servers.lock().await = Some(servers);
+    let config = AppConfig::load()?;
+    let resolved = config.resolve_servers().await?;
+    let infos = resolved.servers.iter().map(ConnectionInfo::from).collect();
+    // 同じ取得結果から AI 設定も解決してキャッシュする (取得コマンドの
+    // 再実行を避けるため)。解決エラーはここでは接続一覧を壊さず、
+    // get_ai_info / ai_generate_sql 側の再解決で返す。
+    match ai::resolve_ai_config(config.local_ai().as_ref(), resolved.fetched_ai.as_ref()) {
+        Ok(ai_config) => *state.ai.lock().await = Some(ai_config),
+        Err(_) => *state.ai.lock().await = None,
+    }
+    *state.servers.lock().await = Some(resolved.servers);
     Ok(infos)
 }
 
@@ -101,6 +165,7 @@ async fn reset_connections(state: tauri::State<'_, AppState>) -> Result<(), AppE
     *state.servers.lock().await = None;
     *state.sqlfiles_dir.lock().await = None;
     *state.default_limit.lock().await = None;
+    *state.ai.lock().await = None;
     state.db.reset().await;
     state.schema_cache.clear().await;
     Ok(())
@@ -363,29 +428,60 @@ async fn get_schema_map(
 ) -> Result<std::collections::BTreeMap<String, Vec<String>>, AppError> {
     let server = state.find_server(&connection).await?;
     let schema_key = state.active_schema_key(&server).await;
-    if let Some(map) = state
-        .schema_cache
-        .get_schema_map(&connection, &schema_key)
-        .await
-    {
-        return Ok(map);
+    state.resolve_schema_map(&server, &schema_key).await
+}
+
+/// AI 設定の情報 (configured / model) を返す。api_key は含めない。
+/// `ai:` セクションが無い場合はエラーではなく configured: false。
+/// セクションはあるが不正 (不明 provider 等) な場合はエラーを返す。
+#[tauri::command]
+async fn get_ai_info(state: tauri::State<'_, AppState>) -> Result<ai::AiInfo, AppError> {
+    Ok(match state.resolve_ai_config().await? {
+        Some(config) => ai::AiInfo {
+            configured: true,
+            model: config.model().to_string(),
+        },
+        None => ai::AiInfo {
+            configured: false,
+            model: String::new(),
+        },
+    })
+}
+
+/// 自然言語の指示から SQL を生成して返す。実行はせず、エディタへの
+/// 挿入もフロント側に任せる (ユーザーが確認してから実行する)。
+/// LLM に送るのはスキーマ情報 (テーブル・カラム名)・エンジン方言・
+/// アクティブスキーマ名・ユーザーの指示のみ。クエリの結果データや
+/// 接続情報 (ホスト・認証情報) は送らない。
+#[tauri::command]
+async fn ai_generate_sql(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    instruction: String,
+) -> Result<String, AppError> {
+    if instruction.trim().is_empty() {
+        return Err(AppError::Ai("The instruction is empty".into()));
     }
-    let pool = state.db.get_pool(&server).await?;
-    let all = schema_info::fetch_all_columns(&pool).await?;
-    let map = all
-        .iter()
-        .map(|(table, columns)| {
-            (
-                table.clone(),
-                columns.iter().map(|c| c.name.clone()).collect(),
-            )
-        })
-        .collect();
-    state
-        .schema_cache
-        .put_all_columns(&connection, &schema_key, all)
-        .await;
-    Ok(map)
+    let ai_config = state.resolve_ai_config().await?.ok_or_else(|| {
+        AppError::Ai(
+            "AI is not configured. Add an 'ai:' section (provider / api_key) \
+             to config.yml or the connection YAML"
+                .into(),
+        )
+    })?;
+    let server = state.find_server(&connection).await?;
+    let schema_key = state.active_schema_key(&server).await;
+    let schema_map = state.resolve_schema_map(&server, &schema_key).await?;
+    // sqlite の schema はローカル DB ファイルパスなので、プロンプトには含めない
+    let is_sqlite = matches!(
+        server.engine.to_ascii_lowercase().as_str(),
+        "sqlite" | "sqlite3"
+    );
+    let active_schema =
+        (!is_sqlite && !schema_key.trim().is_empty()).then_some(schema_key.as_str());
+    let system_prompt = ai::build_sql_system_prompt(&server.engine, active_schema, &schema_map);
+    let response = ai::chat_complete(&ai_config, &system_prompt, &instruction).await?;
+    Ok(ai::strip_sql_fences(&response))
 }
 
 /// 設定の解決結果を返す (情報表示用。機密を含まない)。
@@ -470,6 +566,8 @@ pub fn run() {
             list_tables,
             list_columns,
             get_schema_map,
+            get_ai_info,
+            ai_generate_sql,
             get_config_info,
             ensure_config_file,
         ])

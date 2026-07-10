@@ -20,6 +20,10 @@ pub enum AppError {
     #[error("{0}")]
     Readonly(String),
 
+    /// AI 機能のエラー (設定不備・API 呼び出し失敗)
+    #[error("AI error: {0}")]
+    Ai(String),
+
     /// ユーザーのキャンセル要求でクエリが中断された。
     /// フロントエンドはこの文字列 ("Query cancelled") との一致で
     /// エラーではなくキャンセルとして表示を分ける。
