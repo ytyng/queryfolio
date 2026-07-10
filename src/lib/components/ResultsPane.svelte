@@ -115,6 +115,21 @@
 
   const tabTooltip = (tab: ResultTab): string =>
     `${tab.connection}${tab.schema ? ` / ${tab.schema}` : ""} at ${formatTime(tab.executedAt)}\n${tab.sql.trim()}`;
+
+  const aiConfigured = $derived(appStore.aiInfo?.configured ?? false);
+
+  /// Fix with AI ボタンの title (未設定・エラー時は設定方法を案内する)。
+  /// DB エラーメッセージには値が含まれ得るため、送信内容を明示する
+  const aiFixButtonTitle = $derived(
+    aiConfigured
+      ? `Ask AI to fix this SQL (${appStore.aiInfo?.model}). ` +
+          "Sends the failed SQL, the database error message, and " +
+          "table/column names to the AI provider (never the query results)."
+      : appStore.aiError
+        ? `AI is unavailable: ${appStore.aiError}`
+        : "AI is not configured. Add an 'ai:' section (provider: openai, " +
+          "api_key: ...) to config.yml or the connection YAML.",
+  );
 </script>
 
 <div class="flex h-full min-h-0 flex-col bg-zinc-900">
@@ -279,9 +294,73 @@
       {:else if activeTab?.running}
         <p class="px-3 py-2 text-xs text-blue-400">Running...</p>
       {:else if activeTab?.error}
-        <pre
-          class="whitespace-pre-wrap px-3 py-2 font-mono text-xs text-red-400"
-          data-annotate="text-error-message">{activeTab.error}</pre>
+        <div class="px-3 py-2">
+          <div class="flex items-start gap-2">
+            <pre
+              class="min-w-0 flex-1 whitespace-pre-wrap font-mono text-xs text-red-400"
+              data-annotate="text-error-message">{activeTab.error}</pre>
+            <button
+              class="flex shrink-0 items-center gap-1 rounded border border-blue-500/50 bg-blue-500/15 px-2 py-0.5 text-xs text-blue-300 hover:bg-blue-500/25 disabled:cursor-not-allowed disabled:opacity-50"
+              title={aiFixButtonTitle}
+              data-annotate="button-ai-fix"
+              disabled={!aiConfigured || activeTab.fixing}
+              onclick={() => appStore.fixSqlWithAi(activeTab.id)}
+            >
+              {#if activeTab.fixing}
+                <!-- 修正案の生成中スピナー -->
+                <span
+                  class="inline-block size-3 animate-spin rounded-full border-2 border-blue-300 border-t-transparent"
+                  data-annotate="spinner-ai-fixing"
+                ></span>
+                Fixing...
+              {:else}
+                ✨ Fix with AI
+              {/if}
+            </button>
+          </div>
+
+          <!-- AI の修正案 (元の SQL と並べて表示。Apply までは実行しない) -->
+          {#if activeTab.fixSuggestion}
+            <div
+              class="mt-2 rounded border border-zinc-700 bg-zinc-800/40"
+              data-annotate="panel-ai-fix-suggestion"
+            >
+              <div
+                class="flex items-center gap-2 border-b border-zinc-700 px-2 py-1 text-xs text-zinc-400"
+              >
+                <span class="font-semibold">AI fix suggestion</span>
+                <span class="ml-auto flex items-center gap-1">
+                  <button
+                    class="rounded border border-blue-500/50 bg-blue-500/15 px-1.5 py-0.5 text-blue-300 hover:bg-blue-500/25"
+                    title="Insert the suggested SQL into the editor (does not run it)"
+                    data-annotate="button-ai-fix-apply"
+                    onclick={() => appStore.applyFixSuggestion(activeTab.id)}
+                  >
+                    Apply to editor
+                  </button>
+                  <button
+                    class="rounded border border-zinc-700 px-1.5 py-0.5 hover:bg-zinc-700 hover:text-zinc-200"
+                    title="Discard the suggestion"
+                    data-annotate="button-ai-fix-dismiss"
+                    onclick={() => appStore.dismissFixSuggestion(activeTab.id)}
+                  >
+                    Dismiss
+                  </button>
+                </span>
+              </div>
+              <div class="p-2 text-xs">
+                <p class="mb-1 text-zinc-500">Original SQL:</p>
+                <pre
+                  class="mb-2 overflow-x-auto rounded bg-zinc-900 px-2 py-1 font-mono text-zinc-400"
+                  data-annotate="text-ai-fix-original">{activeTab.sql.trim()}</pre>
+                <p class="mb-1 text-zinc-500">Suggested SQL:</p>
+                <pre
+                  class="overflow-x-auto rounded bg-zinc-900 px-2 py-1 font-mono text-emerald-300"
+                  data-annotate="text-ai-fix-suggested">{activeTab.fixSuggestion}</pre>
+              </div>
+            </div>
+          {/if}
+        </div>
       {:else if activeTab?.cancelled}
         <p
           class="px-3 py-2 text-xs text-amber-400"
