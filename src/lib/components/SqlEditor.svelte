@@ -73,36 +73,74 @@
     return previous;
   };
 
-  const currentStatementText = (state: EditorState): string => {
-    const head = state.selection.main.head;
-    const range = statementRangeAt(state, head);
-    // psql 風メタコマンド (\dt など) は、カーソル行が \ 始まりの場合に
-    // その行全体を実行対象にする。ただし複数行 SQL の途中の行
-    // (文字列リテラル内等) を誤ってメタコマンド扱いしないよう、
-    // カーソルを含む Statement が行の外にまたがる場合は SQL として扱う。
-    const line = state.doc.lineAt(head);
-    const lineText = state.sliceDoc(line.from, line.to).trim();
-    if (lineText.startsWith("\\")) {
-      // 注意: lezer のエラー回復は "\\d" を ⚠(バックスラッシュ) +
-      // Statement("d") とパースし、後続の SQL と融合することもあるため、
-      // 「Statement 内かどうか」ではメタコマンド行を判別できない。
-      // カーソルを含む Statement の開始行も \ 始まりなら、その Statement は
-      // メタコマンド行から始まった誤パースとみなして行を実行する。
-      // 開始行が通常の SQL (複数行文の途中の文字列リテラル等) の場合のみ
-      // Statement 全体を実行する。
+  // ある行の trim 済みテキストの範囲を返す (空行なら null)
+  const trimmedLineRange = (
+    state: EditorState,
+    pos: number,
+  ): { from: number; to: number } | null => {
+    const line = state.doc.lineAt(pos);
+    const text = state.sliceDoc(line.from, line.to);
+    const leading = text.length - text.trimStart().length;
+    const trailing = text.length - text.trimEnd().length;
+    if (leading + trailing >= text.length) {
+      return null;
+    }
+    return { from: line.from + leading, to: line.to - trailing };
+  };
+
+  // 実行対象の範囲を返す。**ハイライトと実行は必ずこの同じ範囲を使うこと**
+  // (別ロジックにすると表示と実行される SQL が乖離するバグになる)。
+  //
+  // 注意: lezer のエラー回復は "\d" を ⚠(バックスラッシュ) + Statement("d")
+  // とパースするため、Statement 範囲をそのまま使うとバックスラッシュが
+  // 欠落した SQL が実行される。以下のルールで補正する:
+  // - カーソル行が \ 始まりで、カーソルを含む Statement が無い、または
+  //   その Statement の開始行も \ 始まり (メタ行由来の誤パース) の場合は、
+  //   カーソル行の trim 範囲を実行対象にする
+  // - それ以外は Statement 範囲を使うが、範囲の直前 (行頭から Statement
+  //   開始まで) が空白とバックスラッシュのみなら範囲を行頭側へ拡張して
+  //   バックスラッシュを含める (直前の文フォールバックがメタ行を返す場合)
+  const executionTargetRange = (
+    state: EditorState,
+    pos: number,
+  ): { from: number; to: number } | null => {
+    const range = statementRangeAt(state, pos);
+    const cursorLine = trimmedLineRange(state, pos);
+    const cursorLineText = cursorLine
+      ? state.sliceDoc(cursorLine.from, cursorLine.to)
+      : "";
+
+    if (cursorLineText.startsWith("\\")) {
       const inStatement =
-        range !== null && head >= range.from && head <= range.to;
+        range !== null && pos >= range.from && pos <= range.to;
       if (!inStatement) {
-        return lineText;
+        return cursorLine;
       }
-      const statementFirstLine = state.doc.lineAt(range.from);
-      const statementFirstLineText = state
-        .sliceDoc(statementFirstLine.from, statementFirstLine.to)
-        .trim();
-      if (statementFirstLineText.startsWith("\\")) {
-        return lineText;
+      const firstLine = trimmedLineRange(state, range.from);
+      const firstLineText = firstLine
+        ? state.sliceDoc(firstLine.from, firstLine.to)
+        : "";
+      if (firstLineText.startsWith("\\")) {
+        return cursorLine;
       }
     }
+
+    if (!range) {
+      return null;
+    }
+
+    // Statement 直前のバックスラッシュ (エラートークン) を範囲に含める
+    const startLine = state.doc.lineAt(range.from);
+    const beforeStatement = state.sliceDoc(startLine.from, range.from);
+    const match = beforeStatement.match(/^(\s*)\\+$/);
+    if (match) {
+      return { from: startLine.from + match[1].length, to: range.to };
+    }
+    return range;
+  };
+
+  const currentStatementText = (state: EditorState): string => {
+    const range = executionTargetRange(state, state.selection.main.head);
     if (!range) {
       return "";
     }
@@ -125,7 +163,8 @@
       }
 
       build(view: EditorView): DecorationSet {
-        const range = statementRangeAt(
+        // 実行対象と同じ範囲をハイライトする (表示と実行の乖離を防ぐ)
+        const range = executionTargetRange(
           view.state,
           view.state.selection.main.head,
         );
@@ -182,6 +221,10 @@
     "&": {
       height: "100%",
       fontSize: "13px",
+      backgroundColor: "#111111",
+    },
+    ".cm-gutters": {
+      backgroundColor: "#111111",
     },
     ".cm-scroller": {
       fontFamily:
