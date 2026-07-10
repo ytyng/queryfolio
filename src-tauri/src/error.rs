@@ -13,6 +13,9 @@ pub enum AppError {
     #[error("Query file error: {0}")]
     QueryFile(String),
 
+    #[error("Query history error: {0}")]
+    History(String),
+
     /// readonly 接続で書き込み系の文が実行されようとした
     #[error("{0}")]
     Readonly(String),

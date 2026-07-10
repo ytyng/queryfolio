@@ -19,6 +19,19 @@ export interface QueryResult {
   elapsed_ms: number;
 }
 
+/// クエリ実行履歴の 1 件分 (バックエンドの history::HistoryEntry に対応)
+export interface QueryHistoryEntry {
+  /// 実行時刻 (ISO 8601)
+  time: string;
+  sql: string;
+  /// 実行時のアクティブスキーマ (database)
+  schema: string | null;
+  /// 取得行数または影響行数 (失敗時は null)
+  row_count: number | null;
+  elapsed_ms: number;
+  success: boolean;
+}
+
 export interface ConfigInfo {
   config_path: string;
   config_exists: boolean;
@@ -33,6 +46,13 @@ export const resetConnections = () => invoke<void>("reset_connections");
 
 export const runQuery = (connection: string, sql: string, maxRows?: number) =>
   invoke<QueryResult>("run_query", { connection, sql, maxRows });
+
+/// クエリ実行履歴を新しい順に返す。search は SQL の部分一致 (大小無視)。
+export const listQueryHistory = (
+  connection: string,
+  search?: string,
+  limit?: number,
+) => invoke<QueryHistoryEntry[]>("list_query_history", { connection, search, limit });
 
 export const listQueryFiles = (connection: string) =>
   invoke<string[]>("list_query_files", { connection });

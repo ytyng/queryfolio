@@ -1,6 +1,13 @@
 <script lang="ts">
   import appStore from "$lib/stores/app.svelte";
 
+  interface Props {
+    /// HISTORY タブへの切り替え (タブ状態は +page.svelte が持つ)
+    onShowHistory: () => void;
+  }
+
+  let { onShowHistory }: Props = $props();
+
   let creating = $state(false);
   let newFileName = $state("");
   let deleteCandidate = $state<string | null>(null);
@@ -46,10 +53,18 @@
 </script>
 
 <div class="flex h-full w-56 shrink-0 flex-col border-r border-zinc-700 bg-zinc-900">
-  <div class="flex items-center justify-between border-b border-zinc-700 px-3 py-2">
+  <div class="flex items-center gap-2 border-b border-zinc-700 px-3 py-2">
     <span class="text-xs font-semibold tracking-wide text-zinc-400">FILES</span>
     <button
-      class="rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
+      class="text-xs font-semibold tracking-wide text-zinc-600 hover:text-zinc-300"
+      title="Show query history"
+      data-annotate="tab-history"
+      onclick={onShowHistory}
+    >
+      HISTORY
+    </button>
+    <button
+      class="ml-auto rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
       title="New query file"
       data-annotate="button-create-file"
       disabled={!appStore.selectedConnection}

@@ -234,6 +234,22 @@ const updateEditorContent = (content: string) => {
   }, AUTO_SAVE_DELAY_MS);
 };
 
+/// 履歴パネルからの SQL 挿入。開いているファイルの末尾に追記する
+/// (既存の編集内容を上書きしないよう、置換ではなく追記にする)。
+/// 実行はしない。エディタへの反映は SqlEditor 側の $effect が行う。
+const insertSqlFromHistory = (sql: string) => {
+  if (!selectedConnection) {
+    toast.warning("Select a connection first");
+    return;
+  }
+  if (!selectedFile) {
+    toast.warning("Select or create a query file first");
+    return;
+  }
+  const trimmed = editorContent.replace(/\s+$/, "");
+  updateEditorContent(trimmed ? `${trimmed}\n\n${sql}\n` : `${sql}\n`);
+};
+
 /// 実行結果の書き込み先タブを決める。
 /// アクティブな非ピン留めタブがあれば使い回し、無ければ新規タブを作る。
 /// 上限到達時は最も古い非ピン留めタブを破棄する。
@@ -433,6 +449,7 @@ export default {
   deleteFile,
   saveCurrentFile,
   updateEditorContent,
+  insertSqlFromHistory,
   runQuery,
   rerunTab,
   selectResultTab,
