@@ -31,7 +31,7 @@
     <span class="text-xs font-semibold tracking-wide text-zinc-400">FILES</span>
     <button
       class="rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
-      title="新規クエリファイル"
+      title="New query file"
       data-annotate="button-create-file"
       disabled={!appStore.selectedConnection}
       onclick={() => {
@@ -43,7 +43,7 @@
   </div>
   <div class="min-h-0 flex-1 overflow-y-auto">
     {#if !appStore.selectedConnection}
-      <p class="px-3 py-2 text-xs text-zinc-500">接続先を選択してください</p>
+      <p class="px-3 py-2 text-xs text-zinc-500">Select a connection</p>
     {:else}
       {#if creating}
         <form
@@ -56,7 +56,7 @@
           <!-- svelte-ignore a11y_autofocus -->
           <input
             class="w-full rounded border border-zinc-600 bg-zinc-800 px-1.5 py-0.5 text-xs text-zinc-200 outline-none focus:border-blue-400"
-            placeholder="ファイル名"
+            placeholder="File name"
             data-annotate="input-new-file-name"
             autofocus
             bind:value={newFileName}
@@ -69,7 +69,7 @@
       {/if}
       {#if appStore.files.length === 0 && !creating}
         <p class="px-3 py-2 text-xs text-zinc-500">
-          + でクエリファイルを作成できます
+          Click + to create a query file
         </p>
       {/if}
       {#each appStore.files as fileName (fileName)}
@@ -86,7 +86,7 @@
           >
             {fileName}
             {#if appStore.selectedFile === fileName && appStore.dirty}
-              <span class="text-zinc-500" title="未保存">*</span>
+              <span class="text-zinc-500" title="Unsaved">*</span>
             {/if}
           </button>
           <button
@@ -95,15 +95,15 @@
               ? 'bg-red-800 text-red-200'
               : 'text-zinc-500 hover:text-red-400'}"
             title={deleteCandidate === fileName
-              ? "もう一度クリックで削除"
-              : "削除"}
+              ? "Click again to delete"
+              : "Delete"}
             data-annotate="button-delete-file-{fileName}"
             onclick={() => confirmDelete(fileName)}
             onblur={() => {
               deleteCandidate = null;
             }}
           >
-            {deleteCandidate === fileName ? "削除?" : "×"}
+            {deleteCandidate === fileName ? "Delete?" : "×"}
           </button>
         </div>
       {/each}

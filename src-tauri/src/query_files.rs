@@ -8,16 +8,16 @@ use crate::error::AppError;
 fn validate_component(name: &str) -> Result<&str, AppError> {
     let name = name.trim();
     if name.is_empty() {
-        return Err(AppError::QueryFile("名前が空です".into()));
+        return Err(AppError::QueryFile("The name is empty".into()));
     }
     if name.starts_with('.') {
         return Err(AppError::QueryFile(format!(
-            "先頭が . の名前は使用できません: {name}"
+            "Names starting with a dot are not allowed: {name}"
         )));
     }
     if name.contains('/') || name.contains('\\') || name.contains('\0') {
         return Err(AppError::QueryFile(format!(
-            "名前に使用できない文字が含まれています: {name}"
+            "The name contains invalid characters: {name}"
         )));
     }
     Ok(name)
@@ -75,7 +75,7 @@ pub fn read_query_file(
     let path = file_path(sqlfiles_dir, connection, file_name)?;
     if !path.exists() {
         return Err(AppError::QueryFile(format!(
-            "ファイルが見つかりません: {}",
+            "File not found: {}",
             path.display()
         )));
     }
@@ -106,7 +106,7 @@ pub fn create_query_file(
     let path = file_path(sqlfiles_dir, connection, &normalized)?;
     if path.exists() {
         return Err(AppError::QueryFile(format!(
-            "同名のファイルが既に存在します: {normalized}"
+            "A file with the same name already exists: {normalized}"
         )));
     }
     if let Some(parent) = path.parent() {
@@ -124,7 +124,7 @@ pub fn delete_query_file(
     let path = file_path(sqlfiles_dir, connection, file_name)?;
     if !path.exists() {
         return Err(AppError::QueryFile(format!(
-            "ファイルが見つかりません: {}",
+            "File not found: {}",
             path.display()
         )));
     }

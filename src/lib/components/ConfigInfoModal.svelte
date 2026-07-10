@@ -28,7 +28,7 @@
       onClose();
       return;
     }
-    reloadError = appStore.errorMessage ?? "再読込に失敗しました";
+    reloadError = appStore.errorMessage ?? "Failed to reload";
     try {
       info = await getConfigInfo();
     } catch (e) {
@@ -49,10 +49,10 @@
   <div
     class="flex w-[560px] flex-col gap-3 rounded-lg border border-zinc-700 bg-zinc-900 p-4 shadow-xl"
   >
-    <h2 class="text-sm font-semibold text-zinc-200">設定</h2>
+    <h2 class="text-sm font-semibold text-zinc-200">Settings</h2>
 
     <p class="text-xs text-zinc-400">
-      設定は YAML ファイルを直接編集してください。編集後は「再読込」で反映されます。
+      Edit the YAML file directly, then press Reload to apply the changes.
     </p>
 
     {#if loadError}
@@ -60,29 +60,29 @@
     {:else if info}
       <dl class="flex flex-col gap-2 text-xs">
         <div class="flex flex-col gap-0.5">
-          <dt class="text-zinc-500">設定ファイル</dt>
+          <dt class="text-zinc-500">Config file</dt>
           <dd class="font-mono text-zinc-200" data-annotate="text-config-path">
             {info.config_path}
             {#if !info.config_exists}
-              <span class="text-amber-400">(未作成)</span>
+              <span class="text-amber-400">(not created)</span>
             {/if}
           </dd>
         </div>
         <div class="flex flex-col gap-0.5">
-          <dt class="text-zinc-500">接続定義のソース (sql_servers)</dt>
+          <dt class="text-zinc-500">Connection source (sql_servers)</dt>
           <dd class="font-mono text-zinc-200" data-annotate="text-config-source">
             {info.source}
           </dd>
         </div>
         <div class="flex flex-col gap-0.5">
-          <dt class="text-zinc-500">クエリファイル保存先 (sqlfiles_dir)</dt>
+          <dt class="text-zinc-500">Query file directory (sqlfiles_dir)</dt>
           <dd class="font-mono text-zinc-200" data-annotate="text-sqlfiles-dir">
             {info.sqlfiles_dir}
           </dd>
         </div>
       </dl>
     {:else}
-      <p class="text-xs text-zinc-500">読込中...</p>
+      <p class="text-xs text-zinc-500">Loading...</p>
     {/if}
 
     {#if reloadError}
@@ -97,14 +97,14 @@
         data-annotate="button-config-close"
         onclick={onClose}
       >
-        閉じる
+        Close
       </button>
       <button
         class="rounded bg-blue-600 px-3 py-1 text-xs text-white hover:bg-blue-500"
         data-annotate="button-config-reload"
         onclick={reload}
       >
-        再読込
+        Reload
       </button>
     </div>
   </div>

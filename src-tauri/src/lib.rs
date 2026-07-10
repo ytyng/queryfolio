@@ -48,7 +48,7 @@ impl AppState {
             .find(|s| s.name == connection)
             .cloned()
             .ok_or_else(|| {
-                AppError::Config(format!("接続 '{connection}' が設定にありません"))
+                AppError::Config(format!("Connection '{connection}' is not defined in the config"))
             })
     }
 }
@@ -153,6 +153,12 @@ fn get_config_info() -> ConfigInfo {
     config::config_info()
 }
 
+/// config.yml が無ければテンプレートを作成する。作成した場合はそのパスを返す。
+#[tauri::command]
+fn ensure_config_file() -> Result<Option<String>, AppError> {
+    config::ensure_config_file()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -169,6 +175,7 @@ pub fn run() {
             create_query_file,
             delete_query_file,
             get_config_info,
+            ensure_config_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

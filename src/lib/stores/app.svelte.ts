@@ -155,7 +155,7 @@ const saveCurrentFile = async (): Promise<boolean> => {
     dirty = false;
     return true;
   } catch (e) {
-    errorMessage = `保存に失敗しました: ${toErrorMessage(e)}`;
+    errorMessage = `Failed to save the file: ${toErrorMessage(e)}`;
     return false;
   }
 };
@@ -178,11 +178,11 @@ const updateEditorContent = (content: string) => {
 
 const runQuery = async (sql: string) => {
   if (!selectedConnection) {
-    errorMessage = "接続先を選択してください";
+    errorMessage = "Select a connection first";
     return;
   }
   if (!sql.trim()) {
-    errorMessage = "実行する SQL がありません";
+    errorMessage = "There is no SQL statement to run";
     return;
   }
   if (!(await flushPendingSave())) {

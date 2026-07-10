@@ -4,19 +4,19 @@ use serde::{Serialize, Serializer};
 /// 文字列として渡す。
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
-    #[error("設定エラー: {0}")]
+    #[error("Config error: {0}")]
     Config(String),
 
-    #[error("SSH トンネルエラー: {0}")]
+    #[error("SSH tunnel error: {0}")]
     SshTunnel(String),
 
-    #[error("クエリファイルエラー: {0}")]
+    #[error("Query file error: {0}")]
     QueryFile(String),
 
-    #[error("IO エラー: {0}")]
+    #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("DB エラー: {0}")]
+    #[error("Database error: {0}")]
     Db(#[from] sqlx::Error),
 }
 

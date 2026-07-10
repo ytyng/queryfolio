@@ -23,7 +23,7 @@
     <span class="text-xs font-semibold tracking-wide text-zinc-400">CONNECTIONS</span>
     <button
       class="rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200"
-      title="接続設定を再読込"
+      title="Reload connections"
       data-annotate="button-reload-connections"
       onclick={() => appStore.reloadConnections()}
     >
@@ -32,10 +32,10 @@
   </div>
   <div class="min-h-0 flex-1 overflow-y-auto">
     {#if appStore.loadingConnections}
-      <p class="px-3 py-2 text-xs text-zinc-500">読込中...</p>
+      <p class="px-3 py-2 text-xs text-zinc-500">Loading...</p>
     {:else if appStore.connections.length === 0}
       <p class="px-3 py-2 text-xs text-zinc-500">
-        接続がありません。設定を確認してください。
+        No connections. Review your config file.
       </p>
     {:else}
       {#each appStore.connections as connection (connection.name)}
@@ -53,7 +53,7 @@
             {#if connection.has_ssh_tunnel}
               <span
                 class="rounded bg-zinc-700 px-1 text-[10px] text-zinc-300"
-                title="SSH トンネル経由">ssh</span
+                title="Via SSH tunnel">ssh</span
               >
             {/if}
           </span>

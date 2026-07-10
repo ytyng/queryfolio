@@ -50,3 +50,7 @@ export const deleteQueryFile = (connection: string, fileName: string) =>
   invoke<void>("delete_query_file", { connection, fileName });
 
 export const getConfigInfo = () => invoke<ConfigInfo>("get_config_info");
+
+/// config.yml が無ければテンプレートを作成する。作成した場合はそのパスを返す。
+export const ensureConfigFile = () =>
+  invoke<string | null>("ensure_config_file");

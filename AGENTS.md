@@ -58,6 +58,7 @@ pnpm tauri build        # リリースビルド
 
 ## 開発上の注意
 
+- **アプリ内メッセージ (UI ラベル・トースト・placeholder・エラーメッセージ・自動生成される設定ファイルのコメント) はすべて英語で書く**。Rust の AppError 等、フロントに表示される文字列も対象。コードコメントは日本語でよい。
 - ユーザーアクションを受ける要素には `data-annotate="<識別子>"` を付ける (E2E テスト用)。
 - `window.prompt` / `alert` / `confirm` は使わない (ブラウザ自動化がブロックされる + UX)。
 - 64bit 整数は JS の Number.MAX_SAFE_INTEGER を超えると Tauri invoke 境界で丸められるため、db.rs の json_i64 / json_u64 で範囲外は文字列化している。
