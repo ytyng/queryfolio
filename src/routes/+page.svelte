@@ -1,12 +1,14 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { toast } from "svelte-sonner";
+  import { ensureConfigFile } from "$lib/api";
   import appStore from "$lib/stores/app.svelte";
   import Toolbar from "$lib/components/Toolbar.svelte";
   import ConnectionsPane from "$lib/components/ConnectionsPane.svelte";
   import FilesPane from "$lib/components/FilesPane.svelte";
   import SqlEditor from "$lib/components/SqlEditor.svelte";
   import ResultsPane from "$lib/components/ResultsPane.svelte";
-  import SettingsModal from "$lib/components/SettingsModal.svelte";
+  import ConfigInfoModal from "$lib/components/ConfigInfoModal.svelte";
 
   let showSettings = $state(false);
   let editor: SqlEditor | undefined = $state();
@@ -16,8 +18,20 @@
       ?.engine ?? null,
   );
 
-  onMount(() => {
-    void appStore.loadConnections();
+  onMount(async () => {
+    try {
+      const createdPath = await ensureConfigFile();
+      if (createdPath) {
+        toast.info("Created a config file", {
+          description: `Edit ${createdPath} to add your connections`,
+        });
+      }
+    } catch (e) {
+      toast.error("Failed to create the config file", {
+        description: String(e),
+      });
+    }
+    await appStore.loadConnections();
   });
 </script>
 
@@ -46,7 +60,7 @@
         {:else}
           <div class="flex h-full items-center justify-center">
             <p class="text-sm text-zinc-600">
-              クエリファイルを選択または作成してください
+              Select or create a query file
             </p>
           </div>
         {/if}
@@ -59,7 +73,7 @@
 </div>
 
 {#if showSettings}
-  <SettingsModal
+  <ConfigInfoModal
     onClose={() => {
       showSettings = false;
     }}

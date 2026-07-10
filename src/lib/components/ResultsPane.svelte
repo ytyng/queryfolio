@@ -42,7 +42,7 @@
   >
     <span class="font-semibold tracking-wide">RESULTS</span>
     {#if appStore.running}
-      <span class="text-blue-400">実行中...</span>
+      <span class="text-blue-400">Running...</span>
     {:else if appStore.queryResult}
       {@const result = appStore.queryResult}
       {#if result.affected_rows !== null}
@@ -52,7 +52,7 @@
       {:else}
         <span data-annotate="text-row-count">{result.row_count} rows</span>
         {#if result.truncated}
-          <span class="text-amber-400" title="上限件数で切り詰められています">
+          <span class="text-amber-400" title="Truncated at the row limit">
             (truncated)
           </span>
         {/if}
@@ -122,10 +122,10 @@
         </tbody>
       </table>
     {:else if appStore.queryResult}
-      <p class="px-3 py-2 text-xs text-zinc-500">結果セットはありません</p>
+      <p class="px-3 py-2 text-xs text-zinc-500">No result set</p>
     {:else}
       <p class="px-3 py-2 text-xs text-zinc-500">
-        Cmd+Enter (Ctrl+Enter) でカーソル位置の SQL を実行します
+        Press Cmd+Enter (Ctrl+Enter) to run the SQL statement under the cursor
       </p>
     {/if}
   </div>

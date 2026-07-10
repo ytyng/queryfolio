@@ -9,7 +9,7 @@ use ssh2::Session;
 
 use crate::config::SshTunnelConfig;
 use crate::error::AppError;
-use crate::settings::expand_tilde;
+use crate::config::expand_tilde;
 
 /// SSH の blocking 操作 (handshake / auth 等) のタイムアウト (ミリ秒)。
 const SSH_TIMEOUT_MS: u32 = 30_000;
@@ -90,7 +90,7 @@ fn accept_loop(
                 let shutdown = Arc::clone(&shutdown);
                 std::thread::spawn(move || {
                     if let Err(e) = forward_connection(stream, &target, shutdown) {
-                        eprintln!("[SshTunnel] 転送エラー: {e}");
+                        eprintln!("[SshTunnel] forwarding error: {e}");
                     }
                 });
             }
@@ -98,7 +98,7 @@ fn accept_loop(
                 std::thread::sleep(Duration::from_millis(100));
             }
             Err(e) => {
-                eprintln!("[SshTunnel] accept エラー: {e}");
+                eprintln!("[SshTunnel] accept error: {e}");
                 return;
             }
         }
@@ -112,7 +112,7 @@ fn establish_session(config: &SshTunnelConfig) -> Result<Session, AppError> {
     // ホストで OS の TCP タイムアウトまで待たされるのを防ぐ)
     let addr = format!("{}:{}", config.host, config.port);
     let socket_addrs: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&addr)
-        .map_err(|e| AppError::SshTunnel(format!("{addr} の名前解決に失敗: {e}")))?
+        .map_err(|e| AppError::SshTunnel(format!("Failed to resolve {addr}: {e}")))?
         .collect();
     let mut tcp = None;
     let mut last_error = None;
@@ -130,20 +130,20 @@ fn establish_session(config: &SshTunnelConfig) -> Result<Session, AppError> {
     }
     let tcp = tcp.ok_or_else(|| {
         AppError::SshTunnel(format!(
-            "{addr} への接続に失敗: {}",
+            "Failed to connect to {addr}: {}",
             last_error
                 .map(|e| e.to_string())
-                .unwrap_or_else(|| "アドレスを解決できませんでした".into())
+                .unwrap_or_else(|| "no resolvable address".into())
         ))
     })?;
 
     let mut session = Session::new()
-        .map_err(|e| AppError::SshTunnel(format!("セッション作成に失敗: {e}")))?;
+        .map_err(|e| AppError::SshTunnel(format!("Failed to create the SSH session: {e}")))?;
     session.set_timeout(SSH_TIMEOUT_MS);
     session.set_tcp_stream(tcp);
     session
         .handshake()
-        .map_err(|e| AppError::SshTunnel(format!("ハンドシェイクに失敗: {e}")))?;
+        .map_err(|e| AppError::SshTunnel(format!("SSH handshake failed: {e}")))?;
 
     verify_host_key(&session, config)?;
     authenticate(&session, config)?;
@@ -155,15 +155,15 @@ fn establish_session(config: &SshTunnelConfig) -> Result<Session, AppError> {
 /// 追記して許可する (OpenSSH の StrictHostKeyChecking=accept-new 相当)。
 fn verify_host_key(session: &Session, config: &SshTunnelConfig) -> Result<(), AppError> {
     let (key, key_type) = session.host_key().ok_or_else(|| {
-        AppError::SshTunnel("ホストキーを取得できませんでした".into())
+        AppError::SshTunnel("Could not obtain the host key".into())
     })?;
 
     let mut known_hosts = session
         .known_hosts()
-        .map_err(|e| AppError::SshTunnel(format!("known_hosts の初期化に失敗: {e}")))?;
+        .map_err(|e| AppError::SshTunnel(format!("Failed to initialize known_hosts: {e}")))?;
 
     let known_hosts_path = dirs::home_dir()
-        .ok_or_else(|| AppError::SshTunnel("ホームディレクトリを特定できません".into()))?
+        .ok_or_else(|| AppError::SshTunnel("Could not determine the home directory".into()))?
         .join(".ssh")
         .join("known_hosts");
 
@@ -172,7 +172,7 @@ fn verify_host_key(session: &Session, config: &SshTunnelConfig) -> Result<(), Ap
             .read_file(&known_hosts_path, ssh2::KnownHostFileKind::OpenSSH)
             .map_err(|e| {
                 AppError::SshTunnel(format!(
-                    "known_hosts の読み込みに失敗 ({}): {e}",
+                    "Failed to read known_hosts ({}): {e}",
                     known_hosts_path.display()
                 ))
             })?;
@@ -181,8 +181,9 @@ fn verify_host_key(session: &Session, config: &SshTunnelConfig) -> Result<(), Ap
     match known_hosts.check_port(&config.host, config.port, key) {
         ssh2::CheckResult::Match => Ok(()),
         ssh2::CheckResult::Mismatch => Err(AppError::SshTunnel(format!(
-            "{} のホストキーが known_hosts と一致しません。中間者攻撃の可能性があるため接続を中止しました。\
-             ホストキーが正しく変更された場合は known_hosts の該当行を削除してください",
+            "Host key for {} does not match known_hosts. Connection aborted because this \
+             may be a man-in-the-middle attack. If the host key was legitimately changed, \
+             remove the corresponding line from known_hosts",
             config.host
         ))),
         ssh2::CheckResult::NotFound => {
@@ -196,7 +197,7 @@ fn verify_host_key(session: &Session, config: &SshTunnelConfig) -> Result<(), Ap
             known_hosts
                 .add(&entry_host, key, "added by queryfolio", key_type.into())
                 .map_err(|e| {
-                    AppError::SshTunnel(format!("known_hosts への追加に失敗: {e}"))
+                    AppError::SshTunnel(format!("Failed to add the host key to known_hosts: {e}"))
                 })?;
             if let Some(parent) = known_hosts_path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -205,14 +206,14 @@ fn verify_host_key(session: &Session, config: &SshTunnelConfig) -> Result<(), Ap
                 .write_file(&known_hosts_path, ssh2::KnownHostFileKind::OpenSSH)
                 .map_err(|e| {
                     AppError::SshTunnel(format!(
-                        "known_hosts の書き込みに失敗 ({}): {e}",
+                        "Failed to write known_hosts ({}): {e}",
                         known_hosts_path.display()
                     ))
                 })?;
             Ok(())
         }
         ssh2::CheckResult::Failure => Err(AppError::SshTunnel(
-            "ホストキーの検証処理に失敗しました".into(),
+            "Host key verification failed".into(),
         )),
     }
 }
@@ -229,7 +230,7 @@ fn authenticate(session: &Session, config: &SshTunnelConfig) -> Result<(), AppEr
             )
             .map_err(|e| {
                 AppError::SshTunnel(format!(
-                    "秘密鍵認証に失敗 ({}): {e}",
+                    "Private key authentication failed ({}): {e}",
                     key_path.display()
                 ))
             })?;
@@ -239,14 +240,14 @@ fn authenticate(session: &Session, config: &SshTunnelConfig) -> Result<(), AppEr
     if let Some(password) = &config.password {
         session
             .userauth_password(&config.user, password)
-            .map_err(|e| AppError::SshTunnel(format!("パスワード認証に失敗: {e}")))?;
+            .map_err(|e| AppError::SshTunnel(format!("Password authentication failed: {e}")))?;
         return Ok(());
     }
 
     // password も private_key_path も無い場合は ssh-agent を試す
     session
         .userauth_agent(&config.user)
-        .map_err(|e| AppError::SshTunnel(format!("ssh-agent 認証に失敗: {e}")))?;
+        .map_err(|e| AppError::SshTunnel(format!("ssh-agent authentication failed: {e}")))?;
     Ok(())
 }
 
@@ -264,7 +265,7 @@ fn forward_connection(
         .channel_direct_tcpip(&target.target_host, target.target_port, None)
         .map_err(|e| {
             AppError::SshTunnel(format!(
-                "direct-tcpip チャンネルの作成に失敗 ({}:{}): {e}",
+                "Failed to open a direct-tcpip channel ({}:{}): {e}",
                 target.target_host, target.target_port
             ))
         })?;
@@ -334,7 +335,7 @@ where
             Ok(0) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
-                    "書き込み先がクローズされました",
+                    "The write target was closed",
                 ));
             }
             Ok(n) => offset += n,

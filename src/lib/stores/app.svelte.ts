@@ -35,15 +35,16 @@ const loadConnections = async () => {
 /// 接続設定を再読込する (プール・SSH トンネルも破棄される)。
 /// 旧設定の選択状態を残さないよう一旦クリアし、同名の接続が
 /// まだ存在する場合のみ再選択する (ファイル一覧も新設定で再取得される)。
-const reloadConnections = async () => {
+/// 失敗した場合は false を返す (errorMessage 設定済み)。
+const reloadConnections = async (): Promise<boolean> => {
   if (!(await flushPendingSave())) {
-    return;
+    return false;
   }
   try {
     await api.resetConnections();
   } catch (e) {
     errorMessage = toErrorMessage(e);
-    return;
+    return false;
   }
   const previousConnection = selectedConnection;
   selectedConnection = null;
@@ -53,12 +54,16 @@ const reloadConnections = async () => {
   queryResult = null;
   dirty = false;
   await loadConnections();
+  if (errorMessage) {
+    return false;
+  }
   if (
     previousConnection &&
     connections.some((c) => c.name === previousConnection)
   ) {
     await selectConnection(previousConnection);
   }
+  return true;
 };
 
 // 保留中の自動保存を確定させる。保存に失敗した場合は false を返す。
@@ -150,7 +155,7 @@ const saveCurrentFile = async (): Promise<boolean> => {
     dirty = false;
     return true;
   } catch (e) {
-    errorMessage = `保存に失敗しました: ${toErrorMessage(e)}`;
+    errorMessage = `Failed to save the file: ${toErrorMessage(e)}`;
     return false;
   }
 };
@@ -173,11 +178,11 @@ const updateEditorContent = (content: string) => {
 
 const runQuery = async (sql: string) => {
   if (!selectedConnection) {
-    errorMessage = "接続先を選択してください";
+    errorMessage = "Select a connection first";
     return;
   }
   if (!sql.trim()) {
-    errorMessage = "実行する SQL がありません";
+    errorMessage = "There is no SQL statement to run";
     return;
   }
   if (!(await flushPendingSave())) {
@@ -229,7 +234,6 @@ export default {
   },
   loadConnections,
   reloadConnections,
-  flushPendingSave,
   selectConnection,
   selectFile,
   createFile,

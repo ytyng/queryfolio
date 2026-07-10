@@ -19,15 +19,33 @@ pnpm install
 pnpm tauri dev
 ```
 
-## Connection config
+## Configuration
 
-Create `~/.config/queryfolio/config.yaml` (see `config.example.yaml`), or open the in-app settings (⚙) and register a getter command such as:
+Everything lives in one file: `~/.config/queryfolio/config.yml` (see `config.example.yaml`). The `sql_servers` key accepts either the server list itself, or a source declaration pointing to where the list comes from:
 
+```yaml
+# Inline (sql-agent-mcp-server compatible)
+sql_servers:
+  - name: dev-postgres
+    engine: postgres
+    host: localhost
+    ...
+
+# Or fetch from 1Password (exactly one of command / env / file)
+# sql_servers:
+#   command: op read "op://development/queryfolio/config-yaml"
+
+# Or from a file / an environment variable
+# sql_servers:
+#   file: ~/secrets/sql-servers.yaml
+# sql_servers:
+#   env: QUERYFOLIO_CONNECTIONS_YAML
+
+# Optional
+sqlfiles_dir: ~/queries
 ```
-op read "op://development/queryfolio/config-yaml"
-```
 
-Environment variables `QUERYFOLIO_CONFIG_YAML` and `QUERYFOLIO_CONFIG_YAML_GETTER_COMMAND` are also supported (mainly for development; GUI apps launched from Finder do not inherit shell env vars).
+The `QUERYFOLIO_CONFIG_YAML` environment variable overrides the whole config file (for development; GUI apps launched from Finder do not inherit shell env vars).
 
 ## Development
 

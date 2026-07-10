@@ -31,8 +31,7 @@ pnpm tauri build        # リリースビルド
 | ファイル | 役割 |
 |---------|------|
 | lib.rs | Tauri コマンド定義と AppState (接続設定キャッシュ + DbManager) |
-| config.rs | 接続設定 YAML のロード・テンプレート展開・getter command 実行 |
-| settings.rs | アプリ設定 (~/.config/queryfolio/settings.json)、expand_tilde |
+| config.rs | config.yml のロード・ソース宣言解決・テンプレート展開・expand_tilde |
 | db.rs | sqlx プール管理、クエリ実行、型別 JSON 変換 |
 | tunnel.rs | SSH ローカルポートフォワード (known_hosts 検証付き) |
 | query_files.rs | クエリファイル CRUD (パストラバーサル対策) |
@@ -42,23 +41,24 @@ pnpm tauri build        # リリースビルド
 
 - `lib/api.ts` — invoke の型付きラッパー (バックエンドとの境界)
 - `lib/stores/app.svelte.ts` — Svelte 5 runes ストア (getter + メソッドを default export)
-- `lib/components/` — Toolbar / ConnectionsPane / FilesPane / SqlEditor / ResultsPane / SettingsModal
+- `lib/components/` — Toolbar / ConnectionsPane / FilesPane / SqlEditor / ResultsPane / ConfigInfoModal (読み取り専用の設定表示)
 - `lib/export.ts` — CSV/TSV/JSON 変換 (formula injection 対策込み)
 
-## 接続設定の解決順
+## 設定 (config.yml)
 
-1. `QUERYFOLIO_CONFIG_YAML` 環境変数 (YAML 文字列そのもの。テスト用に便利)
-2. `QUERYFOLIO_CONFIG_YAML_GETTER_COMMAND` 環境変数
-3. アプリ設定の `config_yaml_getter_command` (例: `op read "op://..."`)
-4. アプリ設定の `config_yaml_path`
-5. `~/.config/queryfolio/config.yaml`
+設定は `~/.config/queryfolio/config.yml` (無ければ `config.yaml`) に一本化されている。settings.json は存在しない。
 
-YAML フォーマットは sql-agent-mcp-server (~/workspace/sql-agent-mcp-server) と互換。`config.example.yaml` 参照。sqlite は `schema` を DB ファイルパスとして扱う独自拡張。
+- `sql_servers` はリスト (sql-agent-mcp-server 互換の直書き) か、ソース宣言マッピングのどちらか。
+- ソース宣言は `command:` / `env:` / `file:` の**ちょうど 1 つ** (複数はエラー)。取得した YAML は sql-agent 互換フォーマットとしてパースされ、さらなるソース宣言の再帰は禁止。
+- `command` はシェル非経由 (shlex 分解) で実行。GUI 起動の最小 PATH 対策として /opt/homebrew/bin と /usr/local/bin を補完する。60 秒タイムアウト + kill_on_drop。
+- `sqlfiles_dir` (任意) でクエリファイル保存先を変更できる。デフォルトは `~/.config/queryfolio/sqlfiles/<connection>/<name>.sql`。
+- `QUERYFOLIO_CONFIG_YAML` 環境変数は設定ファイル全体を上書きする開発・テスト用フック (実機 E2E 検証で使用)。
 
-クエリファイルの保存先: `~/.config/queryfolio/sqlfiles/<connection>/<name>.sql` (設定で変更可)。
+`config.example.yaml` 参照。sqlite は `schema` を DB ファイルパスとして扱う独自拡張。
 
 ## 開発上の注意
 
+- **アプリ内メッセージ (UI ラベル・トースト・placeholder・エラーメッセージ・自動生成される設定ファイルのコメント) はすべて英語で書く**。Rust の AppError 等、フロントに表示される文字列も対象。コードコメントは日本語でよい。
 - ユーザーアクションを受ける要素には `data-annotate="<識別子>"` を付ける (E2E テスト用)。
 - `window.prompt` / `alert` / `confirm` は使わない (ブラウザ自動化がブロックされる + UX)。
 - 64bit 整数は JS の Number.MAX_SAFE_INTEGER を超えると Tauri invoke 境界で丸められるため、db.rs の json_i64 / json_u64 で範囲外は文字列化している。

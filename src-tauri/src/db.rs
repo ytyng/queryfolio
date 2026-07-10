@@ -11,7 +11,7 @@ use sqlx::{Column, Executor, Row, TypeInfo};
 
 use crate::config::ServerConfig;
 use crate::error::AppError;
-use crate::settings::expand_tilde;
+use crate::config::expand_tilde;
 use crate::tunnel::SshTunnel;
 
 /// 1 回のクエリで取得する行数の上限デフォルト。
@@ -64,7 +64,7 @@ impl DbManager {
         let (host, port) = match (&server.ssh_tunnel, engine) {
             (Some(_), Engine::Sqlite) => {
                 return Err(AppError::Config(
-                    "sqlite に ssh_tunnel は使用できません".into(),
+                    "ssh_tunnel cannot be used with sqlite".into(),
                 ));
             }
             (Some(tunnel_config), _) => {
@@ -76,7 +76,7 @@ impl DbManager {
                     SshTunnel::start(&tunnel_config, &target_host, target_port)
                 })
                 .await
-                .map_err(|e| AppError::SshTunnel(format!("トンネルタスクの失敗: {e}")))??;
+                .map_err(|e| AppError::SshTunnel(format!("SSH tunnel task failed: {e}")))??;
                 let local_port = tunnel.local_port;
                 inner.tunnels.insert(server.name.clone(), tunnel);
                 ("127.0.0.1".to_string(), local_port)
@@ -113,7 +113,7 @@ fn parse_engine(engine: &str) -> Result<Engine, AppError> {
         "postgres" | "postgresql" => Ok(Engine::Postgres),
         "sqlite" | "sqlite3" => Ok(Engine::Sqlite),
         other => Err(AppError::Config(format!(
-            "未対応のエンジンです: {other} (mysql / postgres / sqlite に対応)"
+            "Unsupported engine: {other} (supported: mysql / postgres / sqlite)"
         ))),
     }
 }
@@ -177,13 +177,13 @@ async fn connect(
                 .or(server.host.as_deref())
                 .ok_or_else(|| {
                     AppError::Config(
-                        "sqlite では schema に DB ファイルパスを指定してください".into(),
+                        "For sqlite, set schema to the database file path".into(),
                     )
                 })?;
             let file_path = expand_tilde(path);
             if !file_path.exists() {
                 return Err(AppError::Config(format!(
-                    "sqlite DB ファイルが見つかりません: {}",
+                    "SQLite database file not found: {}",
                     file_path.display()
                 )));
             }
@@ -207,7 +207,7 @@ pub async fn run_query(
     max_rows: usize,
 ) -> Result<QueryResult, AppError> {
     if leading_keyword(sql).is_empty() {
-        return Err(AppError::Config("SQL が空です".into()));
+        return Err(AppError::Config("The SQL statement is empty".into()));
     }
     let started = Instant::now();
 

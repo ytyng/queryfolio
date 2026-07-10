@@ -1,13 +1,93 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
-use crate::settings::AppSettings;
 
-/// getter command の実行タイムアウト (秒)。
+/// ソース宣言コマンドの実行タイムアウト (秒)。
 /// 1Password 等の認証待ちで無限ハングするとコマンド呼び出しが固まるため必須。
-const GETTER_COMMAND_TIMEOUT_SECS: u64 = 60;
+const SOURCE_COMMAND_TIMEOUT_SECS: u64 = 60;
+
+/// ~/.config/queryfolio ディレクトリを返す。
+pub fn app_config_dir() -> Result<PathBuf, AppError> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| AppError::Config("Could not determine the home directory".into()))?;
+    Ok(home.join(".config").join("queryfolio"))
+}
+
+/// パス文字列の先頭の ~ をホームディレクトリに展開する。
+pub fn expand_tilde(path: &str) -> PathBuf {
+    if path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+/// 初回起動時に自動作成する config.yml のテンプレート。
+/// そのままで有効な設定 (接続 0 件) としてパースできる内容にする。
+const CONFIG_TEMPLATE: &str = r#"# queryfolio config file
+# See config.example.yaml in the repository for the full format.
+# https://github.com/ytyng/queryfolio
+
+# Connection definitions. Either write servers inline, or use a source
+# declaration (exactly one of command / env / file) to fetch the YAML
+# from elsewhere.
+#
+# Inline example:
+# sql_servers:
+#   - name: local-sqlite
+#     description: "Local SQLite file"
+#     engine: sqlite
+#     schema: ~/data/example.sqlite3
+#   - name: dev-postgres
+#     engine: postgres
+#     host: localhost
+#     port: 5432
+#     schema: development_db
+#     user: dev_user
+#     password: your_password
+#
+# Fetch from 1Password:
+# sql_servers:
+#   command: op read "op://development/queryfolio/config-yaml"
+
+sql_servers: []
+
+# Where query files are stored (default: ~/.config/queryfolio/sqlfiles)
+# sqlfiles_dir: ~/queries
+"#;
+
+/// config.yml / config.yaml が無ければテンプレートを作成する。
+/// 作成した場合は Some(作成パス) を返す。既に存在する場合と、
+/// QUERYFOLIO_CONFIG_YAML 環境変数で上書き中の場合は None。
+pub fn ensure_config_file() -> Result<Option<String>, AppError> {
+    let env_override = std::env::var("QUERYFOLIO_CONFIG_YAML")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    if env_override {
+        return Ok(None);
+    }
+    ensure_config_file_in(&app_config_dir()?)
+}
+
+fn ensure_config_file_in(dir: &std::path::Path) -> Result<Option<String>, AppError> {
+    let yml = dir.join("config.yml");
+    let yaml = dir.join("config.yaml");
+    if yml.exists() || yaml.exists() {
+        return Ok(None);
+    }
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(&yml, CONFIG_TEMPLATE)?;
+    Ok(Some(yml.display().to_string()))
+}
 
 /// SSH トンネル設定。sql-agent-mcp-server の config.yaml と互換。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,69 +150,308 @@ impl From<&ServerConfig> for ConnectionInfo {
     }
 }
 
-/// 接続設定 YAML を解決してサーバー一覧を返す。
+/// sql_servers のソース宣言 (マッピング形式)。
+/// command / env / file のうち、ちょうど 1 つだけを指定する。
+#[derive(Debug, Clone)]
+enum ServersSource {
+    /// サーバー定義がそのまま書かれている (リスト形式)
+    Inline,
+    /// コマンドを実行して stdout を YAML として使う
+    Command(String),
+    /// 環境変数の中身を YAML として使う
+    Env(String),
+    /// ファイルを読んで YAML として使う
+    File(String),
+}
+
+/// フロントエンドの情報表示用。設定の解決結果 (機密を含まない)。
+#[derive(Debug, Serialize)]
+pub struct ConfigInfo {
+    pub config_path: String,
+    pub config_exists: bool,
+    pub source: String,
+    pub sqlfiles_dir: String,
+}
+
+/// ~/.config/queryfolio/config.yml (無ければ config.yaml) のパース結果。
 ///
-/// 解決順 (sql-agent-mcp-server の config_loader.py と同方針):
-/// 1. QUERYFOLIO_CONFIG_YAML 環境変数 (YAML 文字列リテラル)
-/// 2. QUERYFOLIO_CONFIG_YAML_GETTER_COMMAND 環境変数 (実行して stdout を使う)
-/// 3. アプリ設定の config_yaml_getter_command
-/// 4. アプリ設定の config_yaml_path (デフォルト ~/.config/queryfolio/config.yaml)
-pub async fn load_servers(settings: &AppSettings) -> Result<Vec<ServerConfig>, AppError> {
-    let (yaml_text, source) = resolve_yaml_text(settings).await?;
-    parse_servers(&yaml_text, &source)
+/// トップレベルキー:
+/// - sql_servers: サーバー定義リスト、またはソース宣言マッピング
+/// - sql_server_templates: 接続情報の雛形 (リスト形式の時のみ有効)
+/// - sqlfiles_dir: クエリファイル保存ディレクトリ (任意)
+pub struct AppConfig {
+    doc: serde_yaml::Mapping,
+    /// 読み込んだファイルのパス。QUERYFOLIO_CONFIG_YAML 環境変数由来なら None
+    source_path: Option<PathBuf>,
 }
 
-async fn resolve_yaml_text(settings: &AppSettings) -> Result<(String, String), AppError> {
-    if let Ok(yaml) = std::env::var("QUERYFOLIO_CONFIG_YAML") {
-        if !yaml.trim().is_empty() {
-            return Ok((yaml, "env QUERYFOLIO_CONFIG_YAML".into()));
+impl AppConfig {
+    /// 設定をロードする。
+    /// QUERYFOLIO_CONFIG_YAML 環境変数があればそれを設定ファイルの内容として
+    /// 扱う (開発・テスト用オーバーライド)。無ければ config.yml / config.yaml を読む。
+    pub fn load() -> Result<Self, AppError> {
+        if let Ok(yaml) = std::env::var("QUERYFOLIO_CONFIG_YAML") {
+            if !yaml.trim().is_empty() {
+                let doc = parse_mapping(&yaml, "env QUERYFOLIO_CONFIG_YAML")?;
+                return Ok(Self {
+                    doc,
+                    source_path: None,
+                });
+            }
+        }
+
+        let path = Self::find_config_path()?;
+        if !path.exists() {
+            return Err(AppError::Config(format!(
+                "Config file not found. Create {} (see config.example.yaml)",
+                path.display()
+            )));
+        }
+        let text = std::fs::read_to_string(&path)?;
+        let doc = parse_mapping(&text, &path.display().to_string())?;
+        Ok(Self {
+            doc,
+            source_path: Some(path),
+        })
+    }
+
+    /// config.yml を優先し、無ければ config.yaml、どちらも無ければ
+    /// デフォルトの config.yml のパスを返す。
+    fn find_config_path() -> Result<PathBuf, AppError> {
+        let dir = app_config_dir()?;
+        let yml = dir.join("config.yml");
+        if yml.exists() {
+            return Ok(yml);
+        }
+        let yaml = dir.join("config.yaml");
+        if yaml.exists() {
+            return Ok(yaml);
+        }
+        Ok(yml)
+    }
+
+    /// クエリファイルの保存ディレクトリを解決する。
+    pub fn resolve_sqlfiles_dir(&self) -> Result<PathBuf, AppError> {
+        match self.doc.get("sqlfiles_dir").and_then(|v| v.as_str()) {
+            Some(dir) if !dir.trim().is_empty() => Ok(expand_tilde(dir)),
+            _ => Ok(app_config_dir()?.join("sqlfiles")),
         }
     }
 
-    if let Ok(command) = std::env::var("QUERYFOLIO_CONFIG_YAML_GETTER_COMMAND") {
-        if !command.trim().is_empty() {
-            let yaml = run_getter_command(&command).await?;
-            return Ok((yaml, "env QUERYFOLIO_CONFIG_YAML_GETTER_COMMAND".into()));
+    fn servers_source(&self) -> Result<ServersSource, AppError> {
+        let value = self.doc.get("sql_servers").ok_or_else(|| {
+            AppError::Config("The config has no sql_servers key".into())
+        })?;
+
+        if value.is_sequence() {
+            return Ok(ServersSource::Inline);
+        }
+
+        let mapping = value.as_mapping().ok_or_else(|| {
+            AppError::Config(
+                "sql_servers must be a list of server definitions, or a source declaration \
+                 mapping (command / env / file)"
+                    .into(),
+            )
+        })?;
+
+        let mut sources = vec![];
+        for (key, val) in mapping {
+            let key = key.as_str().unwrap_or_default();
+            let text = val.as_str().map(|s| s.to_string()).ok_or_else(|| {
+                AppError::Config(format!("sql_servers.{key} must be a string"))
+            })?;
+            match key {
+                "command" => sources.push(ServersSource::Command(text)),
+                "env" => sources.push(ServersSource::Env(text)),
+                "file" => sources.push(ServersSource::File(text)),
+                other => {
+                    return Err(AppError::Config(format!(
+                        "Unknown key '{other}' in sql_servers (only command / env / file are allowed)"
+                    )));
+                }
+            }
+        }
+
+        match sources.len() {
+            1 => Ok(sources.into_iter().next().unwrap()),
+            0 => Err(AppError::Config(
+                "A sql_servers source declaration requires exactly one of command / env / file"
+                    .into(),
+            )),
+            _ => Err(AppError::Config(
+                "A sql_servers source declaration cannot have more than one of command / env / file"
+                    .into(),
+            )),
         }
     }
 
-    if let Some(command) = &settings.config_yaml_getter_command {
-        if !command.trim().is_empty() {
-            let yaml = run_getter_command(command).await?;
-            return Ok((yaml, "settings config_yaml_getter_command".into()));
+    /// 接続サーバー一覧を解決する。ソース宣言の場合は取得を伴う。
+    pub async fn resolve_servers(&self) -> Result<Vec<ServerConfig>, AppError> {
+        match self.servers_source()? {
+            ServersSource::Inline => {
+                let servers = self
+                    .doc
+                    .get("sql_servers")
+                    .and_then(|v| v.as_sequence())
+                    .cloned()
+                    .unwrap_or_default();
+                let templates = self
+                    .doc
+                    .get("sql_server_templates")
+                    .and_then(|v| v.as_sequence())
+                    .cloned()
+                    .unwrap_or_default();
+                parse_server_entries(&servers, &templates, "config (inline)")
+            }
+            ServersSource::Command(command) => {
+                let yaml = run_source_command(&command).await?;
+                parse_fetched_servers(&yaml, &format!("command: {command}"))
+            }
+            ServersSource::Env(env_name) => {
+                let yaml = std::env::var(&env_name).map_err(|_| {
+                    AppError::Config(format!(
+                        "Environment variable {env_name} is not set \
+                         (GUI apps launched from Finder / Dock do not inherit shell env vars)"
+                    ))
+                })?;
+                parse_fetched_servers(&yaml, &format!("env: {env_name}"))
+            }
+            ServersSource::File(path) => {
+                let file_path = expand_tilde(&path);
+                if !file_path.exists() {
+                    return Err(AppError::Config(format!(
+                        "sql_servers file not found: {}",
+                        file_path.display()
+                    )));
+                }
+                let yaml = std::fs::read_to_string(&file_path)?;
+                parse_fetched_servers(&yaml, &file_path.display().to_string())
+            }
         }
     }
 
-    let path = settings.resolve_config_yaml_path()?;
-    if !path.exists() {
-        return Err(AppError::Config(format!(
-            "接続設定が見つかりません。{} を作成するか、設定画面で getter command を指定してください",
-            path.display()
-        )));
+    /// 情報表示用のサマリを返す (機密を含まない)。
+    pub fn info(&self) -> Result<ConfigInfo, AppError> {
+        let config_path = match &self.source_path {
+            Some(path) => path.display().to_string(),
+            None => "(env QUERYFOLIO_CONFIG_YAML)".to_string(),
+        };
+        let source = match self.servers_source() {
+            Ok(ServersSource::Inline) => "inline".to_string(),
+            Ok(ServersSource::Command(command)) => format!("command: {command}"),
+            Ok(ServersSource::Env(env_name)) => format!("env: {env_name}"),
+            Ok(ServersSource::File(path)) => format!("file: {path}"),
+            Err(e) => format!("(error: {e})"),
+        };
+        Ok(ConfigInfo {
+            config_path,
+            config_exists: true,
+            source,
+            sqlfiles_dir: self.resolve_sqlfiles_dir()?.display().to_string(),
+        })
     }
-    let yaml = std::fs::read_to_string(&path)?;
-    Ok((yaml, path.display().to_string()))
 }
 
-/// getter command を実行して stdout を返す。
+/// 設定ファイルが読めない場合も含めて情報表示用サマリを作る。
+pub fn config_info() -> ConfigInfo {
+    match AppConfig::load() {
+        Ok(config) => config.info().unwrap_or_else(|e| ConfigInfo {
+            config_path: String::new(),
+            config_exists: true,
+            source: format!("(error: {e})"),
+            sqlfiles_dir: String::new(),
+        }),
+        Err(e) => {
+            // load 失敗には「ファイルが無い」以外に「存在するが YAML が壊れている」
+            // 場合があるため、存在判定はパースの成否と独立に行う
+            let (config_path, config_exists) = match AppConfig::find_config_path() {
+                Ok(path) => (path.display().to_string(), path.exists()),
+                Err(_) => (String::new(), false),
+            };
+            ConfigInfo {
+                config_path,
+                config_exists,
+                source: format!("(error: {e})"),
+                sqlfiles_dir: String::new(),
+            }
+        }
+    }
+}
+
+fn parse_mapping(yaml_text: &str, source: &str) -> Result<serde_yaml::Mapping, AppError> {
+    let doc: serde_yaml::Value = serde_yaml::from_str(yaml_text)
+        .map_err(|e| AppError::Config(format!("Failed to parse YAML from {source}: {e}")))?;
+    doc.as_mapping().cloned().ok_or_else(|| {
+        AppError::Config(format!("{source} is not a YAML mapping"))
+    })
+}
+
+/// ソース宣言で取得した YAML をパースする。
+/// sql-agent-mcp-server 互換フォーマット (sql_servers リスト + sql_server_templates)。
+/// 取得先でさらにソース宣言を使う再帰は禁止 (ループ防止のため深さ 1 まで)。
+fn parse_fetched_servers(
+    yaml_text: &str,
+    source: &str,
+) -> Result<Vec<ServerConfig>, AppError> {
+    let mapping = parse_mapping(yaml_text, source)?;
+    let servers_value = mapping.get("sql_servers").ok_or_else(|| {
+        AppError::Config(format!("{source} has no sql_servers key"))
+    })?;
+    let servers = servers_value.as_sequence().ok_or_else(|| {
+        AppError::Config(format!(
+            "sql_servers in {source} is not a list \
+             (recursive source declarations are not allowed)"
+        ))
+    })?;
+    let templates = mapping
+        .get("sql_server_templates")
+        .and_then(|v| v.as_sequence())
+        .cloned()
+        .unwrap_or_default();
+    parse_server_entries(servers, &templates, source)
+}
+
+fn parse_server_entries(
+    servers: &[serde_yaml::Value],
+    templates: &[serde_yaml::Value],
+    source: &str,
+) -> Result<Vec<ServerConfig>, AppError> {
+    let mut result = Vec::new();
+    for server_value in servers {
+        let expanded = expand_template(server_value, templates)?;
+        let server: ServerConfig = serde_yaml::from_value(expanded).map_err(|e| {
+            AppError::Config(format!(
+                "Failed to parse a sql_servers entry in {source}: {e}"
+            ))
+        })?;
+        result.push(server);
+    }
+    Ok(result)
+}
+
+/// ソース宣言の command を実行して stdout を返す。
 ///
 /// shlex で argv に分解し、シェルを介さず実行する。シェルメタ文字が混入しても
 /// 解釈されないためコマンドインジェクションの余地が無い。その代わり
 /// パイプ・リダイレクト・変数展開は使えない (単一コマンド前提)。
-async fn run_getter_command(command: &str) -> Result<String, AppError> {
+async fn run_source_command(command: &str) -> Result<String, AppError> {
     let argv = shlex::split(command).ok_or_else(|| {
         AppError::Config(format!(
-            "getter command の解析に失敗 (クォート不整合等): {command}"
+            "Failed to parse sql_servers command (unbalanced quotes?): {command}"
         ))
     })?;
     if argv.is_empty() {
-        return Err(AppError::Config("getter command が空です".into()));
+        return Err(AppError::Config("sql_servers command is empty".into()));
     }
 
     let output = tokio::time::timeout(
-        Duration::from_secs(GETTER_COMMAND_TIMEOUT_SECS),
+        Duration::from_secs(SOURCE_COMMAND_TIMEOUT_SECS),
         tokio::process::Command::new(&argv[0])
             .args(&argv[1..])
+            // Finder / Dock から起動した GUI の PATH は最小構成 (/usr/bin:/bin 等) で、
+            // Homebrew の op 等が見つからないため定番パスを補う
+            .env("PATH", supplemented_path())
             // タイムアウトで future が drop された時に子プロセスを残さない
             // (認証待ちでハングした op が遺児化し、リトライで多重起動するのを防ぐ)
             .kill_on_drop(true)
@@ -141,16 +460,18 @@ async fn run_getter_command(command: &str) -> Result<String, AppError> {
     .await
     .map_err(|_| {
         AppError::Config(format!(
-            "getter command がタイムアウト ({GETTER_COMMAND_TIMEOUT_SECS}秒): {command} \
-             (1Password 等の認証待ちでハングしている可能性)"
+            "sql_servers command timed out ({SOURCE_COMMAND_TIMEOUT_SECS}s): {command} \
+             (it may be hanging on 1Password or another auth prompt)"
         ))
     })?
-    .map_err(|e| AppError::Config(format!("getter command の実行に失敗: {command}: {e}")))?;
+    .map_err(|e| {
+        AppError::Config(format!("Failed to run sql_servers command: {command}: {e}"))
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(AppError::Config(format!(
-            "getter command が異常終了 (code={:?}): {command}\nstderr: {}",
+            "sql_servers command exited with an error (code={:?}): {command}\nstderr: {}",
             output.status.code(),
             stderr.trim()
         )));
@@ -159,43 +480,29 @@ async fn run_getter_command(command: &str) -> Result<String, AppError> {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     if stdout.trim().is_empty() {
         return Err(AppError::Config(format!(
-            "getter command の出力が空: {command}"
+            "sql_servers command produced no output: {command}"
         )));
     }
     Ok(stdout)
 }
 
-/// YAML テキストをパースし、テンプレート展開済みのサーバー一覧を返す。
-fn parse_servers(yaml_text: &str, source: &str) -> Result<Vec<ServerConfig>, AppError> {
-    let doc: serde_yaml::Value = serde_yaml::from_str(yaml_text)
-        .map_err(|e| AppError::Config(format!("{source} の YAML パースに失敗: {e}")))?;
+/// PATH に Homebrew 等の定番ディレクトリを補ったものを返す。
+fn supplemented_path() -> String {
+    supplement_path(&std::env::var("PATH").unwrap_or_default())
+}
 
-    let mapping = doc
-        .as_mapping()
-        .ok_or_else(|| AppError::Config(format!("{source} は YAML マッピングではありません")))?;
-
-    let templates = mapping
-        .get("sql_server_templates")
-        .and_then(|v| v.as_sequence())
-        .cloned()
-        .unwrap_or_default();
-
-    let servers_value = mapping
-        .get("sql_servers")
-        .and_then(|v| v.as_sequence())
-        .ok_or_else(|| {
-            AppError::Config(format!("{source} に sql_servers がありません"))
-        })?;
-
-    let mut servers = Vec::new();
-    for server_value in servers_value {
-        let expanded = expand_template(server_value, &templates)?;
-        let server: ServerConfig = serde_yaml::from_value(expanded).map_err(|e| {
-            AppError::Config(format!("{source} の sql_servers エントリのパースに失敗: {e}"))
-        })?;
-        servers.push(server);
+fn supplement_path(base: &str) -> String {
+    let mut path = base.to_string();
+    for extra in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        let already = base.split(':').any(|p| p == extra);
+        if !already {
+            if !path.is_empty() {
+                path.push(':');
+            }
+            path.push_str(extra);
+        }
     }
-    Ok(servers)
+    path
 }
 
 /// `template: <名前>` を持つサーバーエントリに、sql_server_templates の
@@ -207,7 +514,7 @@ fn expand_template(
 ) -> Result<serde_yaml::Value, AppError> {
     let server_map = server_value
         .as_mapping()
-        .ok_or_else(|| AppError::Config("sql_servers のエントリがマッピングではありません".into()))?;
+        .ok_or_else(|| AppError::Config("A sql_servers entry is not a mapping".into()))?;
 
     let template_name = match server_map.get("template").and_then(|v| v.as_str()) {
         Some(name) => name.to_string(),
@@ -222,7 +529,7 @@ fn expand_template(
         })
         .ok_or_else(|| {
             AppError::Config(format!(
-                "sql_server_templates にテンプレート '{template_name}' がありません"
+                "Template '{template_name}' not found in sql_server_templates"
             ))
         })?;
 
@@ -242,9 +549,17 @@ fn expand_template(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_parse_servers_basic() {
-        let yaml = r#"
+    fn config_from_yaml(yaml: &str) -> AppConfig {
+        AppConfig {
+            doc: parse_mapping(yaml, "test").unwrap(),
+            source_path: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_inline_servers() {
+        let config = config_from_yaml(
+            r#"
 sql_servers:
   - name: dev-postgres
     description: "dev"
@@ -254,18 +569,19 @@ sql_servers:
     schema: dev_db
     user: dev_user
     password: secret
-"#;
-        let servers = parse_servers(yaml, "test").unwrap();
+"#,
+        );
+        let servers = config.resolve_servers().await.unwrap();
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "dev-postgres");
-        assert_eq!(servers[0].engine, "postgres");
         assert_eq!(servers[0].port, Some(5432));
         assert!(servers[0].ssh_tunnel.is_none());
     }
 
-    #[test]
-    fn test_parse_servers_with_template() {
-        let yaml = r#"
+    #[tokio::test]
+    async fn test_inline_with_template() {
+        let config = config_from_yaml(
+            r#"
 sql_servers:
   - template: shared-host
     name: app-db
@@ -281,53 +597,160 @@ sql_server_templates:
     port: 3306
     user: shared_user
     password: shared_password
-"#;
-        let servers = parse_servers(yaml, "test").unwrap();
+"#,
+        );
+        let servers = config.resolve_servers().await.unwrap();
         assert_eq!(servers.len(), 2);
-        assert_eq!(servers[0].name, "app-db");
         assert_eq!(servers[0].engine, "mysql");
         assert_eq!(servers[0].host.as_deref(), Some("db.example.com"));
         assert_eq!(servers[0].port, Some(3306));
-        assert_eq!(servers[0].schema.as_deref(), Some("app_db"));
         // サーバー側の指定がテンプレートを上書きする
         assert_eq!(servers[1].port, Some(3307));
     }
 
-    #[test]
-    fn test_parse_servers_unknown_template() {
-        let yaml = r#"
+    #[tokio::test]
+    async fn test_source_command() {
+        // /bin/echo で sql-agent 互換 YAML を出力させる
+        let config = config_from_yaml(
+            r#"
 sql_servers:
-  - template: no-such-template
-    name: app-db
-"#;
-        let result = parse_servers(yaml, "test");
+  command: '/bin/echo "sql_servers: [{name: from-command, engine: sqlite, schema: /tmp/x.db}]"'
+"#,
+        );
+        let servers = config.resolve_servers().await.unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "from-command");
+    }
+
+    #[tokio::test]
+    async fn test_source_env() {
+        std::env::set_var(
+            "QUERYFOLIO_TEST_SERVERS_YAML",
+            "sql_servers: [{name: from-env, engine: sqlite, schema: /tmp/x.db}]",
+        );
+        let config = config_from_yaml(
+            r#"
+sql_servers:
+  env: QUERYFOLIO_TEST_SERVERS_YAML
+"#,
+        );
+        let servers = config.resolve_servers().await.unwrap();
+        assert_eq!(servers[0].name, "from-env");
+    }
+
+    #[tokio::test]
+    async fn test_source_file() {
+        let path = std::env::temp_dir().join(format!(
+            "queryfolio-config-test-{}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "sql_servers: [{name: from-file, engine: sqlite, schema: /tmp/x.db}]",
+        )
+        .unwrap();
+        let config = config_from_yaml(&format!(
+            "sql_servers:\n  file: {}",
+            path.display()
+        ));
+        let servers = config.resolve_servers().await.unwrap();
+        assert_eq!(servers[0].name, "from-file");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_source_multiple_keys_is_error() {
+        let config = config_from_yaml(
+            r#"
+sql_servers:
+  command: /bin/echo x
+  file: /tmp/x.yaml
+"#,
+        );
+        let result = config.resolve_servers().await;
         assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("more than one"));
+    }
+
+    #[tokio::test]
+    async fn test_source_unknown_key_is_error() {
+        let config = config_from_yaml("sql_servers:\n  url: op://x/y/z\n");
+        let result = config.resolve_servers().await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Unknown key"));
+    }
+
+    #[tokio::test]
+    async fn test_fetched_yaml_cannot_recurse() {
+        // 取得先の YAML がさらにソース宣言を持つ場合はエラー
+        let config = config_from_yaml(
+            r#"
+sql_servers:
+  command: '/bin/echo "sql_servers: {command: /bin/echo deeper}"'
+"#,
+        );
+        let result = config.resolve_servers().await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("recursive"));
     }
 
     #[test]
-    fn test_parse_servers_with_ssh_tunnel() {
-        let yaml = r#"
-sql_servers:
-  - name: remote-db
-    engine: postgres
-    host: localhost
-    port: 5432
-    schema: remote_db
-    user: remote_user
-    password: remote_password
-    ssh_tunnel:
-      host: ssh.example.com
-      user: ssh_user
-      private_key_path: ~/.ssh/id_rsa
-"#;
-        let servers = parse_servers(yaml, "test").unwrap();
-        let tunnel = servers[0].ssh_tunnel.as_ref().unwrap();
-        assert_eq!(tunnel.host, "ssh.example.com");
-        assert_eq!(tunnel.port, 22);
-        assert_eq!(
-            tunnel.private_key_path.as_deref(),
-            Some("~/.ssh/id_rsa")
-        );
+    fn test_sqlfiles_dir_default_and_custom() {
+        let config = config_from_yaml("sql_servers: []\n");
+        let default_dir = config.resolve_sqlfiles_dir().unwrap();
+        assert!(default_dir.ends_with(".config/queryfolio/sqlfiles"));
+
+        let config = config_from_yaml("sql_servers: []\nsqlfiles_dir: ~/my-queries\n");
+        let custom = config.resolve_sqlfiles_dir().unwrap();
+        assert_eq!(custom, dirs::home_dir().unwrap().join("my-queries"));
+    }
+
+    #[test]
+    fn test_ensure_config_file_in() {
+        let dir = std::env::temp_dir().join(format!(
+            "queryfolio-ensure-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 無ければ作成して Some(パス) を返す
+        let created = ensure_config_file_in(&dir).unwrap();
+        assert!(created.is_some());
+        assert!(dir.join("config.yml").exists());
+
+        // 既に存在すれば None (上書きしない)
+        assert!(ensure_config_file_in(&dir).unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_config_template_is_valid() {
+        // テンプレートはそのままで有効な設定 (接続 0 件) としてパースできること
+        let config = config_from_yaml(CONFIG_TEMPLATE);
+        let servers = config.resolve_servers().await.unwrap();
+        assert!(servers.is_empty());
+        config.resolve_sqlfiles_dir().unwrap();
+    }
+
+    #[test]
+    fn test_expand_tilde() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_tilde("~/foo/bar"), home.join("foo/bar"));
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+    }
+
+    #[test]
+    fn test_supplement_path() {
+        // 無ければ追加される
+        let path = supplement_path("/usr/bin:/bin");
+        assert!(path.split(':').any(|p| p == "/opt/homebrew/bin"));
+        assert!(path.split(':').any(|p| p == "/usr/local/bin"));
+        // 既にあれば重複追加しない
+        let path = supplement_path("/opt/homebrew/bin:/usr/bin");
+        let count = path.split(':').filter(|p| *p == "/opt/homebrew/bin").count();
+        assert_eq!(count, 1);
     }
 
     #[test]

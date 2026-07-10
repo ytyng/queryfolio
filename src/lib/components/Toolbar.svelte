@@ -25,16 +25,16 @@
   <span class="ml-auto flex items-center gap-2">
     <button
       class="rounded bg-green-700 px-3 py-1 text-xs text-white hover:bg-green-600 disabled:opacity-40"
-      title="カーソル位置の SQL を実行 (Cmd+Enter)"
+      title="Run the statement under the cursor (Cmd+Enter)"
       data-annotate="button-run-query"
       disabled={!appStore.selectedConnection || appStore.running}
       onclick={onRunCurrent}
     >
-      {appStore.running ? "実行中..." : "▶ Run"}
+      {appStore.running ? "Running..." : "▶ Run"}
     </button>
     <button
       class="rounded border border-zinc-600 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-800"
-      title="設定"
+      title="Settings"
       data-annotate="button-open-settings"
       onclick={onOpenSettings}
     >
