@@ -236,10 +236,11 @@ const updateEditorContent = (content: string) => {
   }, AUTO_SAVE_DELAY_MS);
 };
 
-/// 履歴パネルからの SQL 挿入。開いているファイルの末尾に追記する
-/// (既存の編集内容を上書きしないよう、置換ではなく追記にする)。
-/// 実行はしない。エディタへの反映は SqlEditor 側の $effect が行う。
-const insertSqlFromHistory = (sql: string) => {
+/// 履歴パネル・スキーマブラウザからの SQL 断片の挿入。
+/// 開いているファイルの末尾に追記する (既存の編集内容を上書きしないよう、
+/// 置換ではなく追記にする)。実行はしない。
+/// エディタへの反映は SqlEditor 側の $effect が行う。
+const insertSqlSnippet = (sql: string) => {
   if (!selectedConnection) {
     toast.warning("Select a connection first");
     return;
@@ -503,7 +504,7 @@ export default {
   deleteFile,
   saveCurrentFile,
   updateEditorContent,
-  insertSqlFromHistory,
+  insertSqlSnippet,
   isConnectionRunning,
   runQuery,
   cancelQuery,

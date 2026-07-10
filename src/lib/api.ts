@@ -32,6 +32,26 @@ export interface QueryHistoryEntry {
   success: boolean;
 }
 
+/// テーブル / ビューの情報 (バックエンドの schema_info::TableInfo に対応)
+export interface TableInfo {
+  /// テーブル名 (スキーマ修飾なし)
+  name: string;
+  /// 所属スキーマ名 (PostgreSQL のみ。MySQL / SQLite は null)
+  schema: string | null;
+  /// "table" または "view"
+  kind: string;
+  /// SQL に埋め込める修飾名。listColumns の table 引数やエディタへの
+  /// 挿入にはこの値を使う
+  qualified_name: string;
+}
+
+/// カラムの情報 (バックエンドの schema_info::ColumnInfo に対応)
+export interface ColumnInfo {
+  name: string;
+  data_type: string;
+  nullable: boolean;
+}
+
 export interface ConfigInfo {
   config_path: string;
   config_exists: boolean;
@@ -88,6 +108,18 @@ export const setActiveSchema = (connection: string, schema: string) =>
 
 export const getActiveSchema = (connection: string) =>
   invoke<string | null>("get_active_schema", { connection });
+
+/// テーブル / ビューの一覧を返す。refresh = true でキャッシュを破棄して再取得。
+export const listTables = (connection: string, refresh?: boolean) =>
+  invoke<TableInfo[]>("list_tables", { connection, refresh });
+
+/// テーブルのカラム一覧を返す。table には TableInfo.qualified_name を渡す。
+export const listColumns = (connection: string, table: string) =>
+  invoke<ColumnInfo[]>("list_columns", { connection, table });
+
+/// テーブル名 → カラム名リストのマップを返す (SQL 補完用)。
+export const getSchemaMap = (connection: string) =>
+  invoke<Record<string, string[]>>("get_schema_map", { connection });
 
 export const getConfigInfo = () => invoke<ConfigInfo>("get_config_info");
 
