@@ -49,6 +49,9 @@ pub struct DbManager {
 struct DbManagerInner {
     pools: HashMap<String, DbPool>,
     tunnels: HashMap<String, SshTunnel>,
+    /// 接続名ごとのアクティブスキーマ (database) のオーバーライド。
+    /// 設定の schema と異なる database に切り替えている時のみ存在する。
+    schema_overrides: HashMap<String, String>,
 }
 
 impl DbManager {
@@ -57,6 +60,13 @@ impl DbManager {
         if let Some(pool) = inner.pools.get(&server.name) {
             return Ok(pool.clone());
         }
+
+        // アクティブスキーマが切り替えられていれば接続先 database を差し替える
+        let mut server = server.clone();
+        if let Some(schema) = inner.schema_overrides.get(&server.name) {
+            server.schema = Some(schema.clone());
+        }
+        let server = &server;
 
         let engine = parse_engine(&server.engine)?;
 
@@ -97,6 +107,23 @@ impl DbManager {
         let mut inner = self.inner.lock().await;
         inner.pools.clear();
         inner.tunnels.clear();
+        inner.schema_overrides.clear();
+    }
+
+    /// 接続のアクティブスキーマ (database) を切り替える。
+    /// プールを破棄し、次のクエリから新しい database で接続し直す
+    /// (SQL の USE ではなくプール再構築で切り替えることで、プール内の
+    /// コネクション間でセッション状態が食い違うのを防ぐ)。
+    /// SSH トンネルは接続先ホストが変わらないため維持する。
+    pub async fn set_schema_override(&self, connection: &str, schema: String) {
+        let mut inner = self.inner.lock().await;
+        inner.schema_overrides.insert(connection.to_string(), schema);
+        inner.pools.remove(connection);
+    }
+
+    /// 接続のアクティブスキーマのオーバーライドを返す (無ければ None)。
+    pub async fn schema_override(&self, connection: &str) -> Option<String> {
+        self.inner.lock().await.schema_overrides.get(connection).cloned()
     }
 }
 
@@ -304,6 +331,43 @@ pub async fn run_query(
         truncated,
         elapsed_ms: started.elapsed().as_millis() as u64,
     })
+}
+
+/// 接続先サーバー上の database (スキーマ) 一覧を返す。
+/// sqlite は database の概念が単一ファイルなので、設定のパスをそのまま返す。
+pub async fn list_schemas(
+    pool: &DbPool,
+    server: &ServerConfig,
+) -> Result<Vec<String>, AppError> {
+    match pool {
+        DbPool::Postgres(p) => {
+            let rows = sqlx::query(
+                "SELECT datname FROM pg_catalog.pg_database \
+                 WHERE datistemplate = false ORDER BY datname",
+            )
+            .fetch_all(p)
+            .await?;
+            Ok(rows
+                .iter()
+                .filter_map(|row| row.try_get::<String, _>(0).ok())
+                .collect())
+        }
+        DbPool::MySql(p) => {
+            let rows = sqlx::query("SHOW DATABASES").fetch_all(p).await?;
+            Ok(rows
+                .iter()
+                .filter_map(|row| row.try_get::<String, _>(0).ok())
+                .collect())
+        }
+        DbPool::Sqlite(_) => {
+            let path = server
+                .schema
+                .as_deref()
+                .or(server.host.as_deref())
+                .unwrap_or("main");
+            Ok(vec![path.to_string()])
+        }
+    }
 }
 
 /// SQL の先頭キーワード (コメントを除く) を小文字で返す。
