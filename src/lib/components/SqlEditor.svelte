@@ -74,14 +74,27 @@
   };
 
   const currentStatementText = (state: EditorState): string => {
+    const head = state.selection.main.head;
+    const range = statementRangeAt(state, head);
     // psql 風メタコマンド (\dt など) は SQL パーサが Statement として
-    // 認識しないため、カーソル行が \ 始まりの場合はその行を実行対象にする
-    const line = state.doc.lineAt(state.selection.main.head);
+    // 認識しないため、カーソル行が \ 始まりの場合はその行を実行対象にする。
+    // ただし複数行 SQL の途中の行 (文字列リテラル内等) を誤って
+    // メタコマンド扱いしないよう、カーソルが Statement の中に無い場合か、
+    // その Statement 自体が \ 始まり (パーサのエラー回復でメタコマンド行が
+    // Statement 扱いされた場合) に限る。
+    const line = state.doc.lineAt(head);
     const lineText = state.sliceDoc(line.from, line.to).trim();
     if (lineText.startsWith("\\")) {
-      return lineText;
+      const inStatement =
+        range !== null && head >= range.from && head <= range.to;
+      if (!inStatement) {
+        return lineText;
+      }
+      const statementText = state.sliceDoc(range.from, range.to).trim();
+      if (statementText.startsWith("\\")) {
+        return lineText;
+      }
     }
-    const range = statementRangeAt(state, state.selection.main.head);
     if (!range) {
       return "";
     }
