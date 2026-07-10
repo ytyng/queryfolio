@@ -32,7 +32,7 @@ pnpm tauri build        # リリースビルド
 |---------|------|
 | lib.rs | Tauri コマンド定義と AppState (接続設定キャッシュ + DbManager) |
 | config.rs | config.yml のロード・ソース宣言解決・テンプレート展開・expand_tilde |
-| db.rs | sqlx プール管理、クエリ実行、型別 JSON 変換 |
+| db.rs | sqlx プール管理、クエリ実行・キャンセル (CancelRegistry)、型別 JSON 変換 |
 | tunnel.rs | SSH ローカルポートフォワード (known_hosts 検証付き) |
 | query_files.rs | クエリファイル CRUD (パストラバーサル対策) |
 | schema_info.rs | テーブル・カラムのカタログ照会と SchemaCache (接続+スキーマ単位のキャッシュ。スキーマブラウザと SQL 補完用 get_schema_map で共有) |

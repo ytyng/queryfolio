@@ -10,7 +10,7 @@ mod tunnel;
 use std::path::PathBuf;
 
 use config::{AppConfig, ConfigInfo, ConnectionInfo, ServerConfig};
-use db::{DbManager, DbPool, QueryResult, DEFAULT_MAX_ROWS};
+use db::{CancelRegistry, DbManager, DbPool, QueryResult, DEFAULT_MAX_ROWS};
 use error::AppError;
 
 /// アプリ全体の共有状態。
@@ -28,6 +28,8 @@ struct AppState {
     /// dirty ファイルの保存先を読み込み時のディレクトリに固定する。
     sqlfiles_dir: tokio::sync::Mutex<Option<PathBuf>>,
     db: DbManager,
+    /// 実行中クエリのキャンセルレジストリ (接続名単位)。
+    query_cancels: CancelRegistry,
     /// クエリ実行履歴の記録 (接続ごとの行数キャッシュを保持)。
     history: history::HistoryManager,
     /// スキーマ情報 (テーブル・カラム) のキャッシュ。
@@ -124,8 +126,10 @@ async fn run_query(
     let started = std::time::Instant::now();
     let result = async {
         let pool: DbPool = state.db.get_pool(&server).await?;
-        db::run_query(
+        db::run_query_cancellable(
             &pool,
+            &state.query_cancels,
+            &connection,
             &sql,
             max_rows.unwrap_or(DEFAULT_MAX_ROWS),
             auto_limit,
@@ -161,6 +165,18 @@ async fn run_query(
     }
 
     result
+}
+
+/// 接続で実行中のクエリにキャンセルを要求する。
+/// 実行中のクエリが無ければ何もせず false を返す。
+/// キャンセルされた実行は run_query 側が AppError::Cancelled
+/// ("Query cancelled") で返る。
+#[tauri::command]
+async fn cancel_query(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+) -> Result<bool, AppError> {
+    state.query_cancels.cancel(&connection).await
 }
 
 /// 接続のクエリ実行履歴を新しい順に返す。
@@ -441,6 +457,7 @@ pub fn run() {
             get_connections,
             reset_connections,
             run_query,
+            cancel_query,
             list_query_history,
             list_query_files,
             read_query_file,

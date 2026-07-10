@@ -19,6 +19,8 @@ export interface ResultTab {
   executedAt: number;
   result: QueryResult | null;
   error: string | null;
+  /// キャンセル要求で実行が中断された (エラーとは別の見た目で表示する)
+  cancelled: boolean;
   running: boolean;
 }
 
@@ -251,6 +253,13 @@ const insertSqlSnippet = (sql: string) => {
   updateEditorContent(trimmed ? `${trimmed}\n\n${sql}\n` : `${sql}\n`);
 };
 
+/// 指定した接続でクエリ実行中のタブがあるかを返す。
+/// バックエンドのキャンセルレジストリは接続単位で最後の実行しか
+/// 管理しないため、同一接続の並列実行はフロント側で抑止する
+/// (許すとキャンセル対象の取り違えや取りこぼしが起きる)。
+const isConnectionRunning = (connection: string): boolean =>
+  resultTabs.some((t) => t.running && t.connection === connection);
+
 /// 実行結果の書き込み先タブを決める。
 /// アクティブな非ピン留めタブがあれば使い回し、無ければ新規タブを作る。
 /// 上限到達時は最も古い非ピン留めタブを破棄する。
@@ -290,6 +299,7 @@ const prepareTargetTab = (): ResultTab | null => {
     executedAt: Date.now(),
     result: null,
     error: null,
+    cancelled: false,
     running: false,
   };
   resultTabs = [...resultTabs, tab];
@@ -304,14 +314,22 @@ const executeTab = async (tab: ResultTab) => {
   // 失敗時に前回の結果を誤認・誤エクスポートしないよう、実行前にクリアする
   tab.result = null;
   tab.error = null;
+  tab.cancelled = false;
   tab.executedAt = Date.now();
   activeTabId = tab.id;
   let result: QueryResult | null = null;
   let error: string | null = null;
+  let cancelled = false;
   try {
     result = await api.runQuery(tab.connection, tab.sql);
   } catch (e) {
-    error = toErrorMessage(e);
+    const message = toErrorMessage(e);
+    // キャンセルによる中断はエラーではなく「Query cancelled」として表示する
+    if (message === api.CANCELLED_ERROR_MESSAGE) {
+      cancelled = true;
+    } else {
+      error = message;
+    }
   }
   tab.running = false;
   // 実行中に設定再読込などでタブが破棄されていた場合は、
@@ -321,6 +339,28 @@ const executeTab = async (tab: ResultTab) => {
   }
   tab.result = result;
   tab.error = error;
+  tab.cancelled = cancelled;
+};
+
+/// タブで実行中のクエリのキャンセルを要求する。
+/// 実際の中断はバックエンドが行い、実行中の runQuery が
+/// 「Query cancelled」で返ることで executeTab 側がタブに反映する。
+const cancelQuery = async (id: number) => {
+  const tab = resultTabs.find((t) => t.id === id);
+  if (!tab || !tab.running) {
+    return;
+  }
+  try {
+    const requested = await api.cancelQuery(tab.connection);
+    // 実行が直前に完了していた等でキャンセル対象が無かった場合の通知
+    if (!requested) {
+      toast.info("No running query to cancel. It may have just finished.");
+    }
+  } catch (e) {
+    toast.error("Failed to cancel the query", {
+      description: toErrorMessage(e),
+    });
+  }
 };
 
 const runQuery = async (sql: string) => {
@@ -331,6 +371,13 @@ const runQuery = async (sql: string) => {
   }
   if (!sql.trim()) {
     toast.warning("There is no SQL statement to run");
+    return;
+  }
+  // 同一接続の並列実行を抑止する (別タブで実行中でも拒否)
+  if (isConnectionRunning(selectedConnection)) {
+    toast.warning(
+      "A query is already running on this connection. Cancel it or wait for it to finish.",
+    );
     return;
   }
   if (!(await flushPendingSave())) {
@@ -351,6 +398,13 @@ const runQuery = async (sql: string) => {
 const rerunTab = async (id: number) => {
   const tab = resultTabs.find((t) => t.id === id);
   if (!tab || tab.running || !tab.sql.trim()) {
+    return;
+  }
+  // 同一接続の並列実行を抑止する (別タブで実行中でも拒否)
+  if (isConnectionRunning(tab.connection)) {
+    toast.warning(
+      "A query is already running on this connection. Cancel it or wait for it to finish.",
+    );
     return;
   }
   errorMessage = null;
@@ -451,7 +505,9 @@ export default {
   saveCurrentFile,
   updateEditorContent,
   insertSqlSnippet,
+  isConnectionRunning,
   runQuery,
+  cancelQuery,
   rerunTab,
   selectResultTab,
   closeResultTab,

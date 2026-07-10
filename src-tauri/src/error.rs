@@ -20,6 +20,12 @@ pub enum AppError {
     #[error("{0}")]
     Readonly(String),
 
+    /// ユーザーのキャンセル要求でクエリが中断された。
+    /// フロントエンドはこの文字列 ("Query cancelled") との一致で
+    /// エラーではなくキャンセルとして表示を分ける。
+    #[error("Query cancelled")]
+    Cancelled,
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
