@@ -3,10 +3,70 @@
   import appStore from "$lib/stores/app.svelte";
   import type { ResultTab } from "$lib/stores/app.svelte";
   import { toCsv, toJson, toTsv } from "$lib/export";
+  import CellInspector from "./CellInspector.svelte";
 
   let copiedFormat = $state<string | null>(null);
 
   const activeTab = $derived(appStore.activeResultTab);
+
+  // インスペクタで表示中のセル。どのタブのセルかを tabId で覚えておき、
+  // タブ切替・タブクローズ時に別タブのセルを表示し続けないようにする
+  let selectedCell = $state<{
+    tabId: number;
+    rowIndex: number;
+    colIndex: number;
+  } | null>(null);
+
+  // タブ切替 (クローズによる切替を含む) でインスペクタを閉じる
+  $effect(() => {
+    void appStore.activeTabId;
+    selectedCell = null;
+  });
+
+  // インスペクタに渡す値。再実行などで結果が入れ替わり
+  // 選択位置が範囲外になった場合は null (= 非表示) にする
+  const inspectedCell = $derived.by(() => {
+    const tab = activeTab;
+    if (!selectedCell || !tab || selectedCell.tabId !== tab.id) {
+      return null;
+    }
+    const result = tab.result;
+    if (!result) {
+      return null;
+    }
+    const row = result.rows[selectedCell.rowIndex];
+    if (!row || selectedCell.colIndex >= result.columns.length) {
+      return null;
+    }
+    return {
+      value: row[selectedCell.colIndex],
+      column: result.columns[selectedCell.colIndex],
+      rowIndex: selectedCell.rowIndex,
+    };
+  });
+
+  // セルクリックで選択してインスペクタを開く。選択中セルの再クリックで閉じる
+  const selectCell = (rowIndex: number, colIndex: number) => {
+    if (!activeTab) {
+      return;
+    }
+    if (
+      selectedCell &&
+      selectedCell.tabId === activeTab.id &&
+      selectedCell.rowIndex === rowIndex &&
+      selectedCell.colIndex === colIndex
+    ) {
+      selectedCell = null;
+      return;
+    }
+    selectedCell = { tabId: activeTab.id, rowIndex, colIndex };
+  };
+
+  const isSelectedCell = (rowIndex: number, colIndex: number): boolean =>
+    selectedCell !== null &&
+    selectedCell.tabId === activeTab?.id &&
+    selectedCell.rowIndex === rowIndex &&
+    selectedCell.colIndex === colIndex;
 
   const copyAs = async (format: "csv" | "tsv" | "json") => {
     const result = activeTab?.result;
@@ -196,65 +256,90 @@
     </div>
   {/if}
 
-  <div class="min-h-0 flex-1 overflow-auto">
-    {#if appStore.errorMessage}
-      <pre
-        class="whitespace-pre-wrap px-3 py-2 font-mono text-xs text-red-400"
-        data-annotate="text-error-message">{appStore.errorMessage}</pre>
-    {:else if activeTab?.running}
-      <p class="px-3 py-2 text-xs text-blue-400">Running...</p>
-    {:else if activeTab?.error}
-      <pre
-        class="whitespace-pre-wrap px-3 py-2 font-mono text-xs text-red-400"
-        data-annotate="text-error-message">{activeTab.error}</pre>
-    {:else if activeTab?.result && activeTab.result.columns.length > 0}
-      {@const result = activeTab.result}
-      <table class="min-w-full border-collapse font-mono text-xs">
-        <thead class="sticky top-0 bg-zinc-800">
-          <tr>
-            <th
-              class="border-b border-r border-zinc-700 px-2 py-1 text-right font-normal text-zinc-500"
-            >
-              #
-            </th>
-            {#each result.columns as column, i (i)}
+  <div class="flex min-h-0 flex-1">
+    <div class="min-h-0 flex-1 overflow-auto">
+      {#if appStore.errorMessage}
+        <pre
+          class="whitespace-pre-wrap px-3 py-2 font-mono text-xs text-red-400"
+          data-annotate="text-error-message">{appStore.errorMessage}</pre>
+      {:else if activeTab?.running}
+        <p class="px-3 py-2 text-xs text-blue-400">Running...</p>
+      {:else if activeTab?.error}
+        <pre
+          class="whitespace-pre-wrap px-3 py-2 font-mono text-xs text-red-400"
+          data-annotate="text-error-message">{activeTab.error}</pre>
+      {:else if activeTab?.result && activeTab.result.columns.length > 0}
+        {@const result = activeTab.result}
+        <table class="min-w-full border-collapse font-mono text-xs">
+          <thead class="sticky top-0 bg-zinc-800">
+            <tr>
               <th
-                class="border-b border-r border-zinc-700 px-2 py-1 text-left font-semibold text-zinc-300"
+                class="border-b border-r border-zinc-700 px-2 py-1 text-right font-normal text-zinc-500"
               >
-                {column}
+                #
               </th>
-            {/each}
-          </tr>
-        </thead>
-        <tbody>
-          {#each result.rows as row, rowIndex (rowIndex)}
-            <tr class="hover:bg-zinc-800/60">
-              <td
-                class="border-b border-r border-zinc-800 px-2 py-0.5 text-right text-zinc-600"
-              >
-                {rowIndex + 1}
-              </td>
-              {#each row as value, colIndex (colIndex)}
-                <td
-                  class="max-w-96 truncate border-b border-r border-zinc-800 px-2 py-0.5 {value ===
-                  null
-                    ? 'italic text-zinc-600'
-                    : 'text-zinc-200'}"
-                  title={cellText(value)}
+              {#each result.columns as column, i (i)}
+                <th
+                  class="border-b border-r border-zinc-700 px-2 py-1 text-left font-semibold text-zinc-300"
                 >
-                  {cellText(value)}
-                </td>
+                  {column}
+                </th>
               {/each}
             </tr>
-          {/each}
-        </tbody>
-      </table>
-    {:else if activeTab?.result}
-      <p class="px-3 py-2 text-xs text-zinc-500">No result set</p>
-    {:else}
-      <p class="px-3 py-2 text-xs text-zinc-500">
-        Press Cmd+Enter (Ctrl+Enter) to run the SQL statement under the cursor
-      </p>
+          </thead>
+          <tbody>
+            {#each result.rows as row, rowIndex (rowIndex)}
+              <tr class="hover:bg-zinc-800/60">
+                <td
+                  class="border-b border-r border-zinc-800 px-2 py-0.5 text-right text-zinc-600"
+                >
+                  {rowIndex + 1}
+                </td>
+                {#each row as value, colIndex (colIndex)}
+                  <!-- クリックでセルインスペクタを開く。truncate のため
+                       ボタンをセル全面に敷く -->
+                  <td
+                    class="max-w-96 border-b border-r border-zinc-800 p-0 {isSelectedCell(
+                      rowIndex,
+                      colIndex,
+                    )
+                      ? 'bg-sky-900/50'
+                      : ''}"
+                  >
+                    <button
+                      class="block w-full cursor-pointer truncate px-2 py-0.5 text-left {value ===
+                      null
+                        ? 'italic text-zinc-600'
+                        : 'text-zinc-200'}"
+                      title={cellText(value)}
+                      data-annotate="button-result-cell-{rowIndex}-{colIndex}"
+                      onclick={() => selectCell(rowIndex, colIndex)}
+                    >
+                      {cellText(value)}
+                    </button>
+                  </td>
+                {/each}
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      {:else if activeTab?.result}
+        <p class="px-3 py-2 text-xs text-zinc-500">No result set</p>
+      {:else}
+        <p class="px-3 py-2 text-xs text-zinc-500">
+          Press Cmd+Enter (Ctrl+Enter) to run the SQL statement under the cursor
+        </p>
+      {/if}
+    </div>
+
+    <!-- セルインスペクタ (セル選択中のみ表示) -->
+    {#if inspectedCell}
+      <CellInspector
+        value={inspectedCell.value}
+        column={inspectedCell.column}
+        rowIndex={inspectedCell.rowIndex}
+        onclose={() => (selectedCell = null)}
+      />
     {/if}
   </div>
 </div>
