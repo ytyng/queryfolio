@@ -76,22 +76,30 @@
   const currentStatementText = (state: EditorState): string => {
     const head = state.selection.main.head;
     const range = statementRangeAt(state, head);
-    // psql 風メタコマンド (\dt など) は SQL パーサが Statement として
-    // 認識しないため、カーソル行が \ 始まりの場合はその行を実行対象にする。
-    // ただし複数行 SQL の途中の行 (文字列リテラル内等) を誤って
-    // メタコマンド扱いしないよう、カーソルが Statement の中に無い場合か、
-    // その Statement 自体が \ 始まり (パーサのエラー回復でメタコマンド行が
-    // Statement 扱いされた場合) に限る。
+    // psql 風メタコマンド (\dt など) は、カーソル行が \ 始まりの場合に
+    // その行全体を実行対象にする。ただし複数行 SQL の途中の行
+    // (文字列リテラル内等) を誤ってメタコマンド扱いしないよう、
+    // カーソルを含む Statement が行の外にまたがる場合は SQL として扱う。
     const line = state.doc.lineAt(head);
     const lineText = state.sliceDoc(line.from, line.to).trim();
     if (lineText.startsWith("\\")) {
+      // 注意: lezer のエラー回復は "\\d" を ⚠(バックスラッシュ) +
+      // Statement("d") とパースし、後続の SQL と融合することもあるため、
+      // 「Statement 内かどうか」ではメタコマンド行を判別できない。
+      // カーソルを含む Statement の開始行も \ 始まりなら、その Statement は
+      // メタコマンド行から始まった誤パースとみなして行を実行する。
+      // 開始行が通常の SQL (複数行文の途中の文字列リテラル等) の場合のみ
+      // Statement 全体を実行する。
       const inStatement =
         range !== null && head >= range.from && head <= range.to;
       if (!inStatement) {
         return lineText;
       }
-      const statementText = state.sliceDoc(range.from, range.to).trim();
-      if (statementText.startsWith("\\")) {
+      const statementFirstLine = state.doc.lineAt(range.from);
+      const statementFirstLineText = state
+        .sliceDoc(statementFirstLine.from, statementFirstLine.to)
+        .trim();
+      if (statementFirstLineText.startsWith("\\")) {
         return lineText;
       }
     }
