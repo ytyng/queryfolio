@@ -18,6 +18,7 @@
   import { sql, MySQL, PostgreSQL, SQLite } from "@codemirror/lang-sql";
   import type { SQLNamespace } from "@codemirror/lang-sql";
   import { oneDark } from "@codemirror/theme-one-dark";
+  import { formatSql } from "$lib/sqlFormat";
 
   interface Props {
     content: string;
@@ -235,6 +236,30 @@
   // ツールバーの Explain ボタンが EXPLAIN の対象文を取るのに使う
   export function getCurrentStatement(): string {
     return view ? currentStatementText(view.state) : "";
+  }
+
+  // カーソル位置の文を整形して、その範囲を整形結果で置換する公開メソッド。
+  // 整形できない (未対応構文・壊す恐れ) 場合は formatSql が原文を返すため
+  // 変化がなく、何もしない。
+  export function formatCurrentStatement() {
+    if (!view) {
+      return;
+    }
+    const state = view.state;
+    const range = executionTargetRange(state, state.selection.main.head);
+    if (!range) {
+      return;
+    }
+    const original = state.sliceDoc(range.from, range.to);
+    const formatted = formatSql(original);
+    if (formatted === original) {
+      return;
+    }
+    view.dispatch({
+      changes: { from: range.from, to: range.to, insert: formatted },
+      selection: { anchor: range.from + formatted.length },
+    });
+    view.focus();
   }
 
   const runKeymap = keymap.of([

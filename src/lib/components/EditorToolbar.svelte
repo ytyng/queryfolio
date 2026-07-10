@@ -11,9 +11,12 @@
     /// Explain SQL ボタン押下時の処理 (+page.svelte がエディタの
     /// カーソル位置の文を取り出して appStore.explainSql に渡す)
     onExplainSql: () => void;
+    /// Format ボタン押下時の処理 (+page.svelte が
+    /// SqlEditor.formatCurrentStatement を呼ぶ)
+    onFormat: () => void;
   }
 
-  let { engine, readonly, onExplain, onExplainSql }: Props = $props();
+  let { engine, readonly, onExplain, onExplainSql, onFormat }: Props = $props();
 
   const isSqlite = $derived(
     ["sqlite", "sqlite3"].includes((engine ?? "").toLowerCase()),
@@ -134,6 +137,17 @@
   {/if}
 
   <div class="ml-auto flex min-w-0 items-center gap-2">
+    <!-- カーソル位置の文を整形する (ファイルが開いているときのみ有効) -->
+    <button
+      type="button"
+      class="rounded border border-zinc-600 bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
+      data-annotate="button-format"
+      title="Format the SQL statement under the cursor"
+      disabled={!appStore.selectedFile}
+      onclick={onFormat}
+    >
+      Format
+    </button>
     <!-- カーソル位置の文をエンジン別 EXPLAIN で実行する (AI 不要の単体機能) -->
     <button
       type="button"
