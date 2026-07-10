@@ -1,20 +1,42 @@
+import { toast } from "svelte-sonner";
 import * as api from "$lib/api";
 import type { ConnectionInfo, QueryResult } from "$lib/api";
 
 const AUTO_SAVE_DELAY_MS = 1000;
+
+/// 結果タブの上限。超過時は最も古い非ピン留めタブを破棄する
+const MAX_RESULT_TABS = 10;
+
+/// 結果ペインの 1 タブ分の状態。結果セットに加えて
+/// 「何を・どこで・いつ実行したか」を保持し、タブから再実行できるようにする
+export interface ResultTab {
+  id: number;
+  pinned: boolean;
+  sql: string;
+  connection: string;
+  schema: string | null;
+  /// 実行開始時刻 (epoch ms)
+  executedAt: number;
+  result: QueryResult | null;
+  error: string | null;
+  running: boolean;
+}
 
 let connections = $state<ConnectionInfo[]>([]);
 let selectedConnection = $state<string | null>(null);
 let files = $state<string[]>([]);
 let selectedFile = $state<string | null>(null);
 let editorContent = $state("");
-let queryResult = $state<QueryResult | null>(null);
+let resultTabs = $state<ResultTab[]>([]);
+let activeTabId = $state<number | null>(null);
 let errorMessage = $state<string | null>(null);
-let running = $state(false);
 let loadingConnections = $state(false);
 let dirty = $state(false);
 let schemas = $state<string[]>([]);
 let activeSchema = $state<string | null>(null);
+
+// タブ ID の連番 (セッション内で一意なら十分なので永続化しない)
+let nextTabId = 1;
 
 let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -53,7 +75,9 @@ const reloadConnections = async (): Promise<boolean> => {
   files = [];
   selectedFile = null;
   editorContent = "";
-  queryResult = null;
+  // 設定が丸ごと入れ替わるため、ピン留め含め全タブを破棄する
+  resultTabs = [];
+  activeTabId = null;
   dirty = false;
   schemas = [];
   activeSchema = null;
@@ -87,10 +111,10 @@ const selectConnection = async (name: string) => {
   if (!(await flushPendingSave())) {
     return;
   }
+  // 結果タブは接続をまたいで比較できるよう、接続切替では破棄しない
   selectedConnection = name;
   selectedFile = null;
   editorContent = "";
-  queryResult = null;
   errorMessage = null;
   dirty = false;
   activeSchema =
@@ -123,7 +147,6 @@ const changeActiveSchema = async (schema: string): Promise<boolean> => {
   try {
     await api.setActiveSchema(selectedConnection, schema);
     activeSchema = schema;
-    queryResult = null;
     errorMessage = null;
     return true;
   } catch (e) {
@@ -211,28 +234,148 @@ const updateEditorContent = (content: string) => {
   }, AUTO_SAVE_DELAY_MS);
 };
 
+/// 実行結果の書き込み先タブを決める。
+/// アクティブな非ピン留めタブがあれば使い回し、無ければ新規タブを作る。
+/// 上限到達時は最も古い非ピン留めタブを破棄する。
+/// 全タブがピン留めで空きを作れない場合は null を返す (toast で通知済み)。
+const prepareTargetTab = (): ResultTab | null => {
+  const current = resultTabs.find((t) => t.id === activeTabId);
+  if (current && !current.pinned) {
+    // 同じタブへの二重書き込みを防ぐ (Cmd+Enter 連打対策)
+    // タブ管理系の通知は結果ペインを覆わないよう toast で出す
+    if (current.running) {
+      toast.warning("A query is already running in this tab.");
+      return null;
+    }
+    return current;
+  }
+  if (resultTabs.length >= MAX_RESULT_TABS) {
+    const oldest = resultTabs
+      .filter((t) => !t.pinned)
+      .reduce<ResultTab | null>(
+        (acc, t) => (acc === null || t.executedAt < acc.executedAt ? t : acc),
+        null,
+      );
+    if (!oldest) {
+      toast.warning(
+        "All result tabs are pinned. Unpin or close a tab to run a new query.",
+      );
+      return null;
+    }
+    resultTabs = resultTabs.filter((t) => t.id !== oldest.id);
+  }
+  const tab: ResultTab = {
+    id: nextTabId++,
+    pinned: false,
+    sql: "",
+    connection: "",
+    schema: null,
+    executedAt: Date.now(),
+    result: null,
+    error: null,
+    running: false,
+  };
+  resultTabs = [...resultTabs, tab];
+  // 生のオブジェクトではなく $state プロキシ経由の参照を返す
+  // (生の参照を書き換えてもリアクティブに反映されないため)
+  return resultTabs[resultTabs.length - 1];
+};
+
+/// タブに記録された接続・SQL でクエリを実行し、結果をタブへ書き込む
+const executeTab = async (tab: ResultTab) => {
+  tab.running = true;
+  // 失敗時に前回の結果を誤認・誤エクスポートしないよう、実行前にクリアする
+  tab.result = null;
+  tab.error = null;
+  tab.executedAt = Date.now();
+  activeTabId = tab.id;
+  let result: QueryResult | null = null;
+  let error: string | null = null;
+  try {
+    result = await api.runQuery(tab.connection, tab.sql);
+  } catch (e) {
+    error = toErrorMessage(e);
+  }
+  tab.running = false;
+  // 実行中に設定再読込などでタブが破棄されていた場合は、
+  // 存在しないタブ (detached なオブジェクト) へ書き込まず結果を捨てる
+  if (!resultTabs.some((t) => t.id === tab.id)) {
+    return;
+  }
+  tab.result = result;
+  tab.error = error;
+};
+
 const runQuery = async (sql: string) => {
+  // 実行前ガードの通知は、既存の結果タブを覆わないよう toast で出す
   if (!selectedConnection) {
-    errorMessage = "Select a connection first";
+    toast.warning("Select a connection first");
     return;
   }
   if (!sql.trim()) {
-    errorMessage = "There is no SQL statement to run";
+    toast.warning("There is no SQL statement to run");
     return;
   }
   if (!(await flushPendingSave())) {
     return;
   }
-  running = true;
   errorMessage = null;
-  // 失敗時に前回の結果を誤認・誤エクスポートしないよう、実行前にクリアする
-  queryResult = null;
+  const tab = prepareTargetTab();
+  if (!tab) {
+    return;
+  }
+  tab.sql = sql;
+  tab.connection = selectedConnection;
+  tab.schema = activeSchema;
+  await executeTab(tab);
+};
+
+/// タブに記録された SQL を同じ接続で再実行する
+const rerunTab = async (id: number) => {
+  const tab = resultTabs.find((t) => t.id === id);
+  if (!tab || tab.running || !tab.sql.trim()) {
+    return;
+  }
+  errorMessage = null;
+  // 接続のアクティブスキーマは実行時点から変わっている可能性があるため、
+  // 表示が実際の実行先とずれないよう再取得する (失敗しても実行は続ける)
   try {
-    queryResult = await api.runQuery(selectedConnection, sql);
-  } catch (e) {
-    errorMessage = toErrorMessage(e);
-  } finally {
-    running = false;
+    tab.schema = (await api.getActiveSchema(tab.connection)) ?? tab.schema;
+  } catch {
+    // 取得失敗時は記録済みのスキーマ表示を維持する
+  }
+  await executeTab(tab);
+};
+
+const selectResultTab = (id: number) => {
+  if (resultTabs.some((t) => t.id === id)) {
+    activeTabId = id;
+  }
+};
+
+const closeResultTab = (id: number) => {
+  const index = resultTabs.findIndex((t) => t.id === id);
+  if (index < 0) {
+    return;
+  }
+  // 実行中のタブを閉じると in-flight のクエリ状態が UI から消えてしまうため拒否する
+  // (閉じるボタンも disabled にしているが、防御的にここでもガードする)
+  if (resultTabs[index].running) {
+    toast.warning("Cannot close a tab while its query is running.");
+    return;
+  }
+  resultTabs = resultTabs.filter((t) => t.id !== id);
+  if (activeTabId === id) {
+    // 閉じたタブの右隣 (無ければ左隣) をアクティブにする
+    const neighbor = resultTabs[index] ?? resultTabs[index - 1] ?? null;
+    activeTabId = neighbor?.id ?? null;
+  }
+};
+
+const toggleResultTabPin = (id: number) => {
+  const tab = resultTabs.find((t) => t.id === id);
+  if (tab) {
+    tab.pinned = !tab.pinned;
   }
 };
 
@@ -252,14 +395,22 @@ export default {
   get editorContent() {
     return editorContent;
   },
-  get queryResult() {
-    return queryResult;
+  get resultTabs() {
+    return resultTabs;
+  },
+  get activeTabId() {
+    return activeTabId;
+  },
+  /// アクティブな結果タブ (無ければ null)
+  get activeResultTab() {
+    return resultTabs.find((t) => t.id === activeTabId) ?? null;
   },
   get errorMessage() {
     return errorMessage;
   },
+  /// いずれかのタブでクエリ実行中なら true (Run ボタンの無効化などに使う)
   get running() {
-    return running;
+    return resultTabs.some((t) => t.running);
   },
   get loadingConnections() {
     return loadingConnections;
@@ -283,4 +434,8 @@ export default {
   saveCurrentFile,
   updateEditorContent,
   runQuery,
+  rerunTab,
+  selectResultTab,
+  closeResultTab,
+  toggleResultTabPin,
 };
