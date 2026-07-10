@@ -31,6 +31,21 @@ sql_servers:
     engine: sqlite
     schema: ~/data/example.sqlite3
 
+  # queryfolio 拡張: readonly: true (省略時 false) を指定すると、
+  # 書き込み系の文 (INSERT / UPDATE / DELETE / DDL、CTE 付き DML、
+  # SELECT INTO 等) の実行を拒否する。
+  # SELECT に副作用のある関数 (nextval 等) までは防げない。
+  # あくまで事故防止のガード。
+  - name: production-replica
+    description: "本番レプリカ (読み取り専用)"
+    engine: mysql
+    host: replica.example.com
+    port: 3306
+    schema: production_db
+    user: replica_user
+    password: replica_password
+    readonly: true
+
   - name: remote-db-with-ssh
     description: "SSH トンネル経由でアクセスするリモートデータベース"
     engine: postgres

@@ -6,6 +6,7 @@ export interface ConnectionInfo {
   engine: string;
   has_ssh_tunnel: boolean;
   schema: string | null;
+  readonly: boolean;
 }
 
 export interface QueryResult {
