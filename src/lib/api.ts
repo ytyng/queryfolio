@@ -14,6 +14,7 @@ export interface QueryResult {
   row_count: number;
   affected_rows: number | null;
   truncated: boolean;
+  applied_limit: number | null;
   elapsed_ms: number;
 }
 
