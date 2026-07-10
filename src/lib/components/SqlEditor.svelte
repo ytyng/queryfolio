@@ -221,6 +221,10 @@
     "&": {
       height: "100%",
       fontSize: "13px",
+      backgroundColor: "#111111",
+    },
+    ".cm-gutters": {
+      backgroundColor: "#111111",
     },
     ".cm-scroller": {
       fontFamily:
