@@ -5,6 +5,15 @@
   let newFileName = $state("");
   let deleteCandidate = $state<string | null>(null);
 
+  // デフォルトのファイル名: query-YYYYMMDD-HHMM (.sql はバックエンドが付与)
+  const defaultFileName = () => {
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const date = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
+    const time = `${pad(now.getHours())}${pad(now.getMinutes())}`;
+    return `query-${date}-${time}`;
+  };
+
   const submitNewFile = async () => {
     const name = newFileName.trim();
     if (!name) {
@@ -35,6 +44,7 @@
       data-annotate="button-create-file"
       disabled={!appStore.selectedConnection}
       onclick={() => {
+        newFileName = defaultFileName();
         creating = true;
       }}
     >
@@ -59,6 +69,7 @@
             placeholder="File name"
             data-annotate="input-new-file-name"
             autofocus
+            onfocus={(e) => e.currentTarget.select()}
             bind:value={newFileName}
             onblur={() => {
               creating = false;
