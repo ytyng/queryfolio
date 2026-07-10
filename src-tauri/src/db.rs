@@ -78,17 +78,28 @@ impl DbManager {
                 ));
             }
             (Some(tunnel_config), _) => {
-                let target_host = server.host.clone().unwrap_or_else(|| "localhost".into());
-                let target_port = server.port.unwrap_or(default_port(engine));
-                let tunnel_config = tunnel_config.clone();
-                // ssh2 は blocking なので spawn_blocking で実行する
-                let tunnel = tokio::task::spawn_blocking(move || {
-                    SshTunnel::start(&tunnel_config, &target_host, target_port)
-                })
-                .await
-                .map_err(|e| AppError::SshTunnel(format!("SSH tunnel task failed: {e}")))??;
-                let local_port = tunnel.local_port;
-                inner.tunnels.insert(server.name.clone(), tunnel);
+                // スキーマ切替等でプールだけ破棄された場合、既存トンネルは
+                // 接続先ホストが同じなのでそのまま再利用する
+                let local_port = match inner.tunnels.get(&server.name) {
+                    Some(tunnel) => tunnel.local_port,
+                    None => {
+                        let target_host =
+                            server.host.clone().unwrap_or_else(|| "localhost".into());
+                        let target_port = server.port.unwrap_or(default_port(engine));
+                        let tunnel_config = tunnel_config.clone();
+                        // ssh2 は blocking なので spawn_blocking で実行する
+                        let tunnel = tokio::task::spawn_blocking(move || {
+                            SshTunnel::start(&tunnel_config, &target_host, target_port)
+                        })
+                        .await
+                        .map_err(|e| {
+                            AppError::SshTunnel(format!("SSH tunnel task failed: {e}"))
+                        })??;
+                        let local_port = tunnel.local_port;
+                        inner.tunnels.insert(server.name.clone(), tunnel);
+                        local_port
+                    }
+                };
                 ("127.0.0.1".to_string(), local_port)
             }
             (None, _) => (
