@@ -15,10 +15,11 @@
   let showSettings = $state(false);
   let editor: SqlEditor | undefined = $state();
 
-  const selectedEngine = $derived(
-    appStore.connections.find((c) => c.name === appStore.selectedConnection)
-      ?.engine ?? null,
+  const selectedConnectionInfo = $derived(
+    appStore.connections.find((c) => c.name === appStore.selectedConnection) ??
+      null,
   );
+  const selectedEngine = $derived(selectedConnectionInfo?.engine ?? null);
 
   onMount(() => {
     // メニューの Reload config file からの通知を受けて再読込する
@@ -68,7 +69,10 @@
 
     <div class="flex min-w-0 flex-1 flex-col">
       {#if appStore.selectedConnection}
-        <EditorToolbar engine={selectedEngine} />
+        <EditorToolbar
+          engine={selectedEngine}
+          readonly={selectedConnectionInfo?.readonly ?? false}
+        />
       {/if}
       <div class="min-h-0 flex-[3] border-b border-zinc-700">
         {#if appStore.selectedFile}

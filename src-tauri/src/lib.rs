@@ -100,7 +100,14 @@ async fn run_query(
         0 => None,
         limit => Some(limit),
     };
-    db::run_query(&pool, &sql, max_rows.unwrap_or(DEFAULT_MAX_ROWS), auto_limit).await
+    db::run_query(
+        &pool,
+        &sql,
+        max_rows.unwrap_or(DEFAULT_MAX_ROWS),
+        auto_limit,
+        server.readonly,
+    )
+    .await
 }
 
 #[tauri::command]

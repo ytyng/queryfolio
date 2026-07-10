@@ -251,11 +251,13 @@ async fn connect(
 /// SQL を実行して結果を返す。
 /// 行を返す文 (SELECT 等) は max_rows 件まで取得し、
 /// それ以外 (INSERT / UPDATE 等) は affected_rows を返す。
+/// readonly が true の場合、読み取り系以外の文は実行せずエラーを返す。
 pub async fn run_query(
     pool: &DbPool,
     sql: &str,
     max_rows: usize,
     auto_limit: Option<u64>,
+    readonly: bool,
 ) -> Result<QueryResult, AppError> {
     // psql 風メタコマンド (\l, \dt など) はカタログ照会 SQL に変換して実行する
     let translated = crate::meta_commands::translate(pool.engine(), sql)?;
@@ -263,6 +265,19 @@ pub async fn run_query(
 
     if leading_keyword(sql).is_empty() {
         return Err(AppError::Config("The SQL statement is empty".into()));
+    }
+
+    // readonly 接続では読み取り系の文のみ許可する。
+    // メタコマンドは読み取り系のカタログ照会にしか変換されないため、
+    // 変換後の SQL はこの判定を常に通る。
+    // 弱点: SELECT に副作用のある関数 (nextval 等) までは防げない。
+    // あくまで事故防止のガードである。
+    if readonly && !is_fetch_statement(sql) {
+        return Err(AppError::Readonly(
+            "This connection is read-only (readonly: true in config). \
+             Statement was not executed."
+                .into(),
+        ));
     }
 
     // LIMIT 未指定の SELECT にはデフォルトの LIMIT を付与する
@@ -1005,6 +1020,7 @@ mod tests {
             "CREATE TABLE t (id INTEGER, name TEXT, score REAL)",
             10,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1015,12 +1031,13 @@ mod tests {
             "INSERT INTO t VALUES (1, 'alice', 1.5), (2, 'bob', NULL)",
             10,
             None,
+            false,
         )
         .await
         .unwrap();
         assert_eq!(result.affected_rows, Some(2));
 
-        let result = run_query(&pool, "SELECT * FROM t ORDER BY id", 10, None)
+        let result = run_query(&pool, "SELECT * FROM t ORDER BY id", 10, None, false)
             .await
             .unwrap();
         assert_eq!(result.columns, vec!["id", "name", "score"]);
@@ -1032,14 +1049,14 @@ mod tests {
         assert!(!result.truncated);
 
         // max_rows での切り詰め
-        let result = run_query(&pool, "SELECT * FROM t ORDER BY id", 1, None)
+        let result = run_query(&pool, "SELECT * FROM t ORDER BY id", 1, None, false)
             .await
             .unwrap();
         assert_eq!(result.row_count, 1);
         assert!(result.truncated);
 
         // 0 行の SELECT でも列ヘッダが返る (describe による補完)
-        let result = run_query(&pool, "SELECT * FROM t WHERE id = -1", 10, None)
+        let result = run_query(&pool, "SELECT * FROM t WHERE id = -1", 10, None, false)
             .await
             .unwrap();
         assert_eq!(result.row_count, 0);
@@ -1051,6 +1068,7 @@ mod tests {
             "INSERT INTO t VALUES (3, 'dave', 2.0) RETURNING id, name",
             10,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1058,11 +1076,11 @@ mod tests {
         assert_eq!(result.rows[0][1], serde_json::json!("dave"));
 
         // psql 風メタコマンドが変換されて実行される
-        let result = run_query(&pool, "\\dt", 10, None).await.unwrap();
+        let result = run_query(&pool, "\\dt", 10, None, false).await.unwrap();
         assert_eq!(result.row_count, 1);
         assert_eq!(result.rows[0][0], serde_json::json!("t"));
 
-        let result = run_query(&pool, "\\d t", 10, None).await.unwrap();
+        let result = run_query(&pool, "\\d t", 10, None, false).await.unwrap();
         // PRAGMA table_info は name カラム (index 1) にカラム名を返す
         let column_names: Vec<&str> = result
             .rows
@@ -1072,24 +1090,24 @@ mod tests {
         assert_eq!(column_names, vec!["id", "name", "score"]);
 
         // 未対応メタコマンドはエラー
-        assert!(run_query(&pool, "\\du", 10, None).await.is_err());
+        assert!(run_query(&pool, "\\du", 10, None, false).await.is_err());
 
         // 自動 LIMIT: LIMIT 未指定の SELECT に付与される (末尾 ; も処理)
-        let result = run_query(&pool, "SELECT * FROM t ORDER BY id;", 10, Some(2))
+        let result = run_query(&pool, "SELECT * FROM t ORDER BY id;", 10, Some(2), false)
             .await
             .unwrap();
         assert_eq!(result.row_count, 2);
         assert_eq!(result.applied_limit, Some(2));
 
         // 既に LIMIT がある場合は付与しない
-        let result = run_query(&pool, "SELECT * FROM t LIMIT 1", 10, Some(2))
+        let result = run_query(&pool, "SELECT * FROM t LIMIT 1", 10, Some(2), false)
             .await
             .unwrap();
         assert_eq!(result.row_count, 1);
         assert_eq!(result.applied_limit, None);
 
         // メタコマンドには適用しない
-        let result = run_query(&pool, "\\dt", 10, Some(2)).await.unwrap();
+        let result = run_query(&pool, "\\dt", 10, Some(2), false).await.unwrap();
         assert_eq!(result.applied_limit, None);
 
         // 末尾コメント付きでも LIMIT がコメントに飲み込まれない
@@ -1098,6 +1116,7 @@ mod tests {
             "SELECT * FROM t ORDER BY id -- trailing note",
             10,
             Some(2),
+            false,
         )
         .await
         .unwrap();
@@ -1105,10 +1124,90 @@ mod tests {
         assert_eq!(result.applied_limit, Some(2));
 
         // VALUES は自動 LIMIT の対象外 (SQLite では VALUES ... LIMIT が構文エラー)
-        let result = run_query(&pool, "VALUES (1), (2), (3)", 10, Some(2))
+        let result = run_query(&pool, "VALUES (1), (2), (3)", 10, Some(2), false)
             .await
             .unwrap();
         assert_eq!(result.row_count, 3);
         assert_eq!(result.applied_limit, None);
+    }
+
+    #[tokio::test]
+    async fn test_run_query_sqlite_readonly() {
+        // :memory: はコネクションごとに別 DB になるため、プールを 1 接続に固定する
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .in_memory(true),
+            )
+            .await
+            .unwrap();
+        let pool = DbPool::Sqlite(pool);
+
+        // 準備 (readonly=false で書き込み)
+        run_query(&pool, "CREATE TABLE t (id INTEGER, name TEXT)", 10, None, false)
+            .await
+            .unwrap();
+        run_query(&pool, "INSERT INTO t VALUES (1, 'alice')", 10, None, false)
+            .await
+            .unwrap();
+
+        // 読み取り系の文は readonly でも実行できる
+        let result = run_query(&pool, "SELECT * FROM t", 10, None, true)
+            .await
+            .unwrap();
+        assert_eq!(result.row_count, 1);
+
+        let result = run_query(
+            &pool,
+            "WITH x AS (SELECT id FROM t) SELECT * FROM x",
+            10,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.row_count, 1);
+
+        // EXPLAIN / PRAGMA も許可される
+        assert!(run_query(&pool, "EXPLAIN SELECT * FROM t", 10, None, true)
+            .await
+            .is_ok());
+        assert!(run_query(&pool, "PRAGMA table_info(t)", 10, None, true)
+            .await
+            .is_ok());
+
+        // メタコマンドは読み取り系のカタログ照会のみなので許可される
+        let result = run_query(&pool, "\\dt", 10, None, true).await.unwrap();
+        assert_eq!(result.rows[0][0], serde_json::json!("t"));
+
+        // 書き込み系の文は拒否される (エラーメッセージに readonly を明記)
+        for sql in [
+            "INSERT INTO t VALUES (2, 'bob')",
+            "UPDATE t SET name = 'x'",
+            "DELETE FROM t",
+            "CREATE TABLE t2 (id INTEGER)",
+            "DROP TABLE t",
+            "ALTER TABLE t ADD COLUMN extra TEXT",
+            // RETURNING 付きの DML (行を返す) も先頭キーワードで拒否される
+            "INSERT INTO t VALUES (3, 'carol') RETURNING id",
+            // 先頭コメントの後ろの DML も拒否される
+            "-- comment\nUPDATE t SET name = 'y'",
+        ] {
+            let err = run_query(&pool, sql, 10, None, true).await.unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("read-only") && message.contains("readonly: true"),
+                "unexpected error message for {sql}: {message}"
+            );
+        }
+
+        // 拒否された文は実行されておらず、データは無傷
+        let result = run_query(&pool, "SELECT id, name FROM t", 10, None, true)
+            .await
+            .unwrap();
+        assert_eq!(result.row_count, 1);
+        assert_eq!(result.rows[0][1], serde_json::json!("alice"));
     }
 }

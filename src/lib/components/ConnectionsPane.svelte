@@ -56,6 +56,13 @@
                 title="Via SSH tunnel">ssh</span
               >
             {/if}
+            {#if connection.readonly}
+              <span
+                class="rounded bg-yellow-500/15 px-1 text-[10px] text-yellow-400"
+                title="Write statements are rejected (readonly: true in config)"
+                data-annotate="badge-readonly-{connection.name}">read-only</span
+              >
+            {/if}
           </span>
           {#if connection.description}
             <span class="truncate text-xs text-zinc-500">{connection.description}</span>

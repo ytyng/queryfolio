@@ -4,9 +4,10 @@
 
   interface Props {
     engine: string | null;
+    readonly: boolean;
   }
 
-  let { engine }: Props = $props();
+  let { engine, readonly }: Props = $props();
 
   const isSqlite = $derived(
     ["sqlite", "sqlite3"].includes((engine ?? "").toLowerCase()),
@@ -39,6 +40,16 @@
       data-annotate="text-editor-engine"
     >
       {engine}
+    </span>
+  {/if}
+
+  {#if readonly}
+    <span
+      class="rounded bg-yellow-500/15 px-1.5 py-0.5 text-[10px] tracking-wide text-yellow-400"
+      title="Write statements are rejected (readonly: true in config)"
+      data-annotate="badge-editor-readonly"
+    >
+      read-only
     </span>
   {/if}
 

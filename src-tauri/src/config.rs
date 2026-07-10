@@ -141,6 +141,11 @@ pub struct ServerConfig {
     pub password: Option<String>,
     #[serde(default)]
     pub ssh_tunnel: Option<SshTunnelConfig>,
+    /// queryfolio 独自拡張: true の場合、行を返さない文 (INSERT / UPDATE /
+    /// DELETE / DDL 等) の実行を拒否する。省略時 false。
+    /// SELECT に副作用のある関数 (nextval 等) までは防げない事故防止ガード。
+    #[serde(default)]
+    pub readonly: bool,
 }
 
 /// フロントエンドに渡す接続先情報。パスワード等の機密は含めない。
@@ -152,6 +157,8 @@ pub struct ConnectionInfo {
     pub has_ssh_tunnel: bool,
     /// 設定上のデフォルト database (スキーマ)
     pub schema: Option<String>,
+    /// 読み取り専用接続 (書き込み系の文の実行を拒否する)
+    pub readonly: bool,
 }
 
 impl From<&ServerConfig> for ConnectionInfo {
@@ -162,6 +169,7 @@ impl From<&ServerConfig> for ConnectionInfo {
             engine: server.engine.clone(),
             has_ssh_tunnel: server.ssh_tunnel.is_some(),
             schema: server.schema.clone(),
+            readonly: server.readonly,
         }
     }
 }
@@ -604,6 +612,28 @@ sql_servers:
     }
 
     #[tokio::test]
+    async fn test_readonly_flag() {
+        // readonly は省略可能 (デフォルト false)。true 指定は ConnectionInfo に伝わる
+        let config = config_from_yaml(
+            r#"
+sql_servers:
+  - name: writable-db
+    engine: sqlite
+    schema: /tmp/x.db
+  - name: readonly-db
+    engine: sqlite
+    schema: /tmp/x.db
+    readonly: true
+"#,
+        );
+        let servers = config.resolve_servers().await.unwrap();
+        assert!(!servers[0].readonly);
+        assert!(servers[1].readonly);
+        assert!(!ConnectionInfo::from(&servers[0]).readonly);
+        assert!(ConnectionInfo::from(&servers[1]).readonly);
+    }
+
+    #[tokio::test]
     async fn test_inline_with_template() {
         let config = config_from_yaml(
             r#"
@@ -800,6 +830,7 @@ sql_servers:
             user: Some("u".into()),
             password: Some("secret".into()),
             ssh_tunnel: None,
+            readonly: false,
         };
         let info = ConnectionInfo::from(&server);
         let json = serde_json::to_string(&info).unwrap();
