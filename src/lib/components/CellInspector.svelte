@@ -19,6 +19,11 @@
   // これを超えるサイズはトークン分解が重くなるためハイライトを諦める
   const HIGHLIGHT_MAX_CHARS = 200_000;
 
+  // トークン (= span 要素) 数の上限。文字数が上限内でも短い要素が
+  // 大量に並ぶ JSON は DOM ノードが膨れて描画が固まるため、
+  // これを超えたらハイライト無しの plain 表示にフォールバックする
+  const HIGHLIGHT_MAX_TOKENS = 5_000;
+
   const isNull = $derived(value === null || value === undefined);
 
   // セルの生テキスト表現 (テーブル表示と同じルール)
@@ -105,7 +110,11 @@
     if (prettyText === null || prettyText.length > HIGHLIGHT_MAX_CHARS) {
       return null;
     }
-    return tokenizeJson(prettyText);
+    const tokenized = tokenizeJson(prettyText);
+    if (tokenized.length > HIGHLIGHT_MAX_TOKENS) {
+      return null;
+    }
+    return tokenized;
   });
 
   const TOKEN_CLASSES: Record<TokenType, string> = {
