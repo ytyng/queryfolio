@@ -57,6 +57,10 @@ let aiGenerating = $state(false);
 let aiAnalyzing = $state(false);
 /// AI による実行計画解説の Markdown (モーダル表示中のみ非 null)
 let aiAnalysis = $state<string | null>(null);
+/// AI で選択 SQL を解説中 (ボタンのスピナー表示・二重送信防止)
+let aiExplaining = $state(false);
+/// AI による選択 SQL 解説の Markdown (モーダル表示中のみ非 null)
+let aiExplanation = $state<string | null>(null);
 /// SQL 補完用のテーブル名 → カラム名リストのマップ (未取得・取得失敗は null)
 let schemaMap = $state<Record<string, string[]> | null>(null);
 
@@ -129,6 +133,7 @@ const reloadConnections = async (): Promise<boolean> => {
   aiInfo = null;
   aiError = null;
   aiAnalysis = null;
+  aiExplanation = null;
   // 実行中の取得が後から古いマップを書き込まないよう世代を進めて破棄する
   schemaMapGeneration++;
   schemaMap = null;
@@ -655,6 +660,44 @@ const closeAiAnalysis = () => {
   aiAnalysis = null;
 };
 
+/// カーソル位置の SQL 文を AI に平易に解説させ、Markdown をモーダルに
+/// 表示する (実行はしない)。LLM に送るのは SQL とスキーマ情報のみで、
+/// クエリの結果データは送らない (バックエンドの ai_explain_sql 参照)
+const explainSql = async (sql: string) => {
+  if (!selectedConnection) {
+    toast.warning("Select a connection first");
+    return;
+  }
+  if (!sql.trim()) {
+    toast.warning("There is no SQL statement to explain");
+    return;
+  }
+  // 二重実行防止 (ボタンも disabled にしているが防御的にガードする)
+  if (aiExplaining) {
+    return;
+  }
+  aiExplaining = true;
+  try {
+    const text = await api.aiExplainSql(selectedConnection, sql);
+    if (!text.trim()) {
+      toast.warning("The AI returned an empty response");
+      return;
+    }
+    aiExplanation = text;
+  } catch (e) {
+    toast.error("Failed to explain the SQL statement", {
+      description: toErrorMessage(e),
+    });
+  } finally {
+    aiExplaining = false;
+  }
+};
+
+/// AI による選択 SQL 解説のモーダルを閉じる
+const closeAiExplanation = () => {
+  aiExplanation = null;
+};
+
 /// タブに記録された SQL を同じ接続で再実行する
 const rerunTab = async (id: number) => {
   const tab = resultTabs.find((t) => t.id === id);
@@ -772,6 +815,13 @@ export default {
   get aiAnalysis() {
     return aiAnalysis;
   },
+  get aiExplaining() {
+    return aiExplaining;
+  },
+  /// AI による選択 SQL 解説の Markdown (モーダル表示中のみ非 null)
+  get aiExplanation() {
+    return aiExplanation;
+  },
   /// SQL 補完用のテーブル名 → カラム名リストのマップ (未取得なら null)
   get schemaMap() {
     return schemaMap;
@@ -797,6 +847,8 @@ export default {
   explainQuery,
   analyzeExplainTab,
   closeAiAnalysis,
+  explainSql,
+  closeAiExplanation,
   cancelQuery,
   rerunTab,
   selectResultTab,

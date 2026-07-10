@@ -591,6 +591,31 @@ async fn ai_explain_plan(
     Ok(response.trim().to_string())
 }
 
+/// カーソル位置 (選択中) の SQL 文を AI に平易に解説させ、Markdown を返す。
+/// 実行はしない。LLM に送るのは SQL・スキーマ情報 (テーブル・カラム名)・
+/// エンジン方言・アクティブスキーマ名のみ。クエリの結果データや接続情報
+/// (ホスト・認証情報) は送らない。
+#[tauri::command]
+async fn ai_explain_sql(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    sql: String,
+) -> Result<String, AppError> {
+    if sql.trim().is_empty() {
+        return Err(AppError::Ai("The SQL statement is empty".into()));
+    }
+    let (ai_config, server, active_schema, schema_map) =
+        state.resolve_ai_context(&connection).await?;
+    let system_prompt = ai::build_explain_sql_system_prompt(
+        &server.engine,
+        active_schema.as_deref(),
+        &schema_map,
+    );
+    let user_message = ai::build_explain_sql_user_message(&sql);
+    let response = ai::chat_complete(&ai_config, &system_prompt, &user_message).await?;
+    Ok(response.trim().to_string())
+}
+
 /// 設定の解決結果を返す (情報表示用。機密を含まない)。
 #[tauri::command]
 fn get_config_info() -> ConfigInfo {
@@ -677,6 +702,7 @@ pub fn run() {
             ai_generate_sql,
             build_explain_sql,
             ai_explain_plan,
+            ai_explain_sql,
             ai_fix_sql,
             get_config_info,
             ensure_config_file,

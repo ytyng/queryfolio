@@ -2,12 +2,15 @@
   import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 
   interface Props {
+    /// モーダルの見出し (EXPLAIN 解説と選択 SQL 解説で使い回すため
+    /// 差し替え可能にする。省略時は EXPLAIN 解説用の見出し)
+    title?: string;
     /// AI 解説の Markdown テキスト
     text: string;
     onClose: () => void;
   }
 
-  let { text, onClose }: Props = $props();
+  let { title = "AI Plan Analysis", text, onClose }: Props = $props();
 
   let copied = $state(false);
 
@@ -66,7 +69,7 @@
   <div
     class="flex max-h-[85vh] w-[720px] max-w-[90vw] flex-col gap-3 rounded-lg border border-zinc-700 bg-zinc-900 p-4 shadow-xl"
   >
-    <h2 class="text-sm font-semibold text-zinc-200">AI Plan Analysis</h2>
+    <h2 class="text-sm font-semibold text-zinc-200">{title}</h2>
 
     <div
       class="flex min-h-0 flex-col gap-2 overflow-y-auto"
