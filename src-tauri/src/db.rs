@@ -423,7 +423,7 @@ async fn connect(
 /// SQL を実行して結果を返す (テスト用の非キャンセル版ラッパー)。
 /// アプリ本体はキャンセル対応の run_query_cancellable を使う。
 #[cfg(test)]
-async fn run_query(
+pub(crate) async fn run_query(
     pool: &DbPool,
     sql: &str,
     max_rows: usize,
