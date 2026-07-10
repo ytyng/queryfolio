@@ -78,17 +78,28 @@ impl DbManager {
                 ));
             }
             (Some(tunnel_config), _) => {
-                let target_host = server.host.clone().unwrap_or_else(|| "localhost".into());
-                let target_port = server.port.unwrap_or(default_port(engine));
-                let tunnel_config = tunnel_config.clone();
-                // ssh2 は blocking なので spawn_blocking で実行する
-                let tunnel = tokio::task::spawn_blocking(move || {
-                    SshTunnel::start(&tunnel_config, &target_host, target_port)
-                })
-                .await
-                .map_err(|e| AppError::SshTunnel(format!("SSH tunnel task failed: {e}")))??;
-                let local_port = tunnel.local_port;
-                inner.tunnels.insert(server.name.clone(), tunnel);
+                // スキーマ切替等でプールだけ破棄された場合、既存トンネルは
+                // 接続先ホストが同じなのでそのまま再利用する
+                let local_port = match inner.tunnels.get(&server.name) {
+                    Some(tunnel) => tunnel.local_port,
+                    None => {
+                        let target_host =
+                            server.host.clone().unwrap_or_else(|| "localhost".into());
+                        let target_port = server.port.unwrap_or(default_port(engine));
+                        let tunnel_config = tunnel_config.clone();
+                        // ssh2 は blocking なので spawn_blocking で実行する
+                        let tunnel = tokio::task::spawn_blocking(move || {
+                            SshTunnel::start(&tunnel_config, &target_host, target_port)
+                        })
+                        .await
+                        .map_err(|e| {
+                            AppError::SshTunnel(format!("SSH tunnel task failed: {e}"))
+                        })??;
+                        let local_port = tunnel.local_port;
+                        inner.tunnels.insert(server.name.clone(), tunnel);
+                        local_port
+                    }
+                };
                 ("127.0.0.1".to_string(), local_port)
             }
             (None, _) => (
@@ -128,10 +139,20 @@ impl DbManager {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Engine {
+pub(crate) enum Engine {
     MySql,
     Postgres,
     Sqlite,
+}
+
+impl DbPool {
+    pub(crate) fn engine(&self) -> Engine {
+        match self {
+            DbPool::MySql(_) => Engine::MySql,
+            DbPool::Postgres(_) => Engine::Postgres,
+            DbPool::Sqlite(_) => Engine::Sqlite,
+        }
+    }
 }
 
 fn parse_engine(engine: &str) -> Result<Engine, AppError> {
@@ -233,6 +254,10 @@ pub async fn run_query(
     sql: &str,
     max_rows: usize,
 ) -> Result<QueryResult, AppError> {
+    // psql 風メタコマンド (\l, \dt など) はカタログ照会 SQL に変換して実行する
+    let translated = crate::meta_commands::translate(pool.engine(), sql)?;
+    let sql = translated.as_deref().unwrap_or(sql);
+
     if leading_keyword(sql).is_empty() {
         return Err(AppError::Config("The SQL statement is empty".into()));
     }
@@ -785,5 +810,22 @@ mod tests {
         .unwrap();
         assert_eq!(result.columns, vec!["id", "name"]);
         assert_eq!(result.rows[0][1], serde_json::json!("dave"));
+
+        // psql 風メタコマンドが変換されて実行される
+        let result = run_query(&pool, "\\dt", 10).await.unwrap();
+        assert_eq!(result.row_count, 1);
+        assert_eq!(result.rows[0][0], serde_json::json!("t"));
+
+        let result = run_query(&pool, "\\d t", 10).await.unwrap();
+        // PRAGMA table_info は name カラム (index 1) にカラム名を返す
+        let column_names: Vec<&str> = result
+            .rows
+            .iter()
+            .filter_map(|row| row[1].as_str())
+            .collect();
+        assert_eq!(column_names, vec!["id", "name", "score"]);
+
+        // 未対応メタコマンドはエラー
+        assert!(run_query(&pool, "\\du", 10).await.is_err());
     }
 }
