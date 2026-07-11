@@ -73,9 +73,9 @@
     renameValue = "";
   };
 
-  // fromBlur=true (フォーカスアウト) のときは無効な入力を黙って取り消す。
-  // Enter 送信のときは理由をトーストで示し、入力を開いたままにする。
-  const submitRename = async (fromBlur = false) => {
+  // Enter でのみ確定する。無効な入力は理由をトーストで示し入力を開いたままにする。
+  // フォーカスアウト (blur) は commit せずキャンセルする (誤コミット防止)。
+  const submitRename = async () => {
     const oldName = renamingFile;
     if (!oldName) {
       return;
@@ -86,15 +86,8 @@
       cancelRename();
       return;
     }
-    const reject = (message: string) => {
-      if (fromBlur) {
-        cancelRename();
-      } else {
-        toast.error(message);
-      }
-    };
     if (raw.startsWith(".")) {
-      reject("The name cannot start with a dot");
+      toast.error("The name cannot start with a dot");
       return;
     }
     const normalized = normalize(raw);
@@ -104,13 +97,11 @@
         (f) => f !== oldName && f.toLowerCase() === normalized.toLowerCase(),
       )
     ) {
-      reject("A file with the same name already exists");
+      toast.error("A file with the same name already exists");
       return;
     }
     const result = await appStore.renameFile(oldName, raw);
     if (result) {
-      cancelRename();
-    } else if (fromBlur) {
       cancelRename();
     } else {
       toast.error("Failed to rename the file", {
@@ -227,7 +218,7 @@
                 value={renameValue}
                 oninput={(e) => sanitizeRenameInput(e.currentTarget.value)}
                 onfocus={(e) => e.currentTarget.select()}
-                onblur={() => void submitRename(true)}
+                onblur={cancelRename}
                 onkeydown={(e) => {
                   if (e.key === "Escape") {
                     e.preventDefault();
