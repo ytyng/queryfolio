@@ -9,10 +9,18 @@ SQL client desktop app built with Tauri 2 + SvelteKit. A lightweight alternative
 - Connection config in YAML, compatible with the sql-agent-mcp-server format
   - Secrets can stay in 1Password: the config YAML is fetched lazily via a getter command like `op read "op://..."`
 - Query files per connection, auto-saved (`~/.config/queryfolio/sqlfiles/<connection>/*.sql`)
-- CodeMirror 6 SQL editor with per-engine dialect, statement highlighting, and Cmd+Enter to run the statement under the cursor
-- Results grid with CSV / TSV / JSON copy (formula-injection safe)
+- CodeMirror 6 SQL editor with per-engine dialect, statement highlighting, Cmd+Enter to run the statement under the cursor, and schema-based autocompletion (table / column names)
+- SQL formatting for SELECT statements (conservative: unsupported or unparsable statements are left untouched)
+- Schema browser (TABLES pane) with lazy-loaded columns
+- Results in tabs with pinning, a cell inspector, and CSV / TSV / JSON copy (formula-injection safe)
+- Query cancellation while running
+- Per-connection query history (searchable, stored locally with restrictive file permissions)
 - psql-style meta commands (`\l` `\dt` `\dv` `\dn` `\du` `\d [table]`) translated to catalog queries, with MySQL / SQLite equivalents where possible
-- AI SQL generation (OpenAI): describe the query in natural language and the generated SQL is inserted into the editor (never auto-executed). Only the schema (table / column names), engine dialect, and your instruction are sent — never query results
+- `readonly: true` per connection rejects write statements (INSERT / UPDATE / DELETE / DDL, including CTE-wrapped DML) as a safety guard
+- Auto `LIMIT` for SELECTs without one (`default_limit`, default 500)
+- AI features (OpenAI): SQL generation from natural language, Fix with AI on query errors, EXPLAIN plan analysis with index suggestions, and explanation of selected SQL. Generated SQL is inserted into the editor, never auto-executed. Only the schema (table / column names), engine dialect, statements, and plans are sent — never query results
+- Resizable panes: drag the dividers between the sidebars, editor, and results; sizes are persisted across restarts
+- Window size / position restored across restarts
 
 ## Setup
 
@@ -31,6 +39,7 @@ sql_servers:
   - name: dev-postgres
     engine: postgres
     host: localhost
+    readonly: true   # optional: reject write statements on this connection
     ...
 
 # Or fetch from 1Password (exactly one of command / env / file)
@@ -64,7 +73,7 @@ The `QUERYFOLIO_CONFIG_YAML` environment variable overrides the whole config fil
 ```shell
 pnpm check                   # svelte-check
 cd src-tauri && cargo test   # Rust unit tests
-pnpm tauri build             # release build
+pnpm tauri build             # release build (macOS: signed with Developer ID via the tauri script; not notarized)
 ```
 
 See `AGENTS.md` for architecture details.

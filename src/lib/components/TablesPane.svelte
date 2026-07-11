@@ -145,7 +145,7 @@
   };
 </script>
 
-<div class="flex h-full w-56 shrink-0 flex-col border-r border-zinc-700 bg-zinc-900">
+<div class="flex h-full w-full flex-col border-r border-zinc-700 bg-zinc-900">
   <div class="flex items-center gap-2 border-b border-zinc-700 px-3 py-2">
     <button
       class="text-xs font-semibold tracking-wide text-zinc-600 hover:text-zinc-300"
