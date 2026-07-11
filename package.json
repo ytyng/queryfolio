@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
-    "tauri": "tauri"
+    "tauri": "APPLE_SIGNING_IDENTITY='Developer ID Application: Cyberneura K.K. (2YN5TLNQ9J)' tauri"
   },
   "license": "MIT",
   "dependencies": {
