@@ -167,11 +167,12 @@
     <button
       class="ml-auto rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
       title="Reload tables"
+      aria-label="Reload tables"
       data-annotate="button-reload-tables"
       disabled={!appStore.selectedConnection || loading}
       onclick={() => void reload()}
     >
-      ↻
+      <i class="bi bi-arrow-clockwise" aria-hidden="true"></i>
     </button>
   </div>
   <div class="min-h-0 flex-1 overflow-y-auto">
@@ -191,10 +192,18 @@
             title={expanded[table.qualified_name]
               ? "Collapse columns"
               : "Expand columns"}
+            aria-label={expanded[table.qualified_name]
+              ? "Collapse columns"
+              : "Expand columns"}
             data-annotate="button-toggle-table-{table.qualified_name}"
             onclick={() => void toggleExpand(table)}
           >
-            {expanded[table.qualified_name] ? "▾" : "▸"}
+            <i
+              class="bi {expanded[table.qualified_name]
+                ? 'bi-chevron-down'
+                : 'bi-chevron-right'}"
+              aria-hidden="true"
+            ></i>
           </button>
           <button
             class="flex min-w-0 flex-1 items-center gap-1 py-1 pr-2 text-left text-sm text-zinc-200"

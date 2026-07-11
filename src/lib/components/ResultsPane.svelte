@@ -170,34 +170,28 @@
                 ? 'text-amber-400'
                 : 'text-zinc-500 hover:text-zinc-300'}"
               title={tab.pinned ? "Unpin this tab" : "Pin this tab"}
+              aria-label={tab.pinned ? "Unpin this tab" : "Pin this tab"}
               data-annotate="button-result-tab-pin-{tab.id}"
               onclick={() => appStore.toggleResultTabPin(tab.id)}
             >
-              <svg
-                class="h-3 w-3"
-                viewBox="0 0 24 24"
-                fill={tab.pinned ? "currentColor" : "none"}
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              >
-                <path d="M12 17v5" />
-                <path
-                  d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"
-                />
-              </svg>
+              <i
+                class="bi {tab.pinned ? 'bi-pin-fill' : 'bi-pin-angle'}"
+                aria-hidden="true"
+              ></i>
             </button>
             <button
               class="rounded px-0.5 text-zinc-500 hover:bg-zinc-700 hover:text-zinc-200 disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-zinc-500"
               title={tab.running
                 ? "Cannot close while the query is running"
                 : "Close this tab"}
+              aria-label={tab.running
+                ? "Cannot close while the query is running"
+                : "Close this tab"}
               data-annotate="button-result-tab-close-{tab.id}"
               disabled={tab.running}
               onclick={() => appStore.closeResultTab(tab.id)}
             >
-              ×
+              <i class="bi bi-x" aria-hidden="true"></i>
             </button>
           </div>
         {/each}
@@ -265,20 +259,22 @@
           <button
             class="rounded border border-red-800 bg-red-900/40 px-1.5 py-0.5 text-red-300 hover:bg-red-800 hover:text-red-100"
             title="Cancel the running query"
+            aria-label="Cancel the running query"
             data-annotate="button-cancel-query"
             onclick={() => appStore.cancelQuery(activeTab.id)}
           >
-            ■ Cancel
+            <i class="bi bi-x-circle" aria-hidden="true"></i> Cancel
           </button>
         {/if}
         <button
           class="rounded border border-zinc-700 px-1.5 py-0.5 hover:bg-zinc-700 hover:text-zinc-200 disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
           title="Run this tab's SQL again on {activeTab.connection}"
+          aria-label="Run this tab's SQL again"
           data-annotate="button-rerun-tab"
           disabled={appStore.isConnectionRunning(activeTab.connection)}
           onclick={() => appStore.rerunTab(activeTab.id)}
         >
-          ↻ Re-run
+          <i class="bi bi-arrow-repeat" aria-hidden="true"></i> Re-run
         </button>
         {#if canAnalyzePlan}
           <!-- EXPLAIN の実行計画を AI に解説させる (AI 設定済みのタブのみ) -->
@@ -297,7 +293,7 @@
               ></span>
               Analyzing...
             {:else}
-              ✨ Analyze with AI
+              <i class="bi bi-stars" aria-hidden="true"></i> Analyze with AI
             {/if}
           </button>
         {/if}
@@ -345,7 +341,7 @@
                 ></span>
                 Fixing...
               {:else}
-                ✨ Fix with AI
+                <i class="bi bi-magic" aria-hidden="true"></i> Fix with AI
               {/if}
             </button>
           </div>

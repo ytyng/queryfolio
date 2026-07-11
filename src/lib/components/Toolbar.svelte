@@ -36,10 +36,11 @@
       <button
         class="rounded bg-red-800 px-3 py-1 text-xs text-white hover:bg-red-700"
         title="Cancel the running query"
+        aria-label="Cancel the running query"
         data-annotate="button-cancel-query-toolbar"
         onclick={cancelRunningQuery}
       >
-        ■ Cancel
+        <i class="bi bi-stop-fill" aria-hidden="true"></i> Cancel
       </button>
     {:else}
       <button
@@ -49,16 +50,17 @@
         disabled={!appStore.selectedConnection}
         onclick={onRunCurrent}
       >
-        ▶ Run
+        <i class="bi bi-play-fill" aria-hidden="true"></i> Run
       </button>
     {/if}
     <button
       class="rounded border border-zinc-600 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-800"
       title="Settings"
+      aria-label="Settings"
       data-annotate="button-open-settings"
       onclick={onOpenSettings}
     >
-      ⚙
+      <i class="bi bi-gear" aria-hidden="true"></i>
     </button>
   </span>
 </div>

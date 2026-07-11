@@ -75,6 +75,7 @@
     <button
       class="ml-auto rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
       title="New query file"
+      aria-label="New query file"
       data-annotate="button-create-file"
       disabled={!appStore.selectedConnection}
       onclick={() => {
@@ -82,7 +83,7 @@
         creating = true;
       }}
     >
-      +
+      <i class="bi bi-plus-lg" aria-hidden="true"></i>
     </button>
   </div>
   <div class="min-h-0 flex-1 overflow-y-auto">
@@ -142,13 +143,20 @@
             title={deleteCandidate === fileName
               ? "Click again to delete"
               : "Delete"}
+            aria-label={deleteCandidate === fileName
+              ? "Click again to delete"
+              : "Delete"}
             data-annotate="button-delete-file-{fileName}"
             onclick={() => confirmDelete(fileName)}
             onblur={() => {
               deleteCandidate = null;
             }}
           >
-            {deleteCandidate === fileName ? "Delete?" : "×"}
+            {#if deleteCandidate === fileName}
+              Delete?
+            {:else}
+              <i class="bi bi-x-lg" aria-hidden="true"></i>
+            {/if}
           </button>
         </div>
       {/each}
