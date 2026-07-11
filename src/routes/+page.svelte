@@ -68,6 +68,12 @@
   let editorPaneEl: HTMLDivElement | undefined = $state();
   let resultsPaneEl: HTMLDivElement | undefined = $state();
 
+  // ドラッグ開始時の基準サイズ。PaneDivider は開始位置からの累積 delta を
+  // 渡すので、基準 + delta で計算するとクランプ飽和後もポインタと同期する
+  let dragBaseConnections = 0;
+  let dragBaseSidebar = 0;
+  let dragBaseEditorFrac = 0;
+
   const selectedConnectionInfo = $derived(
     appStore.connections.find((c) => c.name === appStore.selectedConnection) ??
       null,
@@ -123,9 +129,12 @@
     <PaneDivider
       direction="vertical"
       annotate="pane-divider-connections"
+      onDragStart={() => {
+        dragBaseConnections = connectionsWidth;
+      }}
       onDrag={(delta) => {
         connectionsWidth = clamp(
-          connectionsWidth + delta,
+          dragBaseConnections + delta,
           SIDEBAR_MIN,
           SIDEBAR_MAX,
         );
@@ -165,8 +174,11 @@
     <PaneDivider
       direction="vertical"
       annotate="pane-divider-sidebar"
+      onDragStart={() => {
+        dragBaseSidebar = sidebarWidth;
+      }}
       onDrag={(delta) => {
-        sidebarWidth = clamp(sidebarWidth + delta, SIDEBAR_MIN, SIDEBAR_MAX);
+        sidebarWidth = clamp(dragBaseSidebar + delta, SIDEBAR_MIN, SIDEBAR_MAX);
       }}
       onDragEnd={() => saveLayoutValue("sidebarWidth", sidebarWidth)}
     />
@@ -208,13 +220,16 @@
       <PaneDivider
         direction="horizontal"
         annotate="pane-divider-results"
+        onDragStart={() => {
+          dragBaseEditorFrac = editorFrac;
+        }}
         onDrag={(delta) => {
           const height =
             (editorPaneEl?.clientHeight ?? 0) +
             (resultsPaneEl?.clientHeight ?? 0);
           if (height <= 0) return;
           editorFrac = clamp(
-            editorFrac + delta / height,
+            dragBaseEditorFrac + delta / height,
             EDITOR_FRAC_MIN,
             EDITOR_FRAC_MAX,
           );

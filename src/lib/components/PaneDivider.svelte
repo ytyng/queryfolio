@@ -7,18 +7,22 @@
   interface Props {
     /// vertical = 縦線 (左右にドラッグ) / horizontal = 横線 (上下にドラッグ)
     direction: "vertical" | "horizontal";
-    /// ドラッグ中の移動量 (px)。vertical は X、horizontal は Y
-    onDrag: (delta: number) => void;
+    /// ドラッグ開始時。親はここで基準サイズをスナップショットする
+    onDragStart?: () => void;
+    /// ドラッグ開始位置からの累積移動量 (px)。vertical は X、horizontal は Y。
+    /// 相対 delta ではなく累積にすることで、クランプで飽和しても基準サイズは
+    /// 動かず、上下限を超えて戻したときにポインタとペイン端がずれない。
+    onDrag: (totalDelta: number) => void;
     /// ドラッグ終了時 (サイズの永続化用)
     onDragEnd?: () => void;
     /// data-annotate 識別子
     annotate: string;
   }
 
-  let { direction, onDrag, onDragEnd, annotate }: Props = $props();
+  let { direction, onDragStart, onDrag, onDragEnd, annotate }: Props = $props();
 
   let dragging = $state(false);
-  let lastPos = 0;
+  let startPos = 0;
 
   function position(e: PointerEvent): number {
     return direction === "vertical" ? e.clientX : e.clientY;
@@ -27,15 +31,14 @@
   function handlePointerDown(e: PointerEvent) {
     if (e.button !== 0) return;
     dragging = true;
-    lastPos = position(e);
+    startPos = position(e);
+    onDragStart?.();
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
   }
 
   function handlePointerMove(e: PointerEvent) {
     if (!dragging) return;
-    const pos = position(e);
-    onDrag(pos - lastPos);
-    lastPos = pos;
+    onDrag(position(e) - startPos);
   }
 
   function handlePointerUp(e: PointerEvent) {
