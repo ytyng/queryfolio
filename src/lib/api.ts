@@ -107,6 +107,12 @@ export const createQueryFile = (connection: string, fileName: string) =>
 export const deleteQueryFile = (connection: string, fileName: string) =>
   invoke<void>("delete_query_file", { connection, fileName });
 
+export const renameQueryFile = (
+  connection: string,
+  oldName: string,
+  newName: string,
+) => invoke<string>("rename_query_file", { connection, oldName, newName });
+
 export const listSchemas = (connection: string) =>
   invoke<string[]>("list_schemas", { connection });
 
