@@ -143,10 +143,11 @@
       class="rounded border border-zinc-600 bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
       data-annotate="button-format"
       title="Format the SQL statement under the cursor"
+      aria-label="Format the SQL statement under the cursor"
       disabled={!appStore.selectedFile}
       onclick={onFormat}
     >
-      Format
+      <i class="bi bi-braces" aria-hidden="true"></i> Format
     </button>
     <!-- カーソル位置の文をエンジン別 EXPLAIN で実行する (AI 不要の単体機能) -->
     <button
@@ -154,10 +155,11 @@
       class="rounded border border-zinc-600 bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
       data-annotate="button-explain"
       title="Run EXPLAIN for the SELECT statement under the cursor"
+      aria-label="Run EXPLAIN for the SELECT statement under the cursor"
       disabled={appStore.running}
       onclick={onExplain}
     >
-      Explain
+      <i class="bi bi-diagram-3" aria-hidden="true"></i> Explain
     </button>
     <!-- カーソル位置の文を AI に平易に解説させる (AI 設定済みのときのみ有効) -->
     <button
@@ -176,7 +178,7 @@
         ></span>
         Explaining...
       {:else}
-        ✨ Explain SQL
+        <i class="bi bi-info-circle" aria-hidden="true"></i> Explain SQL
       {/if}
     </button>
     {#if showAiInput}
@@ -215,12 +217,13 @@
           class="rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-50"
           data-annotate="button-ai-close"
           title="Close (Esc)"
+          aria-label="Close (Esc)"
           disabled={appStore.aiGenerating}
           onclick={() => {
             showAiInput = false;
           }}
         >
-          ✕
+          <i class="bi bi-x-lg" aria-hidden="true"></i>
         </button>
       </form>
     {:else}
@@ -229,12 +232,13 @@
         class="rounded border border-zinc-600 bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
         data-annotate="button-ai-toggle"
         title={aiButtonTitle}
+        aria-label="Generate SQL with AI"
         disabled={!aiConfigured}
         onclick={() => {
           showAiInput = true;
         }}
       >
-        ✨ AI
+        <i class="bi bi-stars" aria-hidden="true"></i> AI
       </button>
     {/if}
   </div>

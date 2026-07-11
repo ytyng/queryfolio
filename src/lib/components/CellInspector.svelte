@@ -172,10 +172,11 @@
     <button
       class="ml-auto shrink-0 rounded px-1 text-zinc-500 hover:bg-zinc-700 hover:text-zinc-200"
       title="Close the cell inspector (Esc)"
+      aria-label="Close the cell inspector (Esc)"
       data-annotate="button-cell-inspector-close"
       onclick={onclose}
     >
-      ×
+      <i class="bi bi-x" aria-hidden="true"></i>
     </button>
   </div>
 

@@ -24,10 +24,11 @@
     <button
       class="rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200"
       title="Reload connections"
+      aria-label="Reload connections"
       data-annotate="button-reload-connections"
       onclick={() => appStore.reloadConnections()}
     >
-      ⟳
+      <i class="bi bi-arrow-clockwise" aria-hidden="true"></i>
     </button>
   </div>
   <div class="min-h-0 flex-1 overflow-y-auto">

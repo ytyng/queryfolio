@@ -95,11 +95,12 @@
     <button
       class="ml-auto rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
       title="Reload history"
+      aria-label="Reload history"
       data-annotate="button-reload-history"
       disabled={!appStore.selectedConnection || loading}
       onclick={() => void load(appStore.selectedConnection, search.trim())}
     >
-      ↻
+      <i class="bi bi-arrow-clockwise" aria-hidden="true"></i>
     </button>
   </div>
   <div class="border-b border-zinc-700 px-2 py-1.5">
