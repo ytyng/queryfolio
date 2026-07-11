@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { toast } from "svelte-sonner";
   import appStore from "$lib/stores/app.svelte";
 
   interface Props {
@@ -11,7 +12,13 @@
 
   let creating = $state(false);
   let newFileName = $state("");
-  let deleteCandidate = $state<string | null>(null);
+  /// 3 点メニューを開いているファイル
+  let openMenuFile = $state<string | null>(null);
+  /// メニュー内で Delete の確認待ちになっているファイル
+  let confirmingDelete = $state<string | null>(null);
+  /// リネーム入力中のファイルと入力値
+  let renamingFile = $state<string | null>(null);
+  let renameValue = $state("");
 
   // デフォルトのファイル名: query-YYYYMMDD-HHMM (.sql はバックエンドが付与)。
   // 同一分内の連続作成で衝突しないよう、既存ファイルと重複する場合は
@@ -43,12 +50,91 @@
     creating = false;
   };
 
-  const confirmDelete = async (fileName: string) => {
-    if (deleteCandidate !== fileName) {
-      deleteCandidate = fileName;
+  const closeMenu = () => {
+    openMenuFile = null;
+    confirmingDelete = null;
+  };
+
+  // 名前を正規化する (.sql を保証)。同名判定をバックエンドと揃えるため。
+  const normalize = (name: string) => {
+    const trimmed = name.trim();
+    return trimmed.toLowerCase().endsWith(".sql") ? trimmed : `${trimmed}.sql`;
+  };
+
+  const startRename = (fileName: string) => {
+    closeMenu();
+    renamingFile = fileName;
+    // 拡張子を隠さずそのまま編集させる (ユーザーが .sql を意識できる)
+    renameValue = fileName;
+  };
+
+  const cancelRename = () => {
+    renamingFile = null;
+    renameValue = "";
+  };
+
+  // fromBlur=true (フォーカスアウト) のときは無効な入力を黙って取り消す。
+  // Enter 送信のときは理由をトーストで示し、入力を開いたままにする。
+  const submitRename = async (fromBlur = false) => {
+    const oldName = renamingFile;
+    if (!oldName) {
       return;
     }
-    deleteCandidate = null;
+    const raw = renameValue.trim();
+    // 空・変更なしは黙ってキャンセル
+    if (!raw || normalize(raw) === normalize(oldName)) {
+      cancelRename();
+      return;
+    }
+    const reject = (message: string) => {
+      if (fromBlur) {
+        cancelRename();
+      } else {
+        toast.error(message);
+      }
+    };
+    if (raw.startsWith(".")) {
+      reject("The name cannot start with a dot");
+      return;
+    }
+    const normalized = normalize(raw);
+    // リネーム対象自身は除外する (大文字小文字だけを変える改名を許可)
+    if (
+      appStore.files.some(
+        (f) => f !== oldName && f.toLowerCase() === normalized.toLowerCase(),
+      )
+    ) {
+      reject("A file with the same name already exists");
+      return;
+    }
+    const result = await appStore.renameFile(oldName, raw);
+    if (result) {
+      cancelRename();
+    } else if (fromBlur) {
+      cancelRename();
+    } else {
+      toast.error("Failed to rename the file", {
+        description: appStore.errorMessage ?? undefined,
+      });
+    }
+  };
+
+  // 入力段階で使えない文字 (/ \) を取り除く。.. 等の先頭ドットは送信時に弾く。
+  const sanitizeRenameInput = (value: string) => {
+    renameValue = value.replace(/[/\\]/g, "");
+  };
+
+  const handleNameClick = (fileName: string) => {
+    // 既に開いている (選択中) ファイルの名前を再クリックしたらリネームに入る
+    if (appStore.selectedFile === fileName) {
+      startRename(fileName);
+    } else {
+      void appStore.selectFile(fileName);
+    }
+  };
+
+  const doDelete = async (fileName: string) => {
+    closeMenu();
     await appStore.deleteFile(fileName);
   };
 </script>
@@ -120,44 +206,124 @@
       {/if}
       {#each appStore.files as fileName (fileName)}
         <div
-          class="group flex items-center gap-1 pr-1 hover:bg-zinc-800 {appStore.selectedFile ===
+          class="group relative flex items-center gap-1 pr-1 hover:bg-zinc-800 {appStore.selectedFile ===
           fileName
             ? 'bg-zinc-800 border-l-2 border-blue-400'
             : 'border-l-2 border-transparent'}"
         >
-          <button
-            class="min-w-0 flex-1 truncate px-3 py-1.5 text-left text-sm text-zinc-200"
-            data-annotate="button-file-{fileName}"
-            onclick={() => appStore.selectFile(fileName)}
-          >
-            {fileName}
-            {#if appStore.selectedFile === fileName && appStore.dirty}
-              <span class="text-zinc-500" title="Unsaved">*</span>
-            {/if}
-          </button>
-          <button
-            class="hidden shrink-0 rounded px-1 text-xs group-hover:block {deleteCandidate ===
-            fileName
-              ? 'bg-red-800 text-red-200'
-              : 'text-zinc-500 hover:text-red-400'}"
-            title={deleteCandidate === fileName
-              ? "Click again to delete"
-              : "Delete"}
-            aria-label={deleteCandidate === fileName
-              ? "Click again to delete"
-              : "Delete"}
-            data-annotate="button-delete-file-{fileName}"
-            onclick={() => confirmDelete(fileName)}
-            onblur={() => {
-              deleteCandidate = null;
-            }}
-          >
-            {#if deleteCandidate === fileName}
-              Delete?
-            {:else}
-              <i class="bi bi-x-lg" aria-hidden="true"></i>
-            {/if}
-          </button>
+          {#if renamingFile === fileName}
+            <form
+              class="flex-1 px-2 py-1"
+              onsubmit={(e) => {
+                e.preventDefault();
+                void submitRename();
+              }}
+            >
+              <!-- svelte-ignore a11y_autofocus -->
+              <input
+                class="w-full rounded border border-zinc-600 bg-zinc-800 px-1.5 py-0.5 text-sm text-zinc-200 outline-none focus:border-blue-400"
+                data-annotate="input-rename-{fileName}"
+                autofocus
+                value={renameValue}
+                oninput={(e) => sanitizeRenameInput(e.currentTarget.value)}
+                onfocus={(e) => e.currentTarget.select()}
+                onblur={() => void submitRename(true)}
+                onkeydown={(e) => {
+                  if (e.key === "Escape") {
+                    e.preventDefault();
+                    cancelRename();
+                  }
+                }}
+              />
+            </form>
+          {:else}
+            <button
+              class="min-w-0 flex-1 truncate px-3 py-1.5 text-left text-sm text-zinc-200"
+              data-annotate="button-file-{fileName}"
+              onclick={() => handleNameClick(fileName)}
+            >
+              {fileName}
+              {#if appStore.selectedFile === fileName && appStore.dirty}
+                <span class="text-zinc-500" title="Unsaved">*</span>
+              {/if}
+            </button>
+            <button
+              class="shrink-0 rounded px-1 py-0.5 text-zinc-500 hover:bg-zinc-700 hover:text-zinc-200 {openMenuFile ===
+              fileName
+                ? 'block bg-zinc-700 text-zinc-200'
+                : 'hidden group-hover:block'}"
+              title="More actions"
+              aria-label="More actions"
+              aria-haspopup="menu"
+              data-annotate="button-file-menu-{fileName}"
+              onclick={() => {
+                confirmingDelete = null;
+                openMenuFile = openMenuFile === fileName ? null : fileName;
+              }}
+            >
+              <i class="bi bi-three-dots-vertical" aria-hidden="true"></i>
+            </button>
+          {/if}
+
+          {#if openMenuFile === fileName}
+            <!-- メニュー外クリックで閉じる透明バックドロップ -->
+            <button
+              class="fixed inset-0 z-20 cursor-default"
+              tabindex="-1"
+              aria-label="Close menu"
+              data-annotate="menu-backdrop-{fileName}"
+              onclick={closeMenu}
+            ></button>
+            <div
+              class="absolute right-1 top-full z-30 mt-0.5 min-w-32 rounded border border-zinc-700 bg-zinc-800 py-1 shadow-lg"
+              role="menu"
+            >
+              {#if confirmingDelete === fileName}
+                <div class="px-3 py-1 text-xs text-zinc-400">Delete this file?</div>
+                <div class="flex gap-1 px-2 py-1">
+                  <button
+                    class="flex-1 rounded bg-red-700 px-2 py-1 text-xs text-red-100 hover:bg-red-600"
+                    role="menuitem"
+                    data-annotate="confirm-delete-{fileName}"
+                    onclick={() => void doDelete(fileName)}
+                  >
+                    Delete
+                  </button>
+                  <button
+                    class="flex-1 rounded bg-zinc-700 px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-600"
+                    role="menuitem"
+                    data-annotate="cancel-delete-{fileName}"
+                    onclick={() => {
+                      confirmingDelete = null;
+                    }}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              {:else}
+                <button
+                  class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-zinc-200 hover:bg-zinc-700"
+                  role="menuitem"
+                  data-annotate="menu-rename-{fileName}"
+                  onclick={() => startRename(fileName)}
+                >
+                  <i class="bi bi-pencil" aria-hidden="true"></i>
+                  Rename
+                </button>
+                <button
+                  class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-red-400 hover:bg-zinc-700"
+                  role="menuitem"
+                  data-annotate="menu-delete-{fileName}"
+                  onclick={() => {
+                    confirmingDelete = fileName;
+                  }}
+                >
+                  <i class="bi bi-trash" aria-hidden="true"></i>
+                  Delete
+                </button>
+              {/if}
+            </div>
+          {/if}
         </div>
       {/each}
     {/if}

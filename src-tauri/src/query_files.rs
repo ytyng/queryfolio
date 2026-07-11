@@ -133,6 +133,48 @@ pub fn delete_query_file(
     Ok(())
 }
 
+/// クエリファイルをリネームし、正規化された新しいファイル名を返す。
+/// 新旧が同名 (正規化後) なら no-op で新名を返す。
+pub fn rename_query_file(
+    sqlfiles_dir: &Path,
+    connection: &str,
+    old_name: &str,
+    new_name: &str,
+) -> Result<String, AppError> {
+    let old_normalized = normalize_file_name(old_name)?;
+    let new_normalized = normalize_file_name(new_name)?;
+    if old_normalized == new_normalized {
+        return Ok(new_normalized);
+    }
+    let old_path = file_path(sqlfiles_dir, connection, &old_normalized)?;
+    if !old_path.exists() {
+        return Err(AppError::QueryFile(format!(
+            "File not found: {}",
+            old_path.display()
+        )));
+    }
+    // 衝突判定は case-insensitive で行う (case-insensitive FS の実挙動と揃え、
+    // フロントの判定とも一致させる)。リネーム対象自身 (old) は除外するので、
+    // 大文字小文字だけを変える改名 (Test.sql -> test.sql) は許可される。
+    let new_lower = new_normalized.to_ascii_lowercase();
+    let dir = connection_dir(sqlfiles_dir, connection)?;
+    if dir.exists() {
+        for entry in fs::read_dir(&dir)?.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if name != old_normalized && name.to_ascii_lowercase() == new_lower {
+                return Err(AppError::QueryFile(format!(
+                    "A file with the same name already exists: {new_normalized}"
+                )));
+            }
+        }
+    }
+    let new_path = file_path(sqlfiles_dir, connection, &new_normalized)?;
+    fs::rename(&old_path, &new_path)?;
+    Ok(new_normalized)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,6 +241,74 @@ mod tests {
         );
 
         // 後始末
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rename_query_file() {
+        let dir = test_dir().join("rename");
+        let connection = "test-conn";
+
+        create_query_file(&dir, connection, "old").unwrap();
+        write_query_file(&dir, connection, "old", "SELECT 1;").unwrap();
+
+        // リネーム成功 (内容は保持される)
+        let renamed = rename_query_file(&dir, connection, "old", "new").unwrap();
+        assert_eq!(renamed, "new.sql");
+        assert_eq!(
+            list_query_files(&dir, connection).unwrap(),
+            vec!["new.sql"]
+        );
+        assert_eq!(
+            read_query_file(&dir, connection, "new").unwrap(),
+            "SELECT 1;"
+        );
+
+        // 既存名への変更は拒否
+        create_query_file(&dir, connection, "other").unwrap();
+        assert!(rename_query_file(&dir, connection, "new", "other").is_err());
+
+        // 同名 (正規化後) への変更は no-op
+        assert_eq!(
+            rename_query_file(&dir, connection, "new", "new.sql").unwrap(),
+            "new.sql"
+        );
+
+        // 存在しないファイルのリネームはエラー
+        assert!(rename_query_file(&dir, connection, "missing", "x").is_err());
+
+        // 不正な新名は拒否 (パストラバーサル)
+        assert!(rename_query_file(&dir, connection, "new", "../evil").is_err());
+        assert!(rename_query_file(&dir, connection, "new", "a/b").is_err());
+
+        // 大文字小文字違いの別ファイルへの改名は拒否 (case-insensitive 判定)
+        assert!(rename_query_file(&dir, connection, "new", "OTHER").is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rename_query_file_case_only() {
+        let dir = test_dir().join("rename-case");
+        let connection = "test-conn";
+
+        create_query_file(&dir, connection, "Report").unwrap();
+        write_query_file(&dir, connection, "Report", "SELECT 2;").unwrap();
+
+        // 自分自身の大文字小文字だけを変える改名は許可される
+        let renamed =
+            rename_query_file(&dir, connection, "Report", "report").unwrap();
+        assert_eq!(renamed, "report.sql");
+        assert_eq!(
+            read_query_file(&dir, connection, "report").unwrap(),
+            "SELECT 2;"
+        );
+        // case-insensitive FS では 1 ファイルのまま、case-sensitive FS でも
+        // 旧名は残らない (rename 済み)
+        let files = list_query_files(&dir, connection).unwrap();
+        assert!(files.iter().any(|f| f.eq_ignore_ascii_case("report.sql")));
+        assert!(!files.contains(&"Report.sql".to_string()));
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

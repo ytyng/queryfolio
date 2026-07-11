@@ -288,6 +288,39 @@ const deleteFile = async (fileName: string) => {
   }
 };
 
+// ファイルをリネームする。成功したら正規化後の新ファイル名、失敗したら null。
+// 選択中ファイルのリネーム前に未保存内容を保存し、成功後は selectedFile を追従する。
+const renameFile = async (
+  oldName: string,
+  newName: string,
+): Promise<string | null> => {
+  // await をまたぐ間に接続が切り替わっても、リネームは開始時の接続に対して
+  // 行う (flushPendingSave 中の接続切替による取り違えを防ぐ)
+  const connection = selectedConnection;
+  if (!connection) {
+    return null;
+  }
+  // 選択中ファイルをリネームするなら未保存内容を先に確定させる
+  if (selectedFile === oldName && !(await flushPendingSave())) {
+    return null;
+  }
+  try {
+    const normalized = await api.renameQueryFile(connection, oldName, newName);
+    // リネーム中に接続が切り替わっていたら、旧接続の一覧で上書きしない
+    if (selectedConnection === connection) {
+      files = await api.listQueryFiles(connection);
+      if (selectedFile === oldName) {
+        selectedFile = normalized;
+      }
+    }
+    errorMessage = null;
+    return normalized;
+  } catch (e) {
+    errorMessage = toErrorMessage(e);
+    return null;
+  }
+};
+
 // 現在のファイルを保存する。成功したら true。
 // 失敗時は dirty を保持したまま errorMessage を設定する。
 const saveCurrentFile = async (): Promise<boolean> => {
@@ -837,6 +870,7 @@ export default {
   selectFile,
   createFile,
   deleteFile,
+  renameFile,
   saveCurrentFile,
   updateEditorContent,
   insertSqlSnippet,

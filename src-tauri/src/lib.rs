@@ -357,6 +357,21 @@ async fn delete_query_file(
     )
 }
 
+#[tauri::command]
+async fn rename_query_file(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    old_name: String,
+    new_name: String,
+) -> Result<String, AppError> {
+    query_files::rename_query_file(
+        &state.resolve_sqlfiles_dir().await?,
+        &connection,
+        &old_name,
+        &new_name,
+    )
+}
+
 /// 接続先サーバー上の database (スキーマ) 一覧を返す。
 #[tauri::command]
 async fn list_schemas(
@@ -692,6 +707,7 @@ pub fn run() {
             write_query_file,
             create_query_file,
             delete_query_file,
+            rename_query_file,
             list_schemas,
             set_active_schema,
             get_active_schema,
