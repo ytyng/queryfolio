@@ -14,11 +14,65 @@
   import ResultsPane from "$lib/components/ResultsPane.svelte";
   import ConfigInfoModal from "$lib/components/ConfigInfoModal.svelte";
   import AiAnalysisModal from "$lib/components/AiAnalysisModal.svelte";
+  import PaneDivider from "$lib/components/PaneDivider.svelte";
 
   let showSettings = $state(false);
   let editor: SqlEditor | undefined = $state();
   /// 左ペイン 2 列目のタブ (クエリファイル一覧 / クエリ履歴 / テーブル一覧)
   let leftPaneTab = $state<"files" | "history" | "tables">("files");
+
+  // ペインのレイアウト。区切り線のドラッグで変更し localStorage に保存する
+  const LAYOUT_PREFIX = "queryfolio.layout.";
+  const SIDEBAR_MIN = 140;
+  const SIDEBAR_MAX = 500;
+  const EDITOR_FRAC_MIN = 0.15;
+  const EDITOR_FRAC_MAX = 0.85;
+
+  function loadLayoutValue(key: string, fallback: number): number {
+    try {
+      const raw = localStorage.getItem(LAYOUT_PREFIX + key);
+      if (raw === null) return fallback;
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  function saveLayoutValue(key: string, value: number) {
+    try {
+      localStorage.setItem(LAYOUT_PREFIX + key, String(value));
+    } catch {
+      // localStorage が使えなくてもレイアウト変更自体は機能させる
+    }
+  }
+
+  function clamp(value: number, min: number, max: number): number {
+    return Math.min(max, Math.max(min, value));
+  }
+
+  /// 接続一覧ペインの幅 (px)。デフォルトは従来の w-56 = 224px
+  let connectionsWidth = $state(
+    clamp(loadLayoutValue("connectionsWidth", 224), SIDEBAR_MIN, SIDEBAR_MAX),
+  );
+  /// 2 列目 (Files / History / Tables) ペインの幅 (px)
+  let sidebarWidth = $state(
+    clamp(loadLayoutValue("sidebarWidth", 224), SIDEBAR_MIN, SIDEBAR_MAX),
+  );
+  /// エディタが占める縦の割合。デフォルトは従来の flex 3:2 = 0.6
+  let editorFrac = $state(
+    clamp(loadLayoutValue("editorFrac", 0.6), EDITOR_FRAC_MIN, EDITOR_FRAC_MAX),
+  );
+  // editorFrac の px 換算用。列全体 (ツールバー込み) ではなく
+  // 分割対象 2 ペインの実高さの合計を使うと、ドラッグがカーソルに正確に追従する
+  let editorPaneEl: HTMLDivElement | undefined = $state();
+  let resultsPaneEl: HTMLDivElement | undefined = $state();
+
+  // ドラッグ開始時の基準サイズ。PaneDivider は開始位置からの累積 delta を
+  // 渡すので、基準 + delta で計算するとクランプ飽和後もポインタと同期する
+  let dragBaseConnections = 0;
+  let dragBaseSidebar = 0;
+  let dragBaseEditorFrac = 0;
 
   const selectedConnectionInfo = $derived(
     appStore.connections.find((c) => c.name === appStore.selectedConnection) ??
@@ -69,35 +123,65 @@
   />
 
   <div class="flex min-h-0 flex-1">
-    <ConnectionsPane />
-    {#if leftPaneTab === "files"}
-      <FilesPane
-        onShowHistory={() => {
-          leftPaneTab = "history";
-        }}
-        onShowTables={() => {
-          leftPaneTab = "tables";
-        }}
-      />
-    {:else if leftPaneTab === "history"}
-      <HistoryPane
-        onShowFiles={() => {
-          leftPaneTab = "files";
-        }}
-        onShowTables={() => {
-          leftPaneTab = "tables";
-        }}
-      />
-    {:else}
-      <TablesPane
-        onShowFiles={() => {
-          leftPaneTab = "files";
-        }}
-        onShowHistory={() => {
-          leftPaneTab = "history";
-        }}
-      />
-    {/if}
+    <div class="shrink-0" style="width: {connectionsWidth}px">
+      <ConnectionsPane />
+    </div>
+    <PaneDivider
+      direction="vertical"
+      annotate="pane-divider-connections"
+      onDragStart={() => {
+        dragBaseConnections = connectionsWidth;
+      }}
+      onDrag={(delta) => {
+        connectionsWidth = clamp(
+          dragBaseConnections + delta,
+          SIDEBAR_MIN,
+          SIDEBAR_MAX,
+        );
+      }}
+      onDragEnd={() => saveLayoutValue("connectionsWidth", connectionsWidth)}
+    />
+    <div class="shrink-0" style="width: {sidebarWidth}px">
+      {#if leftPaneTab === "files"}
+        <FilesPane
+          onShowHistory={() => {
+            leftPaneTab = "history";
+          }}
+          onShowTables={() => {
+            leftPaneTab = "tables";
+          }}
+        />
+      {:else if leftPaneTab === "history"}
+        <HistoryPane
+          onShowFiles={() => {
+            leftPaneTab = "files";
+          }}
+          onShowTables={() => {
+            leftPaneTab = "tables";
+          }}
+        />
+      {:else}
+        <TablesPane
+          onShowFiles={() => {
+            leftPaneTab = "files";
+          }}
+          onShowHistory={() => {
+            leftPaneTab = "history";
+          }}
+        />
+      {/if}
+    </div>
+    <PaneDivider
+      direction="vertical"
+      annotate="pane-divider-sidebar"
+      onDragStart={() => {
+        dragBaseSidebar = sidebarWidth;
+      }}
+      onDrag={(delta) => {
+        sidebarWidth = clamp(dragBaseSidebar + delta, SIDEBAR_MIN, SIDEBAR_MAX);
+      }}
+      onDragEnd={() => saveLayoutValue("sidebarWidth", sidebarWidth)}
+    />
 
     <div class="flex min-w-0 flex-1 flex-col">
       {#if appStore.selectedConnection}
@@ -111,7 +195,11 @@
           onFormat={() => editor?.formatCurrentStatement()}
         />
       {/if}
-      <div class="min-h-0 flex-[3] border-b border-zinc-700">
+      <div
+        class="min-h-0 basis-0 border-b border-zinc-700"
+        style="flex-grow: {editorFrac}"
+        bind:this={editorPaneEl}
+      >
         {#if appStore.selectedFile}
           <SqlEditor
             bind:this={editor}
@@ -129,7 +217,30 @@
           </div>
         {/if}
       </div>
-      <div class="min-h-0 flex-[2]">
+      <PaneDivider
+        direction="horizontal"
+        annotate="pane-divider-results"
+        onDragStart={() => {
+          dragBaseEditorFrac = editorFrac;
+        }}
+        onDrag={(delta) => {
+          const height =
+            (editorPaneEl?.clientHeight ?? 0) +
+            (resultsPaneEl?.clientHeight ?? 0);
+          if (height <= 0) return;
+          editorFrac = clamp(
+            dragBaseEditorFrac + delta / height,
+            EDITOR_FRAC_MIN,
+            EDITOR_FRAC_MAX,
+          );
+        }}
+        onDragEnd={() => saveLayoutValue("editorFrac", editorFrac)}
+      />
+      <div
+        class="min-h-0 basis-0"
+        style="flex-grow: {1 - editorFrac}"
+        bind:this={resultsPaneEl}
+      >
         <ResultsPane />
       </div>
     </div>
