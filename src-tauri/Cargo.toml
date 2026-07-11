@@ -46,7 +46,10 @@ reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",
 ] }
 thiserror = "2"
-ssh2 = "0.9"
+# vendored-openssl: OpenSSL を静的リンクする。Homebrew の libssl を動的リンクすると
+# Developer ID 署名アプリで library validation により起動時 abort するため
+# (異なる Team ID の dylib はロード不可)。副次的に Homebrew 未導入環境でも動く。
+ssh2 = { version = "0.9", features = ["vendored-openssl"] }
 base64 = "0.22"
 futures = "0.3"
 tauri-plugin-clipboard-manager = "2.3.2"
