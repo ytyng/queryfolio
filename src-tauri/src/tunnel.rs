@@ -593,16 +593,18 @@ fn expand_env_vars(input: &str) -> String {
 
 /// Include のパス列を展開する。相対パスは `~/.ssh/` からの相対とみなす。
 /// glob パターン (`*` `?` `[...]`) は glob crate で展開する (OpenSSH は glob(3) 準拠)。
+/// トークン分割はダブルクオート/バックスラッシュエスケープを尊重するため、
+/// `Include /tmp/with\ space/inc.conf` のような空白入りパスも 1 つとして扱う。
 fn expand_include_paths(rest: &str, home: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for token in rest.split_whitespace() {
-        let token = unquote(token);
+    for token in split_config_tokens(rest) {
+        // split_config_tokens はクオート除去・エスケープ復号済みのトークンを返す。
         let resolved = if let Some(tail) = token.strip_prefix("~/") {
             home.join(tail)
         } else if token.starts_with('/') {
-            PathBuf::from(token)
+            PathBuf::from(&token)
         } else {
-            home.join(".ssh").join(token)
+            home.join(".ssh").join(&token)
         };
         if token.contains(['*', '?', '[']) {
             // glob crate は既定でソート済みの順で返す。
@@ -614,6 +616,49 @@ fn expand_include_paths(rest: &str, home: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// ssh_config の引数リストを空白区切りのトークンに分割する。
+/// ダブルクオートとバックスラッシュエスケープ (`\ `→空白 / `\\`→`\`) を解釈し、
+/// クオート/エスケープされた空白ではトークンを分割しない。
+fn split_config_tokens(value: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut has_token = false;
+    let mut in_quotes = false;
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                has_token = true;
+            }
+            '\\' if !in_quotes => {
+                has_token = true;
+                match chars.peek() {
+                    Some(&next @ (' ' | '\\')) => {
+                        current.push(next);
+                        chars.next();
+                    }
+                    _ => current.push('\\'),
+                }
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if has_token {
+                    tokens.push(std::mem::take(&mut current));
+                    has_token = false;
+                }
+            }
+            c => {
+                current.push(c);
+                has_token = true;
+            }
+        }
+    }
+    if has_token {
+        tokens.push(current);
+    }
+    tokens
 }
 
 /// ローカル TCP 接続 1 本を SSH direct-tcpip チャンネルへ中継する。
@@ -885,6 +930,30 @@ mod tests {
             other => panic!("expected from-include, resolved={}", other.is_some()),
         }
         let _ = std::fs::remove_file(&inc);
+    }
+
+    #[test]
+    fn split_config_tokens_respects_quotes_and_escapes() {
+        assert_eq!(split_config_tokens("a b c"), vec!["a", "b", "c"]);
+        assert_eq!(split_config_tokens("/tmp/with\\ space/x"), vec!["/tmp/with space/x"]);
+        assert_eq!(split_config_tokens("\"/tmp/a b\" /tmp/c"), vec!["/tmp/a b", "/tmp/c"]);
+        assert_eq!(split_config_tokens("a\\\\b"), vec!["a\\b"]);
+    }
+
+    #[test]
+    fn include_path_with_escaped_space() {
+        let home = Path::new("/home/u");
+        let dir = unique_temp("ssh incdir with space");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("inc.conf"), "Host *\n  IdentityAgent ~/spaced.sock\n").unwrap();
+        // ディレクトリ名に空白。バックスラッシュでエスケープして Include。
+        let escaped = dir.to_string_lossy().replace(' ', "\\ ");
+        let body = format!("Include {}/inc.conf\n", escaped);
+        match resolve(&body, "any.host", home) {
+            Some(AgentSocket::Path(p)) => assert_eq!(p, PathBuf::from("/home/u/spaced.sock")),
+            other => panic!("expected spaced include to resolve, resolved={}", other.is_some()),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
