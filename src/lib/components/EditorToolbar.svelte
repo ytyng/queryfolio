@@ -14,9 +14,21 @@
     /// Format ボタン押下時の処理 (+page.svelte が
     /// SqlEditor.formatCurrentStatement を呼ぶ)
     onFormat: () => void;
+    /// 複数行選択中か。true のとき Replace Multiline ボタンを表示する
+    showReplaceMultiline: boolean;
+    /// Replace Multiline ボタン押下時の処理 (+page.svelte がペインを開く)
+    onReplaceMultiline: () => void;
   }
 
-  let { engine, readonly, onExplain, onExplainSql, onFormat }: Props = $props();
+  let {
+    engine,
+    readonly,
+    onExplain,
+    onExplainSql,
+    onFormat,
+    showReplaceMultiline,
+    onReplaceMultiline,
+  }: Props = $props();
 
   const isSqlite = $derived(
     ["sqlite", "sqlite3"].includes((engine ?? "").toLowerCase()),
@@ -137,6 +149,19 @@
   {/if}
 
   <div class="ml-auto flex min-w-0 items-center gap-2">
+    <!-- 複数行選択中のみ表示。行単位の一括置換ペインを開く -->
+    {#if showReplaceMultiline}
+      <button
+        type="button"
+        class="rounded border border-zinc-600 bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-700"
+        data-annotate="button-replace-multiline"
+        title="Replace the selected lines with a template (e.g. KILL %%%;)"
+        aria-label="Replace the selected lines with a template"
+        onclick={onReplaceMultiline}
+      >
+        <i class="bi bi-body-text" aria-hidden="true"></i> Replace Multiline
+      </button>
+    {/if}
     <!-- カーソル位置の文を整形する (ファイルが開いているときのみ有効) -->
     <button
       type="button"
