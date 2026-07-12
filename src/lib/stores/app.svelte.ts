@@ -141,7 +141,8 @@ const loadAiInfo = async () => {
 /// まだ存在する場合のみ再選択する (ファイル一覧も新設定で再取得される)。
 /// 失敗した場合は false を返す (errorMessage 設定済み)。
 const reloadConnections = async (): Promise<boolean> => {
-  if (!(await flushPendingSave())) {
+  // タブを破棄するので、pending だけでなく全ての未保存タブを先に保存する
+  if (!(await saveAllDirtyTabs())) {
     return false;
   }
   try {
@@ -159,6 +160,9 @@ const reloadConnections = async (): Promise<boolean> => {
     autoSaveTimer = null;
   }
   autoSavePendingTabId = null;
+  // reset 前後に接続切替 (applyConnectionContext) が in-flight でも、その古い
+  // 応答が後から commit して stale な接続を復活させないよう世代を進める
+  connectionContextGeneration++;
   editorTabs = [];
   activeEditorTabId = null;
   lastActiveTabByConnection.clear();
@@ -216,10 +220,30 @@ const flushPendingSave = async (): Promise<boolean> => {
     clearTimeout(autoSaveTimer);
     autoSaveTimer = null;
   }
+  const pendingId = autoSavePendingTabId;
   autoSavePendingTabId = null;
-  // デバウンス予約のタブだけでなく、未保存 (dirty) のタブを全て確定させる。
-  // 自動保存に失敗して pending が外れた dirty タブや、他の接続で開いたまま
-  // 編集した dirty タブも、画面遷移・reload の前にここで守る。
+  // デバウンス予約のタブ (= 直近まで編集していたタブ) だけを確定させる。
+  // 他タブの保存失敗でナビゲーションを巻き込まないよう、対象は 1 タブに限る
+  // (エディタタブは接続をまたいで残るため、切替で内容が失われることはない)。
+  if (pendingId == null) {
+    return true;
+  }
+  const tab = editorTabs.find((t) => t.id === pendingId);
+  if (tab && tab.dirty) {
+    return saveEditorTab(tab);
+  }
+  return true;
+};
+
+/// 全ての dirty なエディタタブを保存する (best-effort)。全て成功したら true。
+/// タブを破棄する前 (reloadConnections) に呼び、未保存の編集を失わないようにする。
+/// 自動保存に失敗して pending が外れた dirty タブもここで確実に対象になる。
+const saveAllDirtyTabs = async (): Promise<boolean> => {
+  if (autoSaveTimer) {
+    clearTimeout(autoSaveTimer);
+    autoSaveTimer = null;
+  }
+  autoSavePendingTabId = null;
   let ok = true;
   for (const tab of editorTabs) {
     if (tab.dirty) {
@@ -311,9 +335,10 @@ const selectConnection = async (name: string) => {
     connectionContextGeneration++;
     return;
   }
-  if (!(await flushPendingSave())) {
-    return;
-  }
+  // 未保存タブは best-effort で保存するが、保存失敗でも切替は止めない。
+  // エディタタブは接続をまたいで残るため、切替で内容が失われることはない
+  // (書込不可などで保存に失敗しても、dirty のままタブに保持される)。
+  await flushPendingSave();
   // 結果タブ・エディタタブは接続をまたいで残す (接続切替では破棄しない)。
   // より新しい切替に追い越されたら、タブ選択を触らず中断する。
   if (!(await applyConnectionContext(name))) {
@@ -333,9 +358,10 @@ const activateEditorTab = async (id: number) => {
   if (!tab) {
     return;
   }
-  if (!(await flushPendingSave())) {
-    return;
-  }
+  // 未保存タブは best-effort で保存するが、保存失敗でもアクティブ化は止めない。
+  // (書込不可などで保存に失敗しても未保存 SQL を閲覧・コピーできるようにする。
+  //  タブは残るので内容は失われない)
+  await flushPendingSave();
   if (tab.connection !== selectedConnection) {
     // より新しい切替に追い越されたら、このタブをアクティブにしない
     if (!(await applyConnectionContext(tab.connection))) {
