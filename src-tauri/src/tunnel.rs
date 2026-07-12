@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -244,11 +244,342 @@ fn authenticate(session: &Session, config: &SshTunnelConfig) -> Result<(), AppEr
         return Ok(());
     }
 
-    // password も private_key_path も無い場合は ssh-agent を試す
-    session
-        .userauth_agent(&config.user)
-        .map_err(|e| AppError::SshTunnel(format!("ssh-agent authentication failed: {e}")))?;
-    Ok(())
+    // password も private_key_path も無い場合は ssh-agent を試す。
+    // GUI 起動時はシェルの SSH_AUTH_SOCK を継承しないことがあるため、使う agent socket を
+    // config の identity_agent → ~/.ssh/config の IdentityAgent → SSH_AUTH_SOCK の順で解決する。
+    match resolve_agent_socket(config) {
+        AgentSocket::Disabled => Err(AppError::SshTunnel(format!(
+            "The SSH agent is disabled for {} (IdentityAgent none) and no \
+             private_key_path/password is configured",
+            config.host
+        ))),
+        AgentSocket::Path(path) => authenticate_with_agent(session, &config.user, Some(&path)),
+        AgentSocket::Default => authenticate_with_agent(session, &config.user, None),
+    }
+}
+
+/// どの ssh-agent socket を使うか。
+enum AgentSocket {
+    /// 明示的な socket パス (libssh2 の set_identity_path で指定)。
+    Path(PathBuf),
+    /// IdentityAgent none 相当。agent 認証を行わない。
+    Disabled,
+    /// 解決できなかった。libssh2 の既定 (SSH_AUTH_SOCK) に任せる。
+    Default,
+}
+
+/// 使用する ssh-agent socket を優先順位に従って解決する。
+///
+/// 1. config の `ssh_tunnel.identity_agent`
+/// 2. `~/.ssh/config` の `IdentityAgent` (対象ホストにマッチするもの)
+/// 3. `SSH_AUTH_SOCK` (= `AgentSocket::Default`)
+fn resolve_agent_socket(config: &SshTunnelConfig) -> AgentSocket {
+    if let Some(explicit) = &config.identity_agent {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            // 空文字は未指定扱いとし、ssh_config へフォールバックする。
+            let home = dirs::home_dir().unwrap_or_default();
+            return parse_agent_socket_value(trimmed, &home);
+        }
+    }
+    ssh_config_identity_agent(&config.host).unwrap_or(AgentSocket::Default)
+}
+
+/// IdentityAgent の値 (config フィールドまたは ssh_config) を AgentSocket に変換する。
+/// `none` は無効化、`SSH_AUTH_SOCK` は既定 (env)、それ以外はパスとして展開する。
+fn parse_agent_socket_value(value: &str, home: &Path) -> AgentSocket {
+    if value.eq_ignore_ascii_case("none") {
+        AgentSocket::Disabled
+    } else if value.eq_ignore_ascii_case("SSH_AUTH_SOCK") {
+        AgentSocket::Default
+    } else {
+        AgentSocket::Path(expand_ssh_path(value, home))
+    }
+}
+
+/// ssh-agent 経由で認証する。socket が Some ならその unix socket を使う。
+/// libssh2 の set_identity_path は SSH_AUTH_SOCK 環境変数を書き換えないので
+/// スレッド間で安全に呼べる。
+fn authenticate_with_agent(
+    session: &Session,
+    user: &str,
+    socket: Option<&Path>,
+) -> Result<(), AppError> {
+    let mut agent = session
+        .agent()
+        .map_err(|e| AppError::SshTunnel(format!("Failed to initialize the ssh-agent: {e}")))?;
+    if let Some(path) = socket {
+        agent.set_identity_path(path).map_err(|e| {
+            AppError::SshTunnel(format!(
+                "Failed to select the ssh-agent socket ({}): {e}",
+                path.display()
+            ))
+        })?;
+    }
+    agent
+        .connect()
+        .map_err(|e| AppError::SshTunnel(format!("Failed to connect to the ssh-agent: {e}")))?;
+    agent
+        .list_identities()
+        .map_err(|e| AppError::SshTunnel(format!("Failed to list ssh-agent identities: {e}")))?;
+    let identities = agent
+        .identities()
+        .map_err(|e| AppError::SshTunnel(format!("Failed to read ssh-agent identities: {e}")))?;
+    if identities.is_empty() {
+        let location = socket
+            .map(|p| format!(" at {}", p.display()))
+            .unwrap_or_default();
+        return Err(AppError::SshTunnel(format!(
+            "No identities found in the ssh agent{location}. Ensure your SSH agent \
+             (e.g. 1Password) is unlocked and holds a key, or set \
+             ssh_tunnel.private_key_path / ssh_tunnel.identity_agent"
+        )));
+    }
+    let mut last_error = None;
+    for identity in &identities {
+        match agent.userauth(user, identity) {
+            Ok(()) => return Ok(()),
+            Err(e) => last_error = Some(e),
+        }
+    }
+    Err(AppError::SshTunnel(format!(
+        "ssh-agent authentication failed for user {user}: {}",
+        last_error
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "no identity was accepted".into())
+    )))
+}
+
+/// `~/.ssh/config` を読み、`host` に対する実効的な IdentityAgent を返す。
+/// OpenSSH のセマンティクスに倣い、最初にマッチした値を採用する。
+/// Host の glob パターン・`IdentityAgent none`/`SSH_AUTH_SOCK`・`~`/`%d`/環境変数展開を尊重する。
+/// (Match ブロックは未対応で、その中の設定は無視する。)
+fn ssh_config_identity_agent(host: &str) -> Option<AgentSocket> {
+    let home = dirs::home_dir()?;
+    let config_path = home.join(".ssh").join("config");
+    ssh_config_identity_agent_at(&config_path, host, &home)
+}
+
+/// `ssh_config_identity_agent` の本体。config パスと home を注入できるようにして
+/// テスト可能にしたもの。
+fn ssh_config_identity_agent_at(
+    config_path: &Path,
+    host: &str,
+    home: &Path,
+) -> Option<AgentSocket> {
+    // Include を展開して 1 本の行リストにしてから走査する。こうすることで
+    // Host ブロック内の Include も、その Host のマッチ条件が引き継がれる
+    // (OpenSSH は Include をその場に展開したかのように扱う)。
+    let mut lines = Vec::new();
+    let mut depth = 0;
+    collect_ssh_config_lines(config_path, home, &mut lines, &mut depth);
+
+    let mut block_matches = true; // Host/Match の外 (冒頭) は全ホストに適用される
+    for line in &lines {
+        let (keyword, rest) = split_ssh_config_line(line);
+        match keyword.to_ascii_lowercase().as_str() {
+            "host" => block_matches = host_patterns_match(rest, host),
+            // Match ブロックは未対応。誤判定を避けるためブロックごと無視する。
+            "match" => block_matches = false,
+            "identityagent" if block_matches => {
+                return Some(parse_agent_socket_value(unquote(rest), home));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// ssh_config を読み、`Include` をその場に展開しながら有効行 (コメント/空行を除く) を
+/// `out` に平坦化して集める。Include の循環を depth 上限で防ぐ。
+fn collect_ssh_config_lines(path: &Path, home: &Path, out: &mut Vec<String>, depth: &mut u32) {
+    if *depth > 16 {
+        return;
+    }
+    *depth += 1;
+    if let Ok(content) = std::fs::read_to_string(path) {
+        for raw_line in content.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (keyword, rest) = split_ssh_config_line(line);
+            if keyword.eq_ignore_ascii_case("include") {
+                for inc in expand_include_paths(rest, home) {
+                    collect_ssh_config_lines(&inc, home, out, depth);
+                }
+            } else {
+                out.push(line.to_string());
+            }
+        }
+    }
+    *depth -= 1;
+}
+
+/// ssh_config の 1 行を「キーワード」と「残り」に分割する。
+/// OpenSSH は `Keyword value` と `Keyword=value` の両方を許す。
+fn split_ssh_config_line(line: &str) -> (&str, &str) {
+    let end = line
+        .find(|c: char| c.is_whitespace() || c == '=')
+        .unwrap_or(line.len());
+    let keyword = &line[..end];
+    let rest = line[end..].trim_start();
+    let rest = rest.strip_prefix('=').map(str::trim_start).unwrap_or(rest);
+    (keyword, rest)
+}
+
+/// Host 行のパターン列 (空白区切り、`!` 否定あり) が host にマッチするか。
+/// ホスト名は OpenSSH に倣い大文字小文字を区別しない。
+fn host_patterns_match(patterns: &str, host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    let mut matched = false;
+    for pattern in patterns.split_whitespace() {
+        if let Some(negated) = pattern.strip_prefix('!') {
+            if glob_match(&negated.to_ascii_lowercase(), &host) {
+                return false;
+            }
+        } else if glob_match(&pattern.to_ascii_lowercase(), &host) {
+            matched = true;
+        }
+    }
+    matched
+}
+
+/// `*` と `?` のみ対応するワイルドカードマッチ。
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star, mut mark) = (None, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// 前後のダブルクオートを除去する。
+fn unquote(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(value)
+}
+
+/// IdentityAgent の値のパスを展開する: 環境変数 (`${VAR}`/`$VAR`)、`%d` (ホーム)、`~`。
+fn expand_ssh_path(value: &str, home: &Path) -> PathBuf {
+    let mut expanded = expand_env_vars(value);
+    if expanded.contains("%d") {
+        expanded = expanded.replace("%d", &home.to_string_lossy());
+    }
+    if let Some(rest) = expanded.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    if expanded == "~" {
+        return home.to_path_buf();
+    }
+    PathBuf::from(expanded)
+}
+
+/// `${VAR}` と `$VAR` を環境変数で展開する。未定義変数は空文字に展開する
+/// (OpenSSH / シェル準拠)。
+fn expand_env_vars(input: &str) -> String {
+    if !input.contains('$') {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        let braced = chars.peek() == Some(&'{');
+        if braced {
+            chars.next();
+        }
+        let mut name = String::new();
+        while let Some(&nc) = chars.peek() {
+            let is_name_char = nc.is_ascii_alphanumeric() || nc == '_';
+            if braced {
+                if nc == '}' {
+                    chars.next();
+                    break;
+                }
+                name.push(nc);
+                chars.next();
+            } else if is_name_char {
+                name.push(nc);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if name.is_empty() {
+            out.push('$'); // `$` 単独等はそのまま残す
+        } else if let Ok(value) = std::env::var(&name) {
+            out.push_str(&value);
+        }
+    }
+    out
+}
+
+/// Include のパス列を展開する。相対パスは `~/.ssh/` からの相対とみなす。
+/// 末尾コンポーネントの glob (`~/.ssh/config.d/*` 等) に対応する。
+fn expand_include_paths(rest: &str, home: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for token in rest.split_whitespace() {
+        let token = unquote(token);
+        let resolved = if let Some(tail) = token.strip_prefix("~/") {
+            home.join(tail)
+        } else if token.starts_with('/') {
+            PathBuf::from(token)
+        } else {
+            home.join(".ssh").join(token)
+        };
+        if token.contains('*') || token.contains('?') || token.contains('[') {
+            expand_glob_last_component(&resolved, &mut out);
+        } else {
+            out.push(resolved);
+        }
+    }
+    out
+}
+
+/// パスの末尾コンポーネントだけを glob 展開する。ディレクトリ部に glob を含む
+/// 多段パターンは未対応。結果は OpenSSH に倣い辞書順にソートする。
+fn expand_glob_last_component(pattern_path: &Path, out: &mut Vec<PathBuf>) {
+    let (Some(dir), Some(file)) = (pattern_path.parent(), pattern_path.file_name()) else {
+        return;
+    };
+    if dir.to_string_lossy().contains(['*', '?', '[']) {
+        return;
+    }
+    let file_pattern = file.to_string_lossy();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut matched: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|entry| glob_match(&file_pattern, &entry.file_name().to_string_lossy()))
+            .map(|entry| entry.path())
+            .collect();
+        matched.sort();
+        out.extend(matched);
+    }
 }
 
 /// ローカル TCP 接続 1 本を SSH direct-tcpip チャンネルへ中継する。
@@ -364,5 +695,192 @@ fn write_all_nonblocking_channel_eof(
                 return Err(io_err);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_match_basic() {
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("app01.*", "app01.example.com"));
+        assert!(!glob_match("app01.*", "app02.example.com"));
+        assert!(glob_match("host?", "host1"));
+        assert!(!glob_match("host?", "host12"));
+        assert!(glob_match("a*c", "abbbc"));
+        assert!(!glob_match("a*c", "abbbd"));
+        assert!(glob_match("exact", "exact"));
+        assert!(!glob_match("exact", "exacts"));
+    }
+
+    #[test]
+    fn host_patterns_match_with_negation() {
+        assert!(host_patterns_match("*", "db.example.com"));
+        assert!(host_patterns_match("*.example.com", "db.example.com"));
+        // 否定パターンが優先してマッチを打ち消す
+        assert!(!host_patterns_match("*.example.com !secret.example.com", "secret.example.com"));
+        assert!(host_patterns_match("*.example.com !secret.example.com", "db.example.com"));
+        assert!(!host_patterns_match("foo bar", "baz"));
+    }
+
+    #[test]
+    fn split_line_handles_space_and_equals() {
+        assert_eq!(split_ssh_config_line("IdentityAgent none"), ("IdentityAgent", "none"));
+        assert_eq!(split_ssh_config_line("Host=foo"), ("Host", "foo"));
+        assert_eq!(
+            split_ssh_config_line("IdentityAgent  \"~/a b\""),
+            ("IdentityAgent", "\"~/a b\"")
+        );
+    }
+
+    #[test]
+    fn unquote_and_expand() {
+        assert_eq!(unquote("\"~/x\""), "~/x");
+        assert_eq!(unquote("plain"), "plain");
+        let home = Path::new("/home/u");
+        assert_eq!(expand_ssh_path("~/a/b", home), PathBuf::from("/home/u/a/b"));
+        assert_eq!(expand_ssh_path("%d/a", home), PathBuf::from("/home/u/a"));
+        assert_eq!(expand_ssh_path("/abs/path", home), PathBuf::from("/abs/path"));
+    }
+
+    fn unique_temp(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("qf_{tag}_{}_{n}", std::process::id()))
+    }
+
+    fn resolve(config_body: &str, host: &str, home: &Path) -> Option<AgentSocket> {
+        let path = unique_temp("ssh_cfg");
+        std::fs::write(&path, config_body).unwrap();
+        let result = ssh_config_identity_agent_at(&path, host, home);
+        let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    #[test]
+    fn resolves_host_star_identity_agent() {
+        let home = Path::new("/home/u");
+        let body = "Host *\n  IdentityAgent \"~/Library/1p/agent.sock\"\n";
+        match resolve(body, "db.example.com", home) {
+            Some(AgentSocket::Path(p)) => {
+                assert_eq!(p, PathBuf::from("/home/u/Library/1p/agent.sock"));
+            }
+            other => panic!("expected Path, got resolved={}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn first_matching_value_wins_and_none_disables() {
+        let home = Path::new("/home/u");
+        // より具体的な Host ブロックが先にあり none を指定していれば、後続の Host * より優先される。
+        let body = "Host irene.example.com\n  IdentityAgent none\n\nHost *\n  IdentityAgent ~/agent.sock\n";
+        assert!(matches!(
+            resolve(body, "irene.example.com", home),
+            Some(AgentSocket::Disabled)
+        ));
+        // マッチしないホストは Host * にフォールバックする。
+        assert!(matches!(
+            resolve(body, "other.example.com", home),
+            Some(AgentSocket::Path(_))
+        ));
+    }
+
+    #[test]
+    fn ssh_auth_sock_literal_maps_to_default() {
+        let home = Path::new("/home/u");
+        let body = "Host *\n  IdentityAgent SSH_AUTH_SOCK\n";
+        assert!(matches!(
+            resolve(body, "db.example.com", home),
+            Some(AgentSocket::Default)
+        ));
+    }
+
+    #[test]
+    fn no_identity_agent_returns_none() {
+        let home = Path::new("/home/u");
+        let body = "Host *\n  User someone\n";
+        assert!(resolve(body, "db.example.com", home).is_none());
+    }
+
+    #[test]
+    fn include_inside_non_matching_host_block_is_ignored() {
+        // Include を Host ブロック内に置いた場合、そのブロックがマッチしないホストには
+        // Include 先の IdentityAgent を適用してはならない (OpenSSH のインライン展開)。
+        let home = Path::new("/home/u");
+        let inc = unique_temp("ssh_inc");
+        std::fs::write(&inc, "IdentityAgent none\n").unwrap();
+        let body = format!(
+            "Host prod\n  Include {}\n\nHost *\n  IdentityAgent ~/agent.sock\n",
+            inc.display()
+        );
+        // dev は Host prod にマッチしないので Host * の agent.sock を得る。
+        assert!(matches!(
+            resolve(&body, "dev", home),
+            Some(AgentSocket::Path(_))
+        ));
+        // prod は Host prod にマッチするので Include 先の none を得る。
+        assert!(matches!(
+            resolve(&body, "prod", home),
+            Some(AgentSocket::Disabled)
+        ));
+        let _ = std::fs::remove_file(&inc);
+    }
+
+    #[test]
+    fn env_var_is_expanded_in_path() {
+        assert_eq!(expand_env_vars("plain"), "plain");
+        std::env::set_var("QF_TEST_AGENT_DIR", "/tmp/qf");
+        assert_eq!(expand_env_vars("${QF_TEST_AGENT_DIR}/a.sock"), "/tmp/qf/a.sock");
+        assert_eq!(expand_env_vars("$QF_TEST_AGENT_DIR/a.sock"), "/tmp/qf/a.sock");
+        // 未定義変数は空に展開される
+        std::env::remove_var("QF_TEST_UNDEFINED");
+        assert_eq!(expand_env_vars("x${QF_TEST_UNDEFINED}y"), "xy");
+    }
+
+    #[test]
+    fn host_matching_is_case_insensitive() {
+        let home = Path::new("/home/u");
+        let body = "Host DB.Example.COM\n  IdentityAgent ~/agent.sock\n";
+        assert!(matches!(
+            resolve(body, "db.example.com", home),
+            Some(AgentSocket::Path(_))
+        ));
+    }
+
+    #[test]
+    fn glob_include_expands_last_component() {
+        let home = Path::new("/home/u");
+        let dir = unique_temp("ssh_incdir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("10-agent.conf"), "Host *\n  IdentityAgent ~/from-glob.sock\n").unwrap();
+        let body = format!("Include {}/*.conf\n", dir.display());
+        match resolve(&body, "any.host", home) {
+            Some(AgentSocket::Path(p)) => assert_eq!(p, PathBuf::from("/home/u/from-glob.sock")),
+            other => panic!("expected glob-included path, resolved={}", other.is_some()),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_config_field_takes_priority() {
+        let cfg = SshTunnelConfig {
+            host: "db.example.com".into(),
+            port: 22,
+            user: "u".into(),
+            password: None,
+            private_key_path: None,
+            private_key_passphrase: None,
+            identity_agent: Some("none".into()),
+        };
+        assert!(matches!(resolve_agent_socket(&cfg), AgentSocket::Disabled));
+
+        let cfg = SshTunnelConfig {
+            identity_agent: Some("~/custom.sock".into()),
+            ..cfg
+        };
+        assert!(matches!(resolve_agent_socket(&cfg), AgentSocket::Path(_)));
     }
 }

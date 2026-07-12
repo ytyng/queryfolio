@@ -61,6 +61,12 @@ sql_servers:
       # password: ssh_password  # または private_key_path を使用
       private_key_path: ~/.ssh/id_rsa
       # private_key_passphrase: key_passphrase
+      # When no password/private_key_path is set, the SSH agent is used.
+      # The agent socket is resolved from ~/.ssh/config (IdentityAgent) and
+      # then SSH_AUTH_SOCK. Override it here if the app is launched in an
+      # environment that does not inherit the right socket (e.g. the
+      # 1Password SSH agent when launched from Finder). "none" disables the agent.
+      # identity_agent: ~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock
 
 # --- sql_servers: 形式 B (ソース宣言。command / env / file のどれか 1 つだけ) ---
 # 取得した YAML は sql-agent-mcp-server 互換フォーマット
