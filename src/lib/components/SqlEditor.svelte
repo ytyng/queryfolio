@@ -13,7 +13,8 @@
   } from "@codemirror/view";
   import type { DecorationSet } from "@codemirror/view";
   import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
-  import { syntaxTree } from "@codemirror/language";
+  import { syntaxTree, HighlightStyle, syntaxHighlighting } from "@codemirror/language";
+  import { tags as t } from "@lezer/highlight";
   import { autocompletion, completionKeymap } from "@codemirror/autocomplete";
   import { sql, MySQL, PostgreSQL, SQLite } from "@codemirror/lang-sql";
   import type { SQLNamespace } from "@codemirror/lang-sql";
@@ -350,6 +351,13 @@
       height: "100%",
       fontSize: "13px",
     },
+    // Base text (identifiers, table/column names) is brighter than oneDark's default.
+    ".cm-content": {
+      color: "#f3f5f9",
+    },
+    ".cm-cursor, .cm-dropCursor": {
+      borderLeftColor: "#f3f5f9",
+    },
     ".cm-scroller": {
       fontFamily:
         "ui-monospace, SFMono-Regular, Menlo, Monaco, monospace",
@@ -366,6 +374,18 @@
       borderBottom: "1px solid rgba(96, 165, 250, 0.25)",
     },
   });
+
+  // Brighter variants of oneDark's syntax palette (overrides oneDark's HighlightStyle).
+  const brightHighlightStyle = HighlightStyle.define([
+    { tag: [t.keyword, t.operatorKeyword, t.modifier], color: "#eac6ff" },
+    { tag: [t.string, t.special(t.string)], color: "#d8f5b0" },
+    { tag: [t.number, t.bool, t.null], color: "#ffd7a3" },
+    { tag: [t.function(t.variableName), t.function(t.propertyName)], color: "#b3ddff" },
+    { tag: [t.name, t.propertyName, t.variableName], color: "#f3f5f9" },
+    { tag: [t.comment], color: "#c0c7da", fontStyle: "italic" },
+    { tag: [t.operator, t.punctuation, t.separator], color: "#e2e7f0" },
+    { tag: [t.typeName, t.className], color: "#ffeab0" },
+  ]);
 
   onMount(() => {
     view = new EditorView({
@@ -387,6 +407,7 @@
           ]),
           languageCompartment.of(languageExtension(engine, schemaMap)),
           oneDark,
+          syntaxHighlighting(brightHighlightStyle),
           editorTheme,
           statementHighlight,
           EditorView.updateListener.of((update) => {

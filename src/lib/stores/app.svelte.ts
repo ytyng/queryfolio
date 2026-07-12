@@ -35,16 +35,27 @@ export interface ResultTab {
 export const isExplainSql = (sql: string): boolean =>
   sql.trimStart().toLowerCase().startsWith("explain");
 
+/// 1 つの開いているエディタタブ。タブはグローバル (全接続横断) に一列で並び、
+/// 各タブが自分の接続を保持する。タブをアクティブにすると、その接続へ切り替わる
+/// (engine / スキーマ / 補完 / 実行はすべてアクティブタブの接続で駆動される)。
+export interface EditorTab {
+  id: number;
+  connection: string;
+  file: string;
+  content: string;
+  /// 未保存の編集があるか (自動保存で false に戻る)
+  dirty: boolean;
+}
+
 let connections = $state<ConnectionInfo[]>([]);
 let selectedConnection = $state<string | null>(null);
 let files = $state<string[]>([]);
-let selectedFile = $state<string | null>(null);
-let editorContent = $state("");
+let editorTabs = $state<EditorTab[]>([]);
+let activeEditorTabId = $state<number | null>(null);
 let resultTabs = $state<ResultTab[]>([]);
 let activeTabId = $state<number | null>(null);
 let errorMessage = $state<string | null>(null);
 let loadingConnections = $state(false);
-let dirty = $state(false);
 let schemas = $state<string[]>([]);
 let activeSchema = $state<string | null>(null);
 /// AI 設定の情報 (未取得・取得失敗時は null)
@@ -70,14 +81,28 @@ let dangerousConfirm = $state<{
   resolve: (ok: boolean) => void;
 } | null>(null);
 
-// タブ ID の連番 (セッション内で一意なら十分なので永続化しない)
+// 結果タブ ID の連番 (セッション内で一意なら十分なので永続化しない)
 let nextTabId = 1;
+// エディタタブ ID の連番
+let nextEditorTabId = 1;
+/// 接続ごとに最後にアクティブだったエディタタブ ID を覚え、接続へ戻った時に復元する
+const lastActiveTabByConnection = new Map<string, number>();
+
+const getActiveEditorTab = (): EditorTab | null =>
+  editorTabs.find((t) => t.id === activeEditorTabId) ?? null;
 
 /// 実行中の loadSchemaMap の世代番号。接続・スキーマの連続切替で
 /// 古い応答が後から解決しても、最新の要求の結果だけを反映するために使う
 let schemaMapGeneration = 0;
 
+/// 実行中の applyConnectionContext の世代番号。接続の連続切替で、遅い接続の
+/// 応答が後から解決して新しい接続の files / schemas / activeSchema を上書き
+/// しないよう、コミット前に最新世代かを検査する (schemaMapGeneration と同趣旨)
+let connectionContextGeneration = 0;
+
 let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
+/// 自動保存が予約されているエディタタブ ID (デバウンス中の対象)
+let autoSavePendingTabId: number | null = null;
 
 const toErrorMessage = (e: unknown): string =>
   typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
@@ -116,7 +141,8 @@ const loadAiInfo = async () => {
 /// まだ存在する場合のみ再選択する (ファイル一覧も新設定で再取得される)。
 /// 失敗した場合は false を返す (errorMessage 設定済み)。
 const reloadConnections = async (): Promise<boolean> => {
-  if (!(await flushPendingSave())) {
+  // タブを破棄するので、pending だけでなく全ての未保存タブを先に保存する
+  if (!(await saveAllDirtyTabs())) {
     return false;
   }
   try {
@@ -128,12 +154,21 @@ const reloadConnections = async (): Promise<boolean> => {
   const previousConnection = selectedConnection;
   selectedConnection = null;
   files = [];
-  selectedFile = null;
-  editorContent = "";
+  // 設定が丸ごと入れ替わるため、開いているエディタタブを全て破棄する
+  if (autoSaveTimer) {
+    clearTimeout(autoSaveTimer);
+    autoSaveTimer = null;
+  }
+  autoSavePendingTabId = null;
+  // reset 前後に接続切替 (applyConnectionContext) が in-flight でも、その古い
+  // 応答が後から commit して stale な接続を復活させないよう世代を進める
+  connectionContextGeneration++;
+  editorTabs = [];
+  activeEditorTabId = null;
+  lastActiveTabByConnection.clear();
   // 設定が丸ごと入れ替わるため、ピン留め含め全タブを破棄する
   resultTabs = [];
   activeTabId = null;
-  dirty = false;
   schemas = [];
   activeSchema = null;
   aiInfo = null;
@@ -185,57 +220,172 @@ const flushPendingSave = async (): Promise<boolean> => {
     clearTimeout(autoSaveTimer);
     autoSaveTimer = null;
   }
-  if (dirty && selectedConnection && selectedFile) {
-    return saveCurrentFile();
+  const pendingId = autoSavePendingTabId;
+  autoSavePendingTabId = null;
+  // デバウンス予約のタブ (= 直近まで編集していたタブ) だけを確定させる。
+  // 他タブの保存失敗でナビゲーションを巻き込まないよう、対象は 1 タブに限る
+  // (エディタタブは接続をまたいで残るため、切替で内容が失われることはない)。
+  if (pendingId == null) {
+    return true;
+  }
+  const tab = editorTabs.find((t) => t.id === pendingId);
+  if (tab && tab.dirty) {
+    return saveEditorTab(tab);
   }
   return true;
 };
 
-const selectConnection = async (name: string) => {
-  if (!(await flushPendingSave())) {
-    return;
+/// 全ての dirty なエディタタブを保存する (best-effort)。全て成功したら true。
+/// タブを破棄する前 (reloadConnections) に呼び、未保存の編集を失わないようにする。
+/// 自動保存に失敗して pending が外れた dirty タブもここで確実に対象になる。
+const saveAllDirtyTabs = async (): Promise<boolean> => {
+  if (autoSaveTimer) {
+    clearTimeout(autoSaveTimer);
+    autoSaveTimer = null;
   }
-  // 結果タブは接続をまたいで比較できるよう、接続切替では破棄しない
-  selectedConnection = name;
-  selectedFile = null;
-  editorContent = "";
-  errorMessage = null;
-  dirty = false;
-  activeSchema =
-    connections.find((c) => c.name === name)?.schema ?? null;
-  schemas = [];
-  // 接続確立を待つ間、前の接続の補完候補を出さないよう先にクリアする
-  // (世代も進め、実行中の古い取得が後から書き込むのを防ぐ)
-  schemaMapGeneration++;
-  schemaMap = null;
+  autoSavePendingTabId = null;
+  let ok = true;
+  for (const tab of editorTabs) {
+    if (tab.dirty) {
+      if (!(await saveEditorTab(tab))) {
+        ok = false;
+      }
+    }
+  }
+  return ok;
+};
+
+/// 指定した接続のファイル一覧・スキーマ・補完マップを読み込み、接続コンテキストを
+/// 切り替える (エディタタブには触れない)。接続選択・タブアクティブ化の両方から使う。
+///
+/// 重要: `selectedConnection` は読み込みを終えてから **最後にまとめて** 反映する。
+/// 先に `selectedConnection = name` すると、await 中は「接続は新 (name) だがエディタは
+/// まだ旧タブの SQL を表示中」というズレが生じ、その窓で Run すると旧 SQL が新接続で
+/// 走ってしまう (DB クライアントとして致命的)。呼び出し側の `activeEditorTabId` 反映は
+/// この関数の resolve 直後の同一マイクロタスクで行われるため、コミット〜タブ反映の間に
+/// ユーザー操作 (マクロタスク) は割り込めず、接続とタブは常に整合する。
+///
+/// コミットできたら true。連続切替でより新しい要求に追い越された場合は、何も反映せず
+/// false を返す (呼び出し側は activeEditorTabId を触らずに中断する)。
+const applyConnectionContext = async (name: string): Promise<boolean> => {
+  const generation = ++connectionContextGeneration;
+  const defaultSchema = connections.find((c) => c.name === name)?.schema ?? null;
+  let loadedFiles: string[] = [];
+  let filesError: string | null = null;
   try {
-    files = await api.listQueryFiles(name);
+    loadedFiles = await api.listQueryFiles(name);
   } catch (e) {
-    errorMessage = toErrorMessage(e);
-    files = [];
+    filesError = toErrorMessage(e);
+  }
+  // await の間により新しい切替が始まっていたら、この応答は捨てる (上書き防止)
+  if (generation !== connectionContextGeneration) {
+    return false;
   }
   // スキーマ一覧の取得は接続確立を伴うため、失敗しても選択自体は成立させる
   // (エラーは結果ペインに出さず、プルダウンを現在値のみにする)
+  let schema = defaultSchema;
+  let loadedSchemas: string[] = [];
   try {
-    activeSchema = (await api.getActiveSchema(name)) ?? activeSchema;
-    schemas = await api.listSchemas(name);
+    schema = (await api.getActiveSchema(name)) ?? schema;
+    loadedSchemas = await api.listSchemas(name);
   } catch {
-    schemas = activeSchema ? [activeSchema] : [];
+    loadedSchemas = schema ? [schema] : [];
   }
+  if (generation !== connectionContextGeneration) {
+    return false;
+  }
+  // ここから resolve まで await を挟まず、接続コンテキストを一括反映する。
+  selectedConnection = name;
+  errorMessage = filesError;
+  files = filesError ? [] : loadedFiles;
+  activeSchema = schema;
+  schemas = loadedSchemas;
+  // 補完候補は新接続のものを取り直す (世代も進め、古い取得の後追い書き込みを防ぐ)
+  schemaMapGeneration++;
+  schemaMap = null;
   // SQL 補完用のスキーママップをバックグラウンドで取得する (待たない)
   void loadSchemaMap();
+  return true;
+};
+
+/// 接続に紐づくエディタタブのうち、アクティブに復元すべきものを選ぶ。
+/// 直近にアクティブだったタブを優先し、無ければ最後に開いたタブ、無ければ null。
+const pickTabForConnection = (name: string): number | null => {
+  const remembered = lastActiveTabByConnection.get(name);
+  if (
+    remembered != null &&
+    editorTabs.some((t) => t.id === remembered && t.connection === name)
+  ) {
+    return remembered;
+  }
+  for (let i = editorTabs.length - 1; i >= 0; i--) {
+    if (editorTabs[i].connection === name) {
+      return editorTabs[i].id;
+    }
+  }
+  return null;
+};
+
+const selectConnection = async (name: string) => {
+  if (name === selectedConnection) {
+    // 現在の接続を再選択したら、進行中の別接続への切替 (applyConnectionContext は
+    // commit まで selectedConnection を変えないため、その最中は現接続が選択中に
+    // 見える) をキャンセルする。世代を進めておくと in-flight の切替は commit されず、
+    // 「今の接続に留まる」という操作の意図どおりになる。
+    connectionContextGeneration++;
+    return;
+  }
+  // 未保存タブは best-effort で保存するが、保存失敗でも切替は止めない。
+  // エディタタブは接続をまたいで残るため、切替で内容が失われることはない
+  // (書込不可などで保存に失敗しても、dirty のままタブに保持される)。
+  await flushPendingSave();
+  // 結果タブ・エディタタブは接続をまたいで残す (接続切替では破棄しない)。
+  // より新しい切替に追い越されたら、タブ選択を触らず中断する。
+  if (!(await applyConnectionContext(name))) {
+    return;
+  }
+  // この接続で最後に開いていたタブを復元する (無ければエディタは空表示)
+  activeEditorTabId = pickTabForConnection(name);
+};
+
+/// エディタタブをアクティブにする。タブの接続が現在の接続と違えば、その接続へ
+/// 切り替える (files / スキーマ / 補完もタブの接続のものに揃える)。
+const activateEditorTab = async (id: number) => {
+  if (id === activeEditorTabId) {
+    return;
+  }
+  const tab = editorTabs.find((t) => t.id === id);
+  if (!tab) {
+    return;
+  }
+  // 未保存タブは best-effort で保存するが、保存失敗でもアクティブ化は止めない。
+  // (書込不可などで保存に失敗しても未保存 SQL を閲覧・コピーできるようにする。
+  //  タブは残るので内容は失われない)
+  await flushPendingSave();
+  if (tab.connection !== selectedConnection) {
+    // より新しい切替に追い越されたら、このタブをアクティブにしない
+    if (!(await applyConnectionContext(tab.connection))) {
+      return;
+    }
+  }
+  activeEditorTabId = id;
+  lastActiveTabByConnection.set(tab.connection, id);
 };
 
 // アクティブスキーマ (database) を切り替える。成功したら true。
 const changeActiveSchema = async (schema: string): Promise<boolean> => {
-  if (!selectedConnection || schema === activeSchema) {
+  const connection = selectedConnection;
+  if (!connection || schema === activeSchema) {
     return true;
   }
-  if (!(await flushPendingSave())) {
-    return false;
-  }
+  // 未保存タブは best-effort で保存 (失敗してもスキーマ切替は止めない)
+  await flushPendingSave();
   try {
-    await api.setActiveSchema(selectedConnection, schema);
+    await api.setActiveSchema(connection, schema);
+    // 切替中に別接続へ移っていたら、そのスキーマ表示を新接続に適用しない
+    if (selectedConnection !== connection) {
+      return false;
+    }
     activeSchema = schema;
     errorMessage = null;
     // 切替先スキーマの補完候補をバックグラウンドで取得する (待たない)
@@ -247,30 +397,108 @@ const changeActiveSchema = async (schema: string): Promise<boolean> => {
   }
 };
 
+/// ファイルを開く。既に開いているタブがあればアクティブにし、無ければ
+/// 内容を読み込んで新しいタブを作りアクティブにする (FilesPane から呼ばれる)。
 const selectFile = async (fileName: string) => {
-  if (!selectedConnection) {
+  // 読み込み先の接続を await 前に固定する。読込中に接続が切り替わっても、
+  // タブは必ず「内容を読んだ接続」に紐づける (誤った接続への実行/保存を防ぐ)。
+  const connection = selectedConnection;
+  if (!connection) {
     return;
   }
-  if (!(await flushPendingSave())) {
+  const existing = editorTabs.find(
+    (t) => t.connection === connection && t.file === fileName,
+  );
+  if (existing) {
+    await activateEditorTab(existing.id);
     return;
   }
+  // 未保存タブは best-effort で保存 (失敗してもファイルオープンは止めない)
+  await flushPendingSave();
   try {
-    editorContent = await api.readQueryFile(selectedConnection, fileName);
-    selectedFile = fileName;
-    dirty = false;
+    const content = await api.readQueryFile(connection, fileName);
+    // 読込中に別接続へ切り替わっていたら、この読込結果は捨てる
+    // (ユーザーはもうその接続を見ていないので、開かない)
+    if (selectedConnection !== connection) {
+      return;
+    }
+    const tab: EditorTab = {
+      id: nextEditorTabId++,
+      connection,
+      file: fileName,
+      content,
+      dirty: false,
+    };
+    editorTabs = [...editorTabs, tab];
+    activeEditorTabId = tab.id;
+    lastActiveTabByConnection.set(connection, tab.id);
     errorMessage = null;
   } catch (e) {
     errorMessage = toErrorMessage(e);
   }
 };
 
+/// エディタタブを閉じる。未保存なら閉じる前に保存する (best-effort)。
+/// アクティブタブを閉じたら右隣 (無ければ左隣) をアクティブにする。
+const removeEditorTab = async (id: number, save: boolean) => {
+  const tab = editorTabs.find((t) => t.id === id);
+  if (!tab) {
+    return;
+  }
+  // このタブの自動保存予約が残っていれば解除する (閉じた後に走らせない)
+  if (autoSavePendingTabId === id) {
+    if (autoSaveTimer) {
+      clearTimeout(autoSaveTimer);
+      autoSaveTimer = null;
+    }
+    autoSavePendingTabId = null;
+  }
+  if (save && tab.dirty) {
+    // 保存に失敗したら閉じない (未保存内容をメモリごと失わないため)
+    if (!(await saveEditorTab(tab))) {
+      return;
+    }
+    // 保存 await の間にさらに編集された場合、saveEditorTab は dirty を残す。
+    // その編集を失わないよう close を中断する (自動保存タイマーが後で確定させる)
+    if (tab.dirty) {
+      return;
+    }
+  }
+  // 保存 await 中に配列が変わっている可能性があるため、位置は取り直す
+  const index = editorTabs.findIndex((t) => t.id === id);
+  if (index < 0) {
+    return;
+  }
+  editorTabs = editorTabs.filter((t) => t.id !== id);
+  if (lastActiveTabByConnection.get(tab.connection) === id) {
+    lastActiveTabByConnection.delete(tab.connection);
+  }
+  if (activeEditorTabId === id) {
+    // filter 後、元 index の位置には右隣タブが繰り上がっている
+    const neighbor = editorTabs[index] ?? editorTabs[index - 1] ?? null;
+    activeEditorTabId = null;
+    if (neighbor) {
+      await activateEditorTab(neighbor.id);
+    }
+  }
+};
+
+const closeEditorTab = (id: number) => {
+  void removeEditorTab(id, true);
+};
+
 const createFile = async (fileName: string) => {
-  if (!selectedConnection) {
+  const connection = selectedConnection;
+  if (!connection) {
     return;
   }
   try {
-    const normalized = await api.createQueryFile(selectedConnection, fileName);
-    files = await api.listQueryFiles(selectedConnection);
+    const normalized = await api.createQueryFile(connection, fileName);
+    // 作成中に別接続へ切り替わっていたら、新接続の一覧を汚さず開かない
+    if (selectedConnection !== connection) {
+      return;
+    }
+    files = await api.listQueryFiles(connection);
     await selectFile(normalized);
   } catch (e) {
     errorMessage = toErrorMessage(e);
@@ -278,16 +506,22 @@ const createFile = async (fileName: string) => {
 };
 
 const deleteFile = async (fileName: string) => {
-  if (!selectedConnection) {
+  const connection = selectedConnection;
+  if (!connection) {
     return;
   }
   try {
-    await api.deleteQueryFile(selectedConnection, fileName);
-    files = await api.listQueryFiles(selectedConnection);
-    if (selectedFile === fileName) {
-      selectedFile = null;
-      editorContent = "";
-      dirty = false;
+    await api.deleteQueryFile(connection, fileName);
+    // 削除したファイルの開いているタブを閉じる (ファイルは消えたので保存しない)
+    const victims = editorTabs.filter(
+      (t) => t.connection === connection && t.file === fileName,
+    );
+    for (const v of victims) {
+      await removeEditorTab(v.id, false);
+    }
+    // タブを閉じる過程で接続が切り替わっていなければ一覧を更新する
+    if (selectedConnection === connection) {
+      files = await api.listQueryFiles(connection);
     }
   } catch (e) {
     errorMessage = toErrorMessage(e);
@@ -295,7 +529,7 @@ const deleteFile = async (fileName: string) => {
 };
 
 // ファイルをリネームする。成功したら正規化後の新ファイル名、失敗したら null。
-// 選択中ファイルのリネーム前に未保存内容を保存し、成功後は selectedFile を追従する。
+// 対象ファイルを開いているタブがあればリネーム前に保存し、成功後は追従する。
 const renameFile = async (
   oldName: string,
   newName: string,
@@ -306,8 +540,11 @@ const renameFile = async (
   if (!connection) {
     return null;
   }
-  // 選択中ファイルをリネームするなら未保存内容を先に確定させる
-  if (selectedFile === oldName && !(await flushPendingSave())) {
+  // 対象ファイルを開いているタブがあれば未保存内容を先に確定させる
+  const opened = editorTabs.some(
+    (t) => t.connection === connection && t.file === oldName,
+  );
+  if (opened && !(await flushPendingSave())) {
     return null;
   }
   try {
@@ -315,8 +552,11 @@ const renameFile = async (
     // リネーム中に接続が切り替わっていたら、旧接続の一覧で上書きしない
     if (selectedConnection === connection) {
       files = await api.listQueryFiles(connection);
-      if (selectedFile === oldName) {
-        selectedFile = normalized;
+    }
+    // 開いているタブのファイル名を追従させる
+    for (const t of editorTabs) {
+      if (t.connection === connection && t.file === oldName) {
+        t.file = normalized;
       }
     }
     errorMessage = null;
@@ -327,15 +567,18 @@ const renameFile = async (
   }
 };
 
-// 現在のファイルを保存する。成功したら true。
+// エディタタブの内容を保存する。成功したら true。
 // 失敗時は dirty を保持したまま errorMessage を設定する。
-const saveCurrentFile = async (): Promise<boolean> => {
-  if (!selectedConnection || !selectedFile) {
-    return true;
-  }
+const saveEditorTab = async (tab: EditorTab): Promise<boolean> => {
+  // 書き込み中にさらに編集された場合、その古い保存完了で新しい編集の dirty を
+  // 消してはならない (lost update 防止)。保存した内容を控え、完了時に内容が
+  // 変わっていない時だけ dirty を下ろす。
+  const saved = tab.content;
   try {
-    await api.writeQueryFile(selectedConnection, selectedFile, editorContent);
-    dirty = false;
+    await api.writeQueryFile(tab.connection, tab.file, saved);
+    if (tab.content === saved) {
+      tab.dirty = false;
+    }
     return true;
   } catch (e) {
     errorMessage = `Failed to save the file: ${toErrorMessage(e)}`;
@@ -343,19 +586,36 @@ const saveCurrentFile = async (): Promise<boolean> => {
   }
 };
 
-/// エディタからの変更通知。自動保存をデバウンスして予約する。
+// アクティブなエディタタブを保存する (Toolbar 等から明示保存する場合用)。
+const saveCurrentFile = async (): Promise<boolean> => {
+  const tab = getActiveEditorTab();
+  if (!tab) {
+    return true;
+  }
+  return saveEditorTab(tab);
+};
+
+/// エディタからの変更通知。アクティブタブの内容を更新し、自動保存を
+/// デバウンスして予約する。予約は編集中のタブを対象にする。
 const updateEditorContent = (content: string) => {
-  if (content === editorContent) {
+  const tab = getActiveEditorTab();
+  if (!tab || content === tab.content) {
     return;
   }
-  editorContent = content;
-  dirty = true;
+  tab.content = content;
+  tab.dirty = true;
+  autoSavePendingTabId = tab.id;
   if (autoSaveTimer) {
     clearTimeout(autoSaveTimer);
   }
   autoSaveTimer = setTimeout(() => {
     autoSaveTimer = null;
-    void saveCurrentFile();
+    const id = autoSavePendingTabId;
+    autoSavePendingTabId = null;
+    const target = editorTabs.find((t) => t.id === id);
+    if (target && target.dirty) {
+      void saveEditorTab(target);
+    }
   }, AUTO_SAVE_DELAY_MS);
 };
 
@@ -368,11 +628,12 @@ const insertSqlSnippet = (sql: string): boolean => {
     toast.warning("Select a connection first");
     return false;
   }
-  if (!selectedFile) {
+  const tab = getActiveEditorTab();
+  if (!tab) {
     toast.warning("Select or create a query file first");
     return false;
   }
-  const trimmed = editorContent.replace(/\s+$/, "");
+  const trimmed = tab.content.replace(/\s+$/, "");
   updateEditorContent(trimmed ? `${trimmed}\n\n${sql}\n` : `${sql}\n`);
   return true;
 };
@@ -385,7 +646,7 @@ const generateSql = async (instruction: string): Promise<boolean> => {
     toast.warning("Select a connection first");
     return false;
   }
-  if (!selectedFile) {
+  if (!getActiveEditorTab()) {
     toast.warning("Select or create a query file first");
     return false;
   }
@@ -648,8 +909,12 @@ const confirmIfDangerous = async (
 };
 
 const runQuery = async (sql: string) => {
+  // 実行先の接続を await 前に固定する。以降の await (保存・危険文の確認モーダル) の
+  // 間に接続が切り替わっても、確認した接続と実行する接続が食い違わないようにする
+  // (旧 SQL を新 DB で実行してしまう事故を防ぐ)。
+  const connection = selectedConnection;
   // 実行前ガードの通知は、既存の結果タブを覆わないよう toast で出す
-  if (!selectedConnection) {
+  if (!connection) {
     toast.warning("Select a connection first");
     return;
   }
@@ -658,18 +923,21 @@ const runQuery = async (sql: string) => {
     return;
   }
   // 同一接続の並列実行を抑止する (別タブで実行中でも拒否)
-  if (isConnectionRunning(selectedConnection)) {
+  if (isConnectionRunning(connection)) {
     toast.warning(
       "A query is already running on this connection. Cancel it or wait for it to finish.",
     );
     return;
   }
-  if (!(await flushPendingSave())) {
-    return;
-  }
+  // 未保存タブは best-effort で保存 (失敗しても実行は止めない。SQL はメモリ上の値)
+  await flushPendingSave();
   // 危険な文 (WHERE 無し UPDATE/DELETE、DROP/TRUNCATE) は、実行を許可した
   // 接続でも実行前に確認する。キャンセルされたら何もしない
-  if (!(await confirmIfDangerous(selectedConnection, sql))) {
+  if (!(await confirmIfDangerous(connection, sql))) {
+    return;
+  }
+  // 確認モーダルの間に接続が切り替わっていたら、別 DB で実行しないよう中止する
+  if (selectedConnection !== connection) {
     return;
   }
   errorMessage = null;
@@ -678,7 +946,7 @@ const runQuery = async (sql: string) => {
     return;
   }
   tab.sql = sql;
-  tab.connection = selectedConnection;
+  tab.connection = connection;
   tab.schema = activeSchema;
   await executeTab(tab);
 };
@@ -860,11 +1128,20 @@ export default {
   get files() {
     return files;
   },
-  get selectedFile() {
-    return selectedFile;
+  /// 開いているエディタタブ (全接続横断・多段表示)
+  get editorTabs() {
+    return editorTabs;
   },
+  get activeEditorTabId() {
+    return activeEditorTabId;
+  },
+  /// アクティブなエディタタブのファイル名 (無ければ null)
+  get selectedFile() {
+    return getActiveEditorTab()?.file ?? null;
+  },
+  /// アクティブなエディタタブの内容 (無ければ空文字)
   get editorContent() {
-    return editorContent;
+    return getActiveEditorTab()?.content ?? "";
   },
   get resultTabs() {
     return resultTabs;
@@ -886,8 +1163,9 @@ export default {
   get loadingConnections() {
     return loadingConnections;
   },
+  /// アクティブなエディタタブに未保存の編集があるか
   get dirty() {
-    return dirty;
+    return getActiveEditorTab()?.dirty ?? false;
   },
   get schemas() {
     return schemas;
@@ -938,6 +1216,8 @@ export default {
   selectConnection,
   changeActiveSchema,
   selectFile,
+  activateEditorTab,
+  closeEditorTab,
   createFile,
   deleteFile,
   renameFile,
