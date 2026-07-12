@@ -429,9 +429,10 @@ pub(crate) async fn run_query(
     max_rows: usize,
     auto_limit: Option<u64>,
     readonly: bool,
+    allow_dangerous: bool,
 ) -> Result<QueryResult, AppError> {
     let mut conn = DbConnection::acquire(pool).await?;
-    run_query_on(&mut conn, sql, max_rows, auto_limit, readonly).await
+    run_query_on(&mut conn, sql, max_rows, auto_limit, readonly, allow_dangerous).await
 }
 
 /// SQL を実行して結果を返す (キャンセル対応版)。
@@ -442,6 +443,8 @@ pub(crate) async fn run_query(
 /// AppError::Cancelled を返す。キャンセルはサーバー側の文の停止のみで
 /// 接続は切断しないため、コネクションは健全なままプールへ戻り、
 /// 同じ接続で次のクエリを正常に実行できる。
+// readonly / allow_dangerous は独立した実行ガードなので個別引数のまま渡す
+#[allow(clippy::too_many_arguments)]
 pub async fn run_query_cancellable(
     pool: &DbPool,
     registry: &CancelRegistry,
@@ -450,6 +453,7 @@ pub async fn run_query_cancellable(
     max_rows: usize,
     auto_limit: Option<u64>,
     readonly: bool,
+    allow_dangerous: bool,
 ) -> Result<QueryResult, AppError> {
     let mut conn = DbConnection::acquire(pool).await?;
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -495,7 +499,8 @@ pub async fn run_query_cancellable(
     };
 
     let guard = registry.register(connection_name, target, cancelled);
-    let result = run_query_on(&mut conn, sql, max_rows, auto_limit, readonly).await;
+    let result =
+        run_query_on(&mut conn, sql, max_rows, auto_limit, readonly, allow_dangerous).await;
     let was_cancelled = guard.was_cancelled();
     drop(guard);
 
@@ -525,6 +530,7 @@ async fn run_query_on(
     max_rows: usize,
     auto_limit: Option<u64>,
     readonly: bool,
+    allow_dangerous: bool,
 ) -> Result<QueryResult, AppError> {
     let engine = conn.engine();
     // psql 風メタコマンド (\l, \dt など) はカタログ照会 SQL に変換して実行する
@@ -544,6 +550,18 @@ async fn run_query_on(
              Statement was not executed."
                 .into(),
         ));
+    }
+
+    // 危険な文 (WHERE 無しの UPDATE / DELETE、DROP / TRUNCATE) は、
+    // allow_dangerous_statements を有効にした接続でのみ実行を許す。
+    // 誤操作による全行破壊・テーブル消失を防ぐ事故防止ガード。
+    if !allow_dangerous {
+        if let Some(reason) = dangerous_reason(sql, engine) {
+            return Err(AppError::Dangerous(format!(
+                "{reason} Set \"allow_dangerous_statements: true\" for this connection \
+                 in config to run it. Statement was not executed."
+            )));
+        }
     }
 
     // LIMIT 未指定の SELECT にはデフォルトの LIMIT を付与する
@@ -944,6 +962,48 @@ fn is_readonly_allowed(sql: &str, engine: Engine) -> bool {
     }
 }
 
+/// 誤操作で全行破壊・テーブル消失を招く危険な文かを判定し、危険なら
+/// 理由 (フロントに表示する英語メッセージ) を返す。
+/// allow_dangerous_statements が無効な接続でこれらの文を拒否する事故防止ガード。
+///
+/// 判定は is_readonly_allowed と同じく、文字列リテラル・コメントを scan_sql で
+/// 除去した cleaned に対する単語境界判定で行う (リテラル内の where 等には反応
+/// しない)。
+/// - UPDATE / DELETE: where の単語が無ければ「全行対象」とみなし危険とする
+/// - TRUNCATE: 常に危険 (全行削除)
+/// - DROP: 常に危険 (オブジェクトの永久削除)
+///
+/// 弱点: サブクエリ内にだけ where がある UPDATE/DELETE は「WHERE あり」と誤認
+/// して見逃す (安全側=許可側に倒れる) ため完全ではない。あくまで代表的な
+/// 事故パターンを止めるガードで、防ぎ切るものではない。
+pub(crate) fn dangerous_reason(sql: &str, engine: Engine) -> Option<&'static str> {
+    let cleaned = scan_sql(sql, engine).cleaned;
+    let has_word = |target: &str| {
+        cleaned
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .any(|word| word == target)
+    };
+    match leading_keyword(sql).as_str() {
+        "update" if !has_word("where") => {
+            Some("UPDATE without a WHERE clause would modify every row.")
+        }
+        "delete" if !has_word("where") => {
+            Some("DELETE without a WHERE clause would remove every row.")
+        }
+        "truncate" => Some("TRUNCATE would remove every row from the table."),
+        "drop" => Some("DROP would permanently destroy a database object."),
+        _ => None,
+    }
+}
+
+/// フロントエンドの実行前確認ダイアログ用ラッパー。危険な文なら理由を返す。
+/// 実行はしない。allow_dangerous_statements が有効な接続で、実行前に
+/// ユーザーへ確認を出すかどうかの判断に使う。
+pub fn dangerous_statement_reason(engine: &str, sql: &str) -> Result<Option<String>, AppError> {
+    let engine = parse_engine(engine)?;
+    Ok(dangerous_reason(sql, engine).map(|s| s.to_string()))
+}
+
 /// 行を返す文かどうかを先頭キーワードで判定する。
 fn is_fetch_statement(sql: &str) -> bool {
     matches!(
@@ -1285,6 +1345,114 @@ mod tests {
     }
 
     #[test]
+    fn test_dangerous_reason() {
+        let d = |s: &str| dangerous_reason(s, Engine::Sqlite).is_some();
+        // WHERE 無しの UPDATE / DELETE は危険
+        assert!(d("UPDATE t SET a = 1"));
+        assert!(d("DELETE FROM t"));
+        assert!(d("delete from t"));
+        // WHERE ありは安全
+        assert!(!d("UPDATE t SET a = 1 WHERE id = 1"));
+        assert!(!d("DELETE FROM t WHERE id = 1"));
+        // 先頭コメントを挟んでも先頭キーワードで判定する
+        assert!(d("-- oops\nUPDATE t SET a = 1"));
+        assert!(!d("/* c */ DELETE FROM t WHERE id = 1"));
+        // DROP / TRUNCATE は常に危険
+        assert!(d("DROP TABLE t"));
+        assert!(d("TRUNCATE TABLE t"));
+        assert!(dangerous_reason("TRUNCATE t", Engine::Postgres).is_some());
+        // 読み取り系・INSERT・DDL の他の文は対象外
+        assert!(!d("SELECT * FROM t"));
+        assert!(!d("INSERT INTO t VALUES (1)"));
+        assert!(!d("CREATE TABLE t (id INTEGER)"));
+        assert!(!d("ALTER TABLE t ADD COLUMN x TEXT"));
+        // リテラル・カラム名の where や drop には反応しない (単語境界 / リテラル除去)
+        assert!(d("UPDATE t SET note = 'where is it'"));
+        assert!(!d("UPDATE t SET a = 1 WHERE label = 'drop'"));
+        // 弱点の明示: サブクエリ内 where だけの全行 UPDATE は見逃す (許可側に倒れる)
+        assert!(!d("UPDATE t SET a = (SELECT max(b) FROM u WHERE u.id = 1)"));
+
+        // 公開ラッパー: 不明なエンジンはエラー
+        assert!(dangerous_statement_reason("mysql", "DROP TABLE t")
+            .unwrap()
+            .is_some());
+        assert!(dangerous_statement_reason("mysql", "SELECT 1")
+            .unwrap()
+            .is_none());
+        assert!(dangerous_statement_reason("bogus", "DROP TABLE t").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_run_query_sqlite_dangerous_guard() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().in_memory(true))
+            .await
+            .unwrap();
+        let pool = DbPool::Sqlite(pool);
+
+        // 準備 (allow_dangerous=true で自由に書き込み)
+        run_query(
+            &pool,
+            "CREATE TABLE t (id INTEGER, name TEXT)",
+            10,
+            None,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+        run_query(
+            &pool,
+            "INSERT INTO t VALUES (1, 'alice'), (2, 'bob')",
+            10,
+            None,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+
+        // allow_dangerous=false: 危険な文は拒否され、データは無傷
+        for sql in ["UPDATE t SET name = 'x'", "DELETE FROM t", "DROP TABLE t"] {
+            let err = run_query(&pool, sql, 10, None, false, false)
+                .await
+                .unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("allow_dangerous_statements")
+                    && message.contains("not executed"),
+                "unexpected error for {sql}: {message}"
+            );
+        }
+        let result = run_query(&pool, "SELECT count(*) FROM t", 10, None, false, false)
+            .await
+            .unwrap();
+        assert_eq!(result.rows[0][0], serde_json::json!(2));
+
+        // WHERE ありの UPDATE / DELETE は allow_dangerous=false でも実行できる
+        run_query(
+            &pool,
+            "UPDATE t SET name = 'x' WHERE id = 1",
+            10,
+            None,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // allow_dangerous=true なら危険な文も実行できる
+        run_query(&pool, "DELETE FROM t", 10, None, false, true)
+            .await
+            .unwrap();
+        let result = run_query(&pool, "SELECT count(*) FROM t", 10, None, false, false)
+            .await
+            .unwrap();
+        assert_eq!(result.rows[0][0], serde_json::json!(0));
+    }
+
+    #[test]
     fn test_build_explain_sql() {
         // エンジン別のプレフィックス
         assert_eq!(
@@ -1488,6 +1656,7 @@ mod tests {
             10,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -1499,12 +1668,13 @@ mod tests {
             10,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
         assert_eq!(result.affected_rows, Some(2));
 
-        let result = run_query(&pool, "SELECT * FROM t ORDER BY id", 10, None, false)
+        let result = run_query(&pool, "SELECT * FROM t ORDER BY id", 10, None, false, false)
             .await
             .unwrap();
         assert_eq!(result.columns, vec!["id", "name", "score"]);
@@ -1516,14 +1686,14 @@ mod tests {
         assert!(!result.truncated);
 
         // max_rows での切り詰め
-        let result = run_query(&pool, "SELECT * FROM t ORDER BY id", 1, None, false)
+        let result = run_query(&pool, "SELECT * FROM t ORDER BY id", 1, None, false, false)
             .await
             .unwrap();
         assert_eq!(result.row_count, 1);
         assert!(result.truncated);
 
         // 0 行の SELECT でも列ヘッダが返る (describe による補完)
-        let result = run_query(&pool, "SELECT * FROM t WHERE id = -1", 10, None, false)
+        let result = run_query(&pool, "SELECT * FROM t WHERE id = -1", 10, None, false, false)
             .await
             .unwrap();
         assert_eq!(result.row_count, 0);
@@ -1536,6 +1706,7 @@ mod tests {
             10,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -1543,11 +1714,11 @@ mod tests {
         assert_eq!(result.rows[0][1], serde_json::json!("dave"));
 
         // psql 風メタコマンドが変換されて実行される
-        let result = run_query(&pool, "\\dt", 10, None, false).await.unwrap();
+        let result = run_query(&pool, "\\dt", 10, None, false, false).await.unwrap();
         assert_eq!(result.row_count, 1);
         assert_eq!(result.rows[0][0], serde_json::json!("t"));
 
-        let result = run_query(&pool, "\\d t", 10, None, false).await.unwrap();
+        let result = run_query(&pool, "\\d t", 10, None, false, false).await.unwrap();
         // PRAGMA table_info は name カラム (index 1) にカラム名を返す
         let column_names: Vec<&str> = result
             .rows
@@ -1557,24 +1728,24 @@ mod tests {
         assert_eq!(column_names, vec!["id", "name", "score"]);
 
         // 未対応メタコマンドはエラー
-        assert!(run_query(&pool, "\\du", 10, None, false).await.is_err());
+        assert!(run_query(&pool, "\\du", 10, None, false, false).await.is_err());
 
         // 自動 LIMIT: LIMIT 未指定の SELECT に付与される (末尾 ; も処理)
-        let result = run_query(&pool, "SELECT * FROM t ORDER BY id;", 10, Some(2), false)
+        let result = run_query(&pool, "SELECT * FROM t ORDER BY id;", 10, Some(2), false, false)
             .await
             .unwrap();
         assert_eq!(result.row_count, 2);
         assert_eq!(result.applied_limit, Some(2));
 
         // 既に LIMIT がある場合は付与しない
-        let result = run_query(&pool, "SELECT * FROM t LIMIT 1", 10, Some(2), false)
+        let result = run_query(&pool, "SELECT * FROM t LIMIT 1", 10, Some(2), false, false)
             .await
             .unwrap();
         assert_eq!(result.row_count, 1);
         assert_eq!(result.applied_limit, None);
 
         // メタコマンドには適用しない
-        let result = run_query(&pool, "\\dt", 10, Some(2), false).await.unwrap();
+        let result = run_query(&pool, "\\dt", 10, Some(2), false, false).await.unwrap();
         assert_eq!(result.applied_limit, None);
 
         // 末尾コメント付きでも LIMIT がコメントに飲み込まれない
@@ -1584,6 +1755,7 @@ mod tests {
             10,
             Some(2),
             false,
+            false,
         )
         .await
         .unwrap();
@@ -1591,7 +1763,7 @@ mod tests {
         assert_eq!(result.applied_limit, Some(2));
 
         // VALUES は自動 LIMIT の対象外 (SQLite では VALUES ... LIMIT が構文エラー)
-        let result = run_query(&pool, "VALUES (1), (2), (3)", 10, Some(2), false)
+        let result = run_query(&pool, "VALUES (1), (2), (3)", 10, Some(2), false, false)
             .await
             .unwrap();
         assert_eq!(result.row_count, 3);
@@ -1600,7 +1772,7 @@ mod tests {
         // build_explain_sql で組み立てた EXPLAIN QUERY PLAN が実行できる
         // (readonly 接続でも許可される)
         let explain_sql = build_explain_sql("sqlite", "SELECT * FROM t ORDER BY id").unwrap();
-        let result = run_query(&pool, &explain_sql, 10, Some(2), true)
+        let result = run_query(&pool, &explain_sql, 10, Some(2), true, false)
             .await
             .unwrap();
         assert!(result.row_count >= 1);
@@ -1695,6 +1867,7 @@ mod tests {
                 10,
                 None,
                 false,
+                false,
             )
             .await
         });
@@ -1722,7 +1895,7 @@ mod tests {
         // 同じ接続 (max_connections=1 なので同一コネクション) で
         // 次のクエリが正常に実行できる = プールの接続が壊れていない
         let result =
-            run_query_cancellable(&pool, &registry, "test-conn", "SELECT 1", 10, None, false)
+            run_query_cancellable(&pool, &registry, "test-conn", "SELECT 1", 10, None, false, false)
                 .await
                 .unwrap();
         assert_eq!(result.row_count, 1);
@@ -1736,7 +1909,7 @@ mod tests {
 
         // 完了済みのクエリ (登録解除済み) へのキャンセルは no-op
         let result =
-            run_query_cancellable(&pool, &registry, "test-conn", "SELECT 1", 10, None, false)
+            run_query_cancellable(&pool, &registry, "test-conn", "SELECT 1", 10, None, false, false)
                 .await
                 .unwrap();
         assert_eq!(result.row_count, 1);
@@ -1744,7 +1917,7 @@ mod tests {
 
         // その後のクエリも正常に実行できる
         let result =
-            run_query_cancellable(&pool, &registry, "test-conn", "SELECT 2", 10, None, false)
+            run_query_cancellable(&pool, &registry, "test-conn", "SELECT 2", 10, None, false, false)
                 .await
                 .unwrap();
         assert_eq!(result.rows[0][0], serde_json::json!(2));
@@ -1763,6 +1936,7 @@ mod tests {
             "SELECT * FROM no_such_table",
             10,
             None,
+            false,
             false,
         )
         .await;
@@ -1784,15 +1958,15 @@ mod tests {
         let pool = DbPool::Sqlite(pool);
 
         // 準備 (readonly=false で書き込み)
-        run_query(&pool, "CREATE TABLE t (id INTEGER, name TEXT)", 10, None, false)
+        run_query(&pool, "CREATE TABLE t (id INTEGER, name TEXT)", 10, None, false, false)
             .await
             .unwrap();
-        run_query(&pool, "INSERT INTO t VALUES (1, 'alice')", 10, None, false)
+        run_query(&pool, "INSERT INTO t VALUES (1, 'alice')", 10, None, false, false)
             .await
             .unwrap();
 
         // 読み取り系の文は readonly でも実行できる
-        let result = run_query(&pool, "SELECT * FROM t", 10, None, true)
+        let result = run_query(&pool, "SELECT * FROM t", 10, None, true, false)
             .await
             .unwrap();
         assert_eq!(result.row_count, 1);
@@ -1803,21 +1977,22 @@ mod tests {
             10,
             None,
             true,
+            false,
         )
         .await
         .unwrap();
         assert_eq!(result.row_count, 1);
 
         // EXPLAIN / PRAGMA も許可される
-        assert!(run_query(&pool, "EXPLAIN SELECT * FROM t", 10, None, true)
+        assert!(run_query(&pool, "EXPLAIN SELECT * FROM t", 10, None, true, false)
             .await
             .is_ok());
-        assert!(run_query(&pool, "PRAGMA table_info(t)", 10, None, true)
+        assert!(run_query(&pool, "PRAGMA table_info(t)", 10, None, true, false)
             .await
             .is_ok());
 
         // メタコマンドは読み取り系のカタログ照会のみなので許可される
-        let result = run_query(&pool, "\\dt", 10, None, true).await.unwrap();
+        let result = run_query(&pool, "\\dt", 10, None, true, false).await.unwrap();
         assert_eq!(result.rows[0][0], serde_json::json!("t"));
 
         // 書き込み系の文は拒否される (エラーメッセージに readonly を明記)
@@ -1836,7 +2011,7 @@ mod tests {
             "WITH x AS (SELECT id FROM t) DELETE FROM t WHERE id IN (SELECT id FROM x)",
             "WITH x AS (SELECT 9) INSERT INTO t SELECT 9, 'eve' FROM x",
         ] {
-            let err = run_query(&pool, sql, 10, None, true).await.unwrap_err();
+            let err = run_query(&pool, sql, 10, None, true, false).await.unwrap_err();
             let message = err.to_string();
             assert!(
                 message.contains("read-only") && message.contains("readonly: true"),
@@ -1845,7 +2020,7 @@ mod tests {
         }
 
         // 拒否された文は実行されておらず、データは無傷
-        let result = run_query(&pool, "SELECT id, name FROM t", 10, None, true)
+        let result = run_query(&pool, "SELECT id, name FROM t", 10, None, true, false)
             .await
             .unwrap();
         assert_eq!(result.row_count, 1);

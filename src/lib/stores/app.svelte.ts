@@ -63,6 +63,12 @@ let aiExplaining = $state(false);
 let aiExplanation = $state<string | null>(null);
 /// SQL 補完用のテーブル名 → カラム名リストのマップ (未取得・取得失敗は null)
 let schemaMap = $state<Record<string, string[]> | null>(null);
+/// 危険な文 (allow_dangerous_statements 有効な接続) の実行前確認ダイアログ。
+/// 非 null の間モーダルを表示し、ユーザーの応答を resolve へ渡す
+let dangerousConfirm = $state<{
+  reason: string;
+  resolve: (ok: boolean) => void;
+} | null>(null);
 
 // タブ ID の連番 (セッション内で一意なら十分なので永続化しない)
 let nextTabId = 1;
@@ -594,6 +600,53 @@ const cancelQuery = async (id: number) => {
   }
 };
 
+/// 危険な文の実行確認を求め、ユーザーの応答 (true=実行) を待つ。
+/// 直前の未応答の確認が残っていれば却下してから差し替える
+const requestDangerousConfirm = (reason: string): Promise<boolean> =>
+  new Promise((resolve) => {
+    if (dangerousConfirm) {
+      dangerousConfirm.resolve(false);
+    }
+    dangerousConfirm = { reason, resolve };
+  });
+
+/// 確認ダイアログの応答 (モーダルから呼ぶ)。ok=true で実行を続行する
+const resolveDangerousConfirm = (ok: boolean) => {
+  if (!dangerousConfirm) {
+    return;
+  }
+  const { resolve } = dangerousConfirm;
+  dangerousConfirm = null;
+  resolve(ok);
+};
+
+/// allow_dangerous_statements が有効な接続で、危険な文なら実行前に確認を出す。
+/// 実行してよければ true、キャンセルなら false を返す。
+/// 無効な接続では常に true を返し (バックエンドの run_query が拒否する)、
+/// 危険判定の呼び出し失敗時も true を返して実行に委ねる (allow が意図のため)。
+const confirmIfDangerous = async (
+  connection: string,
+  sql: string,
+): Promise<boolean> => {
+  const info = connections.find((c) => c.name === connection);
+  if (!info?.allow_dangerous_statements) {
+    return true;
+  }
+  let reason: string | null = null;
+  try {
+    reason = await api.checkDangerousStatement(connection, sql);
+  } catch (e) {
+    // 判定に失敗しても実行に委ねる (allow が意図)。ただし本当のバグを
+    // 握り潰さないよう、失敗自体はコンソールに残す
+    console.warn("checkDangerousStatement failed; running without confirm", e);
+    return true;
+  }
+  if (!reason) {
+    return true;
+  }
+  return await requestDangerousConfirm(reason);
+};
+
 const runQuery = async (sql: string) => {
   // 実行前ガードの通知は、既存の結果タブを覆わないよう toast で出す
   if (!selectedConnection) {
@@ -612,6 +665,11 @@ const runQuery = async (sql: string) => {
     return;
   }
   if (!(await flushPendingSave())) {
+    return;
+  }
+  // 危険な文 (WHERE 無し UPDATE/DELETE、DROP/TRUNCATE) は、実行を許可した
+  // 接続でも実行前に確認する。キャンセルされたら何もしない
+  if (!(await confirmIfDangerous(selectedConnection, sql))) {
     return;
   }
   errorMessage = null;
@@ -745,6 +803,10 @@ const rerunTab = async (id: number) => {
     );
     return;
   }
+  // 再実行でも危険な文は確認する (通常実行と同じガード)
+  if (!(await confirmIfDangerous(tab.connection, tab.sql))) {
+    return;
+  }
   errorMessage = null;
   // 接続のアクティブスキーマは実行時点から変わっている可能性があるため、
   // 表示が実際の実行先とずれないよう再取得する (失敗しても実行は続ける)
@@ -860,6 +922,14 @@ export default {
   get schemaMap() {
     return schemaMap;
   },
+  /// 危険な文の実行確認ダイアログに表示する理由 (非表示中は null)
+  get dangerousConfirmReason() {
+    return dangerousConfirm?.reason ?? null;
+  },
+  /// 確認ダイアログで「実行する」を選んだ
+  confirmDangerous: () => resolveDangerousConfirm(true),
+  /// 確認ダイアログで「キャンセル」を選んだ
+  cancelDangerous: () => resolveDangerousConfirm(false),
   loadConnections,
   loadAiInfo,
   generateSql,

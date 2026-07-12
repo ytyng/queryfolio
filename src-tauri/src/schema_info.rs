@@ -437,7 +437,7 @@ mod tests {
             "CREATE TABLE orders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER)",
             "CREATE VIEW user_names AS SELECT name FROM users",
         ] {
-            crate::db::run_query(&pool, sql, 10, None, false)
+            crate::db::run_query(&pool, sql, 10, None, false, false)
                 .await
                 .unwrap();
         }

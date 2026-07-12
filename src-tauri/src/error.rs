@@ -20,6 +20,11 @@ pub enum AppError {
     #[error("{0}")]
     Readonly(String),
 
+    /// 危険な文 (WHERE 無しの UPDATE / DELETE、DROP / TRUNCATE 等) が
+    /// allow_dangerous_statements を有効にしていない接続で実行されようとした
+    #[error("{0}")]
+    Dangerous(String),
+
     /// AI 機能のエラー (設定不備・API 呼び出し失敗)
     #[error("AI error: {0}")]
     Ai(String),
