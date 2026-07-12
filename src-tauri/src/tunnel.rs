@@ -367,49 +367,59 @@ fn ssh_config_identity_agent_at(
     host: &str,
     home: &Path,
 ) -> Option<AgentSocket> {
-    // Include を展開して 1 本の行リストにしてから走査する。こうすることで
-    // Host ブロック内の Include も、その Host のマッチ条件が引き継がれる
-    // (OpenSSH は Include をその場に展開したかのように扱う)。
-    let mut lines = Vec::new();
+    let mut result = None;
     let mut depth = 0;
-    collect_ssh_config_lines(config_path, home, &mut lines, &mut depth);
-
-    let mut block_matches = true; // Host/Match の外 (冒頭) は全ホストに適用される
-    for line in &lines {
-        let (keyword, rest) = split_ssh_config_line(line);
-        match keyword.to_ascii_lowercase().as_str() {
-            "host" => block_matches = host_patterns_match(rest, host),
-            // Match ブロックは未対応。誤判定を避けるためブロックごと無視する。
-            "match" => block_matches = false,
-            "identityagent" if block_matches => {
-                return Some(parse_agent_socket_value(unquote(rest), home));
-            }
-            _ => {}
-        }
-    }
-    None
+    parse_ssh_config_file(config_path, host, home, &mut result, &mut depth);
+    result
 }
 
-/// ssh_config を読み、`Include` をその場に展開しながら有効行 (コメント/空行を除く) を
-/// `out` に平坦化して集める。Include の循環を depth 上限で防ぐ。
-fn collect_ssh_config_lines(path: &Path, home: &Path, out: &mut Vec<String>, depth: &mut u32) {
-    if *depth > 16 {
+/// ssh_config を 1 ファイル解析し、最初にマッチした IdentityAgent を `result` に書き込む。
+///
+/// OpenSSH のセマンティクス (`ssh -G` で確認) に忠実に:
+/// - Host/Match ブロックの外 (冒頭) の設定は全ホストに適用される。
+/// - `Include` は **enclosing block がマッチする時だけ** 展開する。マッチしない
+///   Host ブロック内の Include は、たとえ include 先が自前の `Host *` を持っていても
+///   適用しない (Case A で確認)。
+/// - include 先の Host コンテキストは return 後の親には波及しない (再帰の局所変数で自然に実現)。
+/// - Match ブロックは未対応で、その中の設定は無視する。
+fn parse_ssh_config_file(
+    path: &Path,
+    host: &str,
+    home: &Path,
+    result: &mut Option<AgentSocket>,
+    depth: &mut u32,
+) {
+    if result.is_some() || *depth > 16 {
         return;
     }
     *depth += 1;
     if let Ok(content) = std::fs::read_to_string(path) {
+        let mut block_matches = true;
         for raw_line in content.lines() {
+            if result.is_some() {
+                break;
+            }
             let line = strip_inline_comment(raw_line.trim());
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
             let (keyword, rest) = split_ssh_config_line(line);
-            if keyword.eq_ignore_ascii_case("include") {
-                for inc in expand_include_paths(rest, home) {
-                    collect_ssh_config_lines(&inc, home, out, depth);
+            match keyword.to_ascii_lowercase().as_str() {
+                "host" => block_matches = host_patterns_match(rest, host),
+                // Match ブロックは未対応。誤判定を避けるためブロックごと無視する。
+                "match" => block_matches = false,
+                "include" if block_matches => {
+                    for inc in expand_include_paths(rest, home) {
+                        parse_ssh_config_file(&inc, host, home, result, depth);
+                        if result.is_some() {
+                            break;
+                        }
+                    }
                 }
-            } else {
-                out.push(line.to_string());
+                "identityagent" if block_matches => {
+                    *result = Some(parse_agent_socket_value(unquote(rest), home));
+                }
+                _ => {}
             }
         }
     }
@@ -844,6 +854,30 @@ mod tests {
             resolve(&body, "prod", home),
             Some(AgentSocket::Disabled)
         ));
+        let _ = std::fs::remove_file(&inc);
+    }
+
+    #[test]
+    fn include_in_nonmatching_block_is_not_expanded_even_with_own_host() {
+        // Include が非マッチ Host ブロック内にある場合、include 先が自前の `Host *` を
+        // 持っていても展開してはならない (OpenSSH の実挙動、ssh -G Case A で確認)。
+        let home = Path::new("/home/u");
+        let inc = unique_temp("ssh_inc_own_host");
+        std::fs::write(&inc, "Host *\n  IdentityAgent ~/from-include.sock\n").unwrap();
+        let body = format!(
+            "Host prod\n  Include {}\nHost *\n  IdentityAgent ~/main-star.sock\n",
+            inc.display()
+        );
+        // dev は Host prod 非マッチ → include を無視し main の Host * を得る。
+        match resolve(&body, "dev", home) {
+            Some(AgentSocket::Path(p)) => assert_eq!(p, PathBuf::from("/home/u/main-star.sock")),
+            other => panic!("expected main-star, resolved={}", other.is_some()),
+        }
+        // prod は Host prod マッチ → include を展開しその Host * が勝つ。
+        match resolve(&body, "prod", home) {
+            Some(AgentSocket::Path(p)) => assert_eq!(p, PathBuf::from("/home/u/from-include.sock")),
+            other => panic!("expected from-include, resolved={}", other.is_some()),
+        }
         let _ = std::fs::remove_file(&inc);
     }
 
