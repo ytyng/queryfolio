@@ -511,6 +511,10 @@ fn unquote(value: &str) -> &str {
 
 /// IdentityAgent の値のパスを展開する:
 /// バックスラッシュエスケープ復号 → 環境変数 (`${VAR}`/`$VAR`) → `%d` (ホーム) → `~`。
+///
+/// 接続依存の percent トークン (`%h`/`%n`/`%r`/`%u`/`%l`/`%C`) は IdentityAgent の
+/// socket パスでは実質使われず、完全対応には接続コンテキスト一式が要るため、未知の
+/// `%X` はそのまま残す (best-effort)。解決不能時は呼び出し側が SSH_AUTH_SOCK に倒す。
 fn expand_ssh_path(value: &str, home: &Path) -> PathBuf {
     let decoded = decode_ssh_escapes(value);
     let mut expanded = expand_env_vars(&decoded);
