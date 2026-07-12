@@ -973,9 +973,17 @@ fn is_readonly_allowed(sql: &str, engine: Engine) -> bool {
 /// - TRUNCATE: 常に危険 (全行削除)
 /// - DROP: 常に危険 (オブジェクトの永久削除)
 ///
-/// 弱点: サブクエリ内にだけ where がある UPDATE/DELETE は「WHERE あり」と誤認
-/// して見逃す (安全側=許可側に倒れる) ため完全ではない。あくまで代表的な
-/// 事故パターンを止めるガードで、防ぎ切るものではない。
+/// 先頭キーワードだけでなく、実際に書き込みが走る次のラップ形も対象にする:
+/// - WITH ... DELETE / UPDATE (Postgres の CTE 付き DML)。先頭は with でも本体で
+///   全行 DELETE/UPDATE が走る
+/// - EXPLAIN ANALYZE / EXPLAIN (ANALYZE) ...: 対象文を実際に実行するため、
+///   中の DELETE/UPDATE/TRUNCATE/DROP も対象。ANALYZE 無しの EXPLAIN は実行を
+///   伴わないので対象外
+///
+/// 弱点: WITH の場合、無関係な CTE / 外側の SELECT にある where を「WHERE あり」と
+/// 誤認して WHERE 無し DML を見逃すことがある (where を一切含まない典型形は捕捉
+/// する)。サブクエリ内だけの where も同様。安全側=許可側に倒れるため完全ではなく、
+/// 代表的な事故パターンを止めるガードである。
 pub(crate) fn dangerous_reason(sql: &str, engine: Engine) -> Option<&'static str> {
     let cleaned = scan_sql(sql, engine).cleaned;
     let has_word = |target: &str| {
@@ -983,17 +991,33 @@ pub(crate) fn dangerous_reason(sql: &str, engine: Engine) -> Option<&'static str
             .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
             .any(|word| word == target)
     };
-    match leading_keyword(sql).as_str() {
-        "update" if !has_word("where") => {
-            Some("UPDATE without a WHERE clause would modify every row.")
-        }
-        "delete" if !has_word("where") => {
-            Some("DELETE without a WHERE clause would remove every row.")
-        }
-        "truncate" => Some("TRUNCATE would remove every row from the table."),
-        "drop" => Some("DROP would permanently destroy a database object."),
-        _ => None,
+    let kw = leading_keyword(sql);
+
+    // EXPLAIN ANALYZE / EXPLAIN (ANALYZE) は対象文を実際に実行するため、
+    // ラップされた DML も危険判定の対象にする。ANALYZE 無しの EXPLAIN は
+    // 実行を伴わないので対象外。
+    let explain_executes = kw == "explain" && has_word("analyze");
+    // 実行時に DML が走り得るラップ形 (CTE 付き DML / EXPLAIN ANALYZE)。
+    let wraps_dml = kw == "with" || explain_executes;
+
+    let is_delete = kw == "delete" || (wraps_dml && has_word("delete"));
+    let is_update = kw == "update" || (wraps_dml && has_word("update"));
+
+    if is_delete && !has_word("where") {
+        return Some("DELETE without a WHERE clause would remove every row.");
     }
+    if is_update && !has_word("where") {
+        return Some("UPDATE without a WHERE clause would modify every row.");
+    }
+    // TRUNCATE / DROP は常に破壊的。WITH には書けないので、ラップ形としては
+    // EXPLAIN ANALYZE 経由のみ考慮する。
+    if kw == "truncate" || (explain_executes && has_word("truncate")) {
+        return Some("TRUNCATE would remove every row from the table.");
+    }
+    if kw == "drop" || (explain_executes && has_word("drop")) {
+        return Some("DROP would permanently destroy a database object.");
+    }
+    None
 }
 
 /// フロントエンドの実行前確認ダイアログ用ラッパー。危険な文なら理由を返す。
@@ -1371,6 +1395,26 @@ mod tests {
         assert!(!d("UPDATE t SET a = 1 WHERE label = 'drop'"));
         // 弱点の明示: サブクエリ内 where だけの全行 UPDATE は見逃す (許可側に倒れる)
         assert!(!d("UPDATE t SET a = (SELECT max(b) FROM u WHERE u.id = 1)"));
+
+        // CTE (WITH) でラップした WHERE 無し DML も捕捉する (Postgres)
+        let p = |s: &str| dangerous_reason(s, Engine::Postgres).is_some();
+        assert!(p("WITH d AS (DELETE FROM users RETURNING *) SELECT count(*) FROM d"));
+        assert!(p("WITH x AS (SELECT 1) UPDATE t SET a = 1"));
+        // CTE 内の DML に WHERE があれば対象外 (スコープ済み)
+        assert!(!p("WITH d AS (DELETE FROM users WHERE id = 1 RETURNING *) SELECT count(*) FROM d"));
+        // 純粋な読み取り CTE は対象外
+        assert!(!p("WITH d AS (SELECT * FROM t) SELECT * FROM d"));
+        assert!(!p("WITH d AS (SELECT deleted_at FROM t) SELECT * FROM d"));
+
+        // EXPLAIN ANALYZE は対象文を実行するため、中の WHERE 無し DML を捕捉
+        assert!(p("EXPLAIN ANALYZE DELETE FROM users"));
+        assert!(p("EXPLAIN (ANALYZE) UPDATE t SET a = 1"));
+        assert!(dangerous_reason("EXPLAIN ANALYZE DELETE FROM users", Engine::MySql).is_some());
+        // ANALYZE 無しの EXPLAIN は実行しないので対象外
+        assert!(!p("EXPLAIN DELETE FROM users"));
+        assert!(!p("EXPLAIN SELECT * FROM t"));
+        // EXPLAIN ANALYZE でも中が読み取りなら対象外
+        assert!(!p("EXPLAIN ANALYZE SELECT * FROM t"));
 
         // 公開ラッパー: 不明なエンジンはエラー
         assert!(dangerous_statement_reason("mysql", "DROP TABLE t")
