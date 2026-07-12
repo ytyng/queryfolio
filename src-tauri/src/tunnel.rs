@@ -509,9 +509,11 @@ fn unquote(value: &str) -> &str {
         .unwrap_or(value)
 }
 
-/// IdentityAgent の値のパスを展開する: 環境変数 (`${VAR}`/`$VAR`)、`%d` (ホーム)、`~`。
+/// IdentityAgent の値のパスを展開する:
+/// バックスラッシュエスケープ復号 → 環境変数 (`${VAR}`/`$VAR`) → `%d` (ホーム) → `~`。
 fn expand_ssh_path(value: &str, home: &Path) -> PathBuf {
-    let mut expanded = expand_env_vars(value);
+    let decoded = decode_ssh_escapes(value);
+    let mut expanded = expand_env_vars(&decoded);
     if expanded.contains("%d") {
         expanded = expanded.replace("%d", &home.to_string_lossy());
     }
@@ -522,6 +524,28 @@ fn expand_ssh_path(value: &str, home: &Path) -> PathBuf {
         return home.to_path_buf();
     }
     PathBuf::from(expanded)
+}
+
+/// ssh_config のバックスラッシュエスケープを復号する。OpenSSH は `\ ` (空白) と
+/// `\\` (バックスラッシュ) を復号し、その他の `\X` はそのまま残す (`ssh -G` で確認)。
+fn decode_ssh_escapes(value: &str) -> String {
+    if !value.contains('\\') {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            let mut lookahead = chars.clone();
+            if let Some(next @ (' ' | '\\')) = lookahead.next() {
+                out.push(next);
+                chars = lookahead; // エスケープ対象を消費
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// `${VAR}` と `$VAR` を環境変数で展開する。未定義変数は空文字に展開する
@@ -898,6 +922,31 @@ mod tests {
         match resolve("Host *\n  IdentityAgent ~/a.sock # use this\n", "db", home) {
             Some(AgentSocket::Path(p)) => assert_eq!(p, PathBuf::from("/home/u/a.sock")),
             other => panic!("expected path, resolved={}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn decodes_backslash_escapes_like_openssh() {
+        // OpenSSH は `\ ` と `\\` のみ復号し、その他の `\X` は残す (ssh -G で確認)。
+        assert_eq!(decode_ssh_escapes("a\\ b"), "a b");
+        assert_eq!(decode_ssh_escapes("a\\\\b"), "a\\b");
+        assert_eq!(decode_ssh_escapes("plain\\tab"), "plain\\tab");
+        assert_eq!(decode_ssh_escapes("noescape"), "noescape");
+    }
+
+    #[test]
+    fn escaped_space_in_identity_agent_path() {
+        let home = Path::new("/home/u");
+        // クオートなしで空白をエスケープした 1Password 風パス。
+        match resolve(
+            "Host *\n  IdentityAgent ~/Library/Group\\ Containers/x/agent.sock\n",
+            "db",
+            home,
+        ) {
+            Some(AgentSocket::Path(p)) => {
+                assert_eq!(p, PathBuf::from("/home/u/Library/Group Containers/x/agent.sock"))
+            }
+            other => panic!("expected path with space, resolved={}", other.is_some()),
         }
     }
 
