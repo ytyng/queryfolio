@@ -11,6 +11,7 @@
   import HistoryPane from "$lib/components/HistoryPane.svelte";
   import TablesPane from "$lib/components/TablesPane.svelte";
   import SqlEditor from "$lib/components/SqlEditor.svelte";
+  import EditorTabs from "$lib/components/EditorTabs.svelte";
   import ReplaceMultilinePane from "$lib/components/ReplaceMultilinePane.svelte";
   import ResultsPane from "$lib/components/ResultsPane.svelte";
   import ConfigInfoModal from "$lib/components/ConfigInfoModal.svelte";
@@ -253,47 +254,56 @@
         />
       {/if}
       <div
-        class="min-h-0 basis-0 border-b border-zinc-700"
+        class="flex min-h-0 basis-0 flex-col border-b border-zinc-700"
         style="flex-grow: {editorFrac}"
         bind:this={editorPaneEl}
       >
-        {#if appStore.selectedFile}
-          <!-- エディタと Replace Multiline ペインを横並びにする -->
-          <div class="flex h-full min-h-0">
-            <div class="min-w-0 flex-1">
-              <SqlEditor
-                bind:this={editor}
-                content={appStore.editorContent}
-                engine={selectedEngine}
-                schemaMap={appStore.schemaMap}
-                onChange={(content) => appStore.updateEditorContent(content)}
-                onRun={(sql) => appStore.runQuery(sql)}
-                onSelectionChange={(info) => {
-                  hasMultilineSelection = info.hasMultilineSelection;
-                }}
-              />
-            </div>
-            {#if showReplacePane}
-              <div class="w-96 shrink-0 border-l border-zinc-700">
-                {#key replaceOpenToken}
-                  <ReplaceMultilinePane
-                    initialLines={replaceInitialLines}
-                    onReplace={applyReplace}
-                    onClose={() => {
-                      showReplacePane = false;
+        {#if appStore.editorTabs.length > 0}
+          <EditorTabs />
+        {/if}
+        <div class="min-h-0 flex-1">
+          {#if appStore.selectedFile}
+            <!-- エディタと Replace Multiline ペインを横並びにする -->
+            <div class="flex h-full min-h-0">
+              <div class="min-w-0 flex-1">
+                <!-- タブ切替でエディタを作り直し、タブ間で undo 履歴・
+                     カーソルが混ざらないようにする -->
+                {#key appStore.activeEditorTabId}
+                  <SqlEditor
+                    bind:this={editor}
+                    content={appStore.editorContent}
+                    engine={selectedEngine}
+                    schemaMap={appStore.schemaMap}
+                    onChange={(content) => appStore.updateEditorContent(content)}
+                    onRun={(sql) => appStore.runQuery(sql)}
+                    onSelectionChange={(info) => {
+                      hasMultilineSelection = info.hasMultilineSelection;
                     }}
                   />
                 {/key}
               </div>
-            {/if}
-          </div>
-        {:else}
-          <div class="flex h-full items-center justify-center">
-            <p class="text-sm text-zinc-600">
-              Select or create a query file
-            </p>
-          </div>
-        {/if}
+              {#if showReplacePane}
+                <div class="w-96 shrink-0 border-l border-zinc-700">
+                  {#key replaceOpenToken}
+                    <ReplaceMultilinePane
+                      initialLines={replaceInitialLines}
+                      onReplace={applyReplace}
+                      onClose={() => {
+                        showReplacePane = false;
+                      }}
+                    />
+                  {/key}
+                </div>
+              {/if}
+            </div>
+          {:else}
+            <div class="flex h-full items-center justify-center">
+              <p class="text-sm text-zinc-600">
+                Select or create a query file
+              </p>
+            </div>
+          {/if}
+        </div>
       </div>
       <PaneDivider
         direction="horizontal"

@@ -379,11 +379,12 @@
 <div class="flex h-full min-h-0 flex-col bg-zinc-900">
   <!-- タブバー -->
   <div
-    class="flex shrink-0 items-center gap-3 border-b border-zinc-700 px-3 py-1 text-xs text-zinc-400"
+    class="flex shrink-0 items-start gap-3 border-b border-zinc-700 px-3 py-1 text-xs text-zinc-400"
   >
-    <span class="font-semibold tracking-wide">RESULTS</span>
+    <span class="mt-0.5 font-semibold tracking-wide">RESULTS</span>
     {#if appStore.resultTabs.length > 0}
-      <div class="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
+      <!-- 多段タブ: タブが増えたら折り返して複数段で表示する -->
+      <div class="flex min-w-0 flex-1 flex-wrap items-center gap-1">
         {#each appStore.resultTabs as tab (tab.id)}
           <div
             class="flex shrink-0 items-center gap-0.5 rounded-t border-t border-r border-l px-1 py-0.5 {tab.id ===
