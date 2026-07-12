@@ -7,6 +7,9 @@ export interface ConnectionInfo {
   has_ssh_tunnel: boolean;
   schema: string | null;
   readonly: boolean;
+  /// 危険な文 (WHERE 無し UPDATE/DELETE、DROP/TRUNCATE) の実行を許可する接続。
+  /// true でも実行前に確認を求める
+  allow_dangerous_statements: boolean;
 }
 
 export interface QueryResult {
@@ -81,6 +84,12 @@ export const cancelQuery = (connection: string) =>
 
 /// バックエンドの AppError::Cancelled が返す文字列 (キャンセル判定用)
 export const CANCELLED_ERROR_MESSAGE = "Query cancelled";
+
+/// 危険な文 (WHERE 無し UPDATE/DELETE、DROP/TRUNCATE) なら理由を、そうでなければ
+/// null を返す。allow_dangerous_statements が有効な接続で、実行前の確認要否を
+/// 判断するために使う (無効な接続では runQuery 側が拒否する)。
+export const checkDangerousStatement = (connection: string, sql: string) =>
+  invoke<string | null>("check_dangerous_statement", { connection, sql });
 
 /// クエリ実行履歴を新しい順に返す。search は SQL の部分一致 (大小無視)。
 export const listQueryHistory = (

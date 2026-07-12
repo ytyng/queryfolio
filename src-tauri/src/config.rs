@@ -154,6 +154,12 @@ pub struct ServerConfig {
     /// SELECT に副作用のある関数 (nextval 等) までは防げない事故防止ガード。
     #[serde(default)]
     pub readonly: bool,
+    /// queryfolio 独自拡張: true の場合、危険な文 (WHERE 無しの UPDATE /
+    /// DELETE、DROP / TRUNCATE 等) の実行を許可する。省略時 false で、
+    /// これらの文は誤操作による全行破壊・テーブル消失を防ぐため拒否される。
+    /// true にしても、フロントエンドは実行前に確認を求める。
+    #[serde(default)]
+    pub allow_dangerous_statements: bool,
 }
 
 /// フロントエンドに渡す接続先情報。パスワード等の機密は含めない。
@@ -167,6 +173,9 @@ pub struct ConnectionInfo {
     pub schema: Option<String>,
     /// 読み取り専用接続 (書き込み系の文の実行を拒否する)
     pub readonly: bool,
+    /// 危険な文 (WHERE 無し UPDATE/DELETE、DROP/TRUNCATE 等) の実行を許可する。
+    /// フロントエンドは true の接続でも実行前に確認を求める
+    pub allow_dangerous_statements: bool,
 }
 
 impl From<&ServerConfig> for ConnectionInfo {
@@ -178,6 +187,7 @@ impl From<&ServerConfig> for ConnectionInfo {
             has_ssh_tunnel: server.ssh_tunnel.is_some(),
             schema: server.schema.clone(),
             readonly: server.readonly,
+            allow_dangerous_statements: server.allow_dangerous_statements,
         }
     }
 }
@@ -919,6 +929,7 @@ sql_servers:
             password: Some("secret".into()),
             ssh_tunnel: None,
             readonly: false,
+            allow_dangerous_statements: false,
         };
         let info = ConnectionInfo::from(&server);
         let json = serde_json::to_string(&info).unwrap();

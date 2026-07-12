@@ -234,6 +234,7 @@ async fn run_query(
             max_rows.unwrap_or(DEFAULT_MAX_ROWS),
             auto_limit,
             server.readonly,
+            server.allow_dangerous_statements,
         )
         .await
     }
@@ -564,6 +565,20 @@ async fn build_explain_sql(
     db::build_explain_sql(&server.engine, &sql)
 }
 
+/// 危険な文 (WHERE 無し UPDATE/DELETE、DROP/TRUNCATE) なら理由を返す。
+/// 実行はしない。allow_dangerous_statements が有効な接続で、フロントが
+/// 実行前に確認ダイアログを出すかどうかを判断するために使う
+/// (無効な接続では run_query 側が拒否するため、フロントは呼ぶ必要がない)。
+#[tauri::command]
+async fn check_dangerous_statement(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    sql: String,
+) -> Result<Option<String>, AppError> {
+    let server = state.find_server(&connection).await?;
+    db::dangerous_statement_reason(&server.engine, &sql)
+}
+
 /// EXPLAIN の実行計画を AI に解説させ、ボトルネックの特定・インデックス
 /// 提案・書き直し案の Markdown を返す。LLM に送るのはスキーマ情報
 /// (テーブル・カラム名)・エンジン方言・アクティブスキーマ名・SQL・
@@ -717,6 +732,7 @@ pub fn run() {
             get_ai_info,
             ai_generate_sql,
             build_explain_sql,
+            check_dangerous_statement,
             ai_explain_plan,
             ai_explain_sql,
             ai_fix_sql,

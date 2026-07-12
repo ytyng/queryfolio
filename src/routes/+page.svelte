@@ -14,6 +14,7 @@
   import ResultsPane from "$lib/components/ResultsPane.svelte";
   import ConfigInfoModal from "$lib/components/ConfigInfoModal.svelte";
   import AiAnalysisModal from "$lib/components/AiAnalysisModal.svelte";
+  import DangerousConfirmModal from "$lib/components/DangerousConfirmModal.svelte";
   import PaneDivider from "$lib/components/PaneDivider.svelte";
 
   let showSettings = $state(false);
@@ -261,5 +262,14 @@
     title="AI SQL Explanation"
     text={appStore.aiExplanation}
     onClose={() => appStore.closeAiExplanation()}
+  />
+{/if}
+
+<!-- 危険な文 (allow_dangerous_statements 有効な接続) の実行前確認モーダル -->
+{#if appStore.dangerousConfirmReason !== null}
+  <DangerousConfirmModal
+    reason={appStore.dangerousConfirmReason}
+    onConfirm={() => appStore.confirmDangerous()}
+    onCancel={() => appStore.cancelDangerous()}
   />
 {/if}

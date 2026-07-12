@@ -46,6 +46,20 @@ sql_servers:
     password: replica_password
     readonly: true
 
+  # queryfolio 拡張: allow_dangerous_statements (省略時 false)。
+  # 省略時は、危険な文 (WHERE 無しの UPDATE / DELETE、DROP、TRUNCATE) を
+  # 誤操作による全行破壊・テーブル消失防止のため拒否する。
+  # true にするとこれらの文を実行できるが、実行前に確認ダイアログが出る。
+  - name: dev-db
+    description: "開発用 DB (危険な文も確認の上で実行できる)"
+    engine: postgres
+    host: localhost
+    port: 5432
+    schema: dev
+    user: dev_user
+    password: dev_password
+    allow_dangerous_statements: true
+
   - name: remote-db-with-ssh
     description: "SSH トンネル経由でアクセスするリモートデータベース"
     engine: postgres
