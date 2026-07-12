@@ -34,7 +34,7 @@ pnpm tauri build        # リリースビルド
 | lib.rs | Tauri コマンド定義と AppState (接続設定キャッシュ + DbManager) |
 | config.rs | config.yml のロード・ソース宣言解決・テンプレート展開・expand_tilde |
 | db.rs | sqlx プール管理、クエリ実行・キャンセル (CancelRegistry)、型別 JSON 変換 |
-| tunnel.rs | SSH ローカルポートフォワード (known_hosts 検証付き) |
+| tunnel.rs | SSH ローカルポートフォワード (known_hosts 検証付き)。ssh-agent 認証時は使う agent socket を `ssh_tunnel.identity_agent` → `~/.ssh/config` の IdentityAgent → SSH_AUTH_SOCK の順で解決し libssh2 の `set_identity_path` で指定する (GUI 起動でシェルの SSH_AUTH_SOCK を継承しなくても 1Password 等の agent に届く)。ssh_config パーサは Include の条件付き展開・glob・Host マッチ・エスケープ/コメント除去に対応 (best-effort) |
 | query_files.rs | クエリファイル CRUD (パストラバーサル対策) |
 | meta_commands.rs | psql 風メタコマンド (\l \dt \dv \dn \du \d) をエンジン別カタログ SQL に変換。識別子バリデーションでインジェクション拒否 |
 | history.rs | クエリ実行履歴。接続ごとに JSONL (~/.config/queryfolio/history/<connection>.jsonl) へ追記、上限 10,000 行でローテーション。SQL に機密が含まれ得るためディレクトリ 700 / ファイル 600 |
@@ -61,6 +61,7 @@ pnpm tauri build        # リリースビルド
 - `default_limit` (任意、デフォルト 500、0 で無効) — LIMIT 未指定の SELECT に自動で `LIMIT n` を付与する (db.rs の should_auto_limit。サブクエリ LIMIT / FOR UPDATE 等は保守的にスキップ)。
 - `readonly: true` (任意、デフォルト false。sql-agent 互換フォーマットへの queryfolio 独自拡張) — その接続で書き込み系の文 (INSERT / UPDATE / DELETE / DDL 等) の実行を拒否する。判定は db.rs の is_readonly_allowed: leading_keyword が select / with / show / describe / desc / explain / pragma / values / table / call 以外なら拒否し、さらに WITH は CTE 付き DML (insert / update / delete / merge)、SELECT は SELECT INTO、EXPLAIN は EXPLAIN ANALYZE + DML (対象文を実際に実行するため) を、リテラル・コメント除去済みの単語境界判定で拒否する。メタコマンドは読み取り系のみなので常に許可。SELECT に副作用のある関数 (nextval 等) までは防げない、あくまで事故防止のガード。
 - `sqlfiles_dir` (任意) でクエリファイル保存先を変更できる。デフォルトは `~/.config/queryfolio/sqlfiles/<connection>/<name>.sql`。
+- `ssh_tunnel.identity_agent` (任意、queryfolio 独自拡張) — ssh-agent 認証で使う agent socket を明示する (OpenSSH の IdentityAgent 相当)。`none` で agent を無効化。省略時は `~/.ssh/config` の IdentityAgent → SSH_AUTH_SOCK の順で解決 (tunnel.rs)。鍵を 1Password SSH agent に置き GUI 起動する環境向けの解決策。
 - `ai:` (任意) — AI SQL 生成の設定 (`provider: openai` / `api_key` / `model` 任意 / `base_url` 任意)。ローカル config.yml のトップレベルと、ソース宣言で取得する接続 YAML のトップレベルの両方に書ける。**両方ある場合は接続 YAML 側を優先** (API キーを 1Password に置ける)。provider は現状 openai のみで、不明値はエラー。AppState にセッションキャッシュされ reset_connections でクリア。
 - `QUERYFOLIO_CONFIG_YAML` 環境変数は設定ファイル全体を上書きする開発・テスト用フック (実機 E2E 検証で使用)。
 
