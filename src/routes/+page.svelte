@@ -64,11 +64,12 @@
     }
   }
 
-  // ファイル切替・クローズで選択追跡状態と置換ペインをリセットする。
-  // selectFile は null を経由せず別ファイルへ差し替えるため selectedFile を
-  // 依存にして毎回リセットし、stale な選択でのボタン表示・誤挿入を防ぐ
+  // タブ切替・クローズで選択追跡状態と置換ペインをリセットする。
+  // 依存はアクティブタブ ID にする: 同名ファイルを別接続で開いている場合、
+  // selectedFile (ファイル名) は変わらないままタブだけ切り替わり得るため、
+  // selectedFile 依存だと stale なスナップショットが残り新タブへ誤適用される
   $effect(() => {
-    void appStore.selectedFile;
+    void appStore.activeEditorTabId;
     hasMultilineSelection = false;
     showReplacePane = false;
     replaceSnapshot = null;

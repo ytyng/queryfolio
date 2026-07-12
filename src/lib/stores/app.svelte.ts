@@ -416,6 +416,11 @@ const removeEditorTab = async (id: number, save: boolean) => {
     if (!(await saveEditorTab(tab))) {
       return;
     }
+    // 保存 await の間にさらに編集された場合、saveEditorTab は dirty を残す。
+    // その編集を失わないよう close を中断する (自動保存タイマーが後で確定させる)
+    if (tab.dirty) {
+      return;
+    }
   }
   // 保存 await 中に配列が変わっている可能性があるため、位置は取り直す
   const index = editorTabs.findIndex((t) => t.id === id);
