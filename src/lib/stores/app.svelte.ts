@@ -374,14 +374,18 @@ const activateEditorTab = async (id: number) => {
 
 // アクティブスキーマ (database) を切り替える。成功したら true。
 const changeActiveSchema = async (schema: string): Promise<boolean> => {
-  if (!selectedConnection || schema === activeSchema) {
+  const connection = selectedConnection;
+  if (!connection || schema === activeSchema) {
     return true;
   }
-  if (!(await flushPendingSave())) {
-    return false;
-  }
+  // 未保存タブは best-effort で保存 (失敗してもスキーマ切替は止めない)
+  await flushPendingSave();
   try {
-    await api.setActiveSchema(selectedConnection, schema);
+    await api.setActiveSchema(connection, schema);
+    // 切替中に別接続へ移っていたら、そのスキーマ表示を新接続に適用しない
+    if (selectedConnection !== connection) {
+      return false;
+    }
     activeSchema = schema;
     errorMessage = null;
     // 切替先スキーマの補完候補をバックグラウンドで取得する (待たない)
@@ -396,31 +400,38 @@ const changeActiveSchema = async (schema: string): Promise<boolean> => {
 /// ファイルを開く。既に開いているタブがあればアクティブにし、無ければ
 /// 内容を読み込んで新しいタブを作りアクティブにする (FilesPane から呼ばれる)。
 const selectFile = async (fileName: string) => {
-  if (!selectedConnection) {
+  // 読み込み先の接続を await 前に固定する。読込中に接続が切り替わっても、
+  // タブは必ず「内容を読んだ接続」に紐づける (誤った接続への実行/保存を防ぐ)。
+  const connection = selectedConnection;
+  if (!connection) {
     return;
   }
   const existing = editorTabs.find(
-    (t) => t.connection === selectedConnection && t.file === fileName,
+    (t) => t.connection === connection && t.file === fileName,
   );
   if (existing) {
     await activateEditorTab(existing.id);
     return;
   }
-  if (!(await flushPendingSave())) {
-    return;
-  }
+  // 未保存タブは best-effort で保存 (失敗してもファイルオープンは止めない)
+  await flushPendingSave();
   try {
-    const content = await api.readQueryFile(selectedConnection, fileName);
+    const content = await api.readQueryFile(connection, fileName);
+    // 読込中に別接続へ切り替わっていたら、この読込結果は捨てる
+    // (ユーザーはもうその接続を見ていないので、開かない)
+    if (selectedConnection !== connection) {
+      return;
+    }
     const tab: EditorTab = {
       id: nextEditorTabId++,
-      connection: selectedConnection,
+      connection,
       file: fileName,
       content,
       dirty: false,
     };
     editorTabs = [...editorTabs, tab];
     activeEditorTabId = tab.id;
-    lastActiveTabByConnection.set(tab.connection, tab.id);
+    lastActiveTabByConnection.set(connection, tab.id);
     errorMessage = null;
   } catch (e) {
     errorMessage = toErrorMessage(e);
@@ -477,12 +488,17 @@ const closeEditorTab = (id: number) => {
 };
 
 const createFile = async (fileName: string) => {
-  if (!selectedConnection) {
+  const connection = selectedConnection;
+  if (!connection) {
     return;
   }
   try {
-    const normalized = await api.createQueryFile(selectedConnection, fileName);
-    files = await api.listQueryFiles(selectedConnection);
+    const normalized = await api.createQueryFile(connection, fileName);
+    // 作成中に別接続へ切り替わっていたら、新接続の一覧を汚さず開かない
+    if (selectedConnection !== connection) {
+      return;
+    }
+    files = await api.listQueryFiles(connection);
     await selectFile(normalized);
   } catch (e) {
     errorMessage = toErrorMessage(e);
@@ -893,8 +909,12 @@ const confirmIfDangerous = async (
 };
 
 const runQuery = async (sql: string) => {
+  // 実行先の接続を await 前に固定する。以降の await (保存・危険文の確認モーダル) の
+  // 間に接続が切り替わっても、確認した接続と実行する接続が食い違わないようにする
+  // (旧 SQL を新 DB で実行してしまう事故を防ぐ)。
+  const connection = selectedConnection;
   // 実行前ガードの通知は、既存の結果タブを覆わないよう toast で出す
-  if (!selectedConnection) {
+  if (!connection) {
     toast.warning("Select a connection first");
     return;
   }
@@ -903,18 +923,21 @@ const runQuery = async (sql: string) => {
     return;
   }
   // 同一接続の並列実行を抑止する (別タブで実行中でも拒否)
-  if (isConnectionRunning(selectedConnection)) {
+  if (isConnectionRunning(connection)) {
     toast.warning(
       "A query is already running on this connection. Cancel it or wait for it to finish.",
     );
     return;
   }
-  if (!(await flushPendingSave())) {
-    return;
-  }
+  // 未保存タブは best-effort で保存 (失敗しても実行は止めない。SQL はメモリ上の値)
+  await flushPendingSave();
   // 危険な文 (WHERE 無し UPDATE/DELETE、DROP/TRUNCATE) は、実行を許可した
   // 接続でも実行前に確認する。キャンセルされたら何もしない
-  if (!(await confirmIfDangerous(selectedConnection, sql))) {
+  if (!(await confirmIfDangerous(connection, sql))) {
+    return;
+  }
+  // 確認モーダルの間に接続が切り替わっていたら、別 DB で実行しないよう中止する
+  if (selectedConnection !== connection) {
     return;
   }
   errorMessage = null;
@@ -923,7 +946,7 @@ const runQuery = async (sql: string) => {
     return;
   }
   tab.sql = sql;
-  tab.connection = selectedConnection;
+  tab.connection = connection;
   tab.schema = activeSchema;
   await executeTab(tab);
 };
