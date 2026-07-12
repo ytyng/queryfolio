@@ -115,6 +115,14 @@ pub struct SshTunnelConfig {
     pub private_key_path: Option<String>,
     #[serde(default)]
     pub private_key_passphrase: Option<String>,
+    /// queryfolio extension: the ssh-agent socket to use for agent
+    /// authentication (equivalent to OpenSSH's IdentityAgent). Use "none" to
+    /// disable the agent. When omitted, the agent socket is resolved from
+    /// ~/.ssh/config (IdentityAgent) and then SSH_AUTH_SOCK. This lets a GUI
+    /// launch reach an agent it did not inherit in its environment (e.g. the
+    /// 1Password SSH agent).
+    #[serde(default)]
+    pub identity_agent: Option<String>,
 }
 
 fn default_ssh_port() -> u16 {
