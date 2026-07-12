@@ -63,6 +63,10 @@ sql_servers: []
 
 # Where query files are stored (default: ~/.config/queryfolio/sqlfiles)
 # sqlfiles_dir: ~/queries
+#
+# Query files live under <sqlfiles_dir>/<folder>/<name>.sql. The per-connection
+# folder is <host>_<engine>_<schema>_<user> by default (the connection name is
+# not used). Set `folder_name:` on a server to pin the folder explicitly.
 "#;
 
 /// 実在する設定ファイルのパスを返す。config.yml / config.yaml のどちらも
@@ -136,6 +140,11 @@ pub struct ServerConfig {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    /// queryfolio 独自拡張: クエリファイルの保存フォルダ名を明示する。
+    /// 省略時は <host>_<engine>_<schema>_<user> から組み立てる
+    /// (name はフォルダ名には使わない)。sqlfiles_folder_name を参照。
+    #[serde(default)]
+    pub folder_name: Option<String>,
     pub engine: String,
     #[serde(default)]
     pub host: Option<String>,
@@ -160,6 +169,50 @@ pub struct ServerConfig {
     /// true にしても、フロントエンドは実行前に確認を求める。
     #[serde(default)]
     pub allow_dangerous_statements: bool,
+}
+
+/// フォルダ名としてファイルシステム上安全になるようサニタイズする。
+/// パス区切り (/ \) や NUL を _ に置換し、先頭ドット (不可視/相対) を避ける。
+/// query_files::validate_component が拒否する文字を事前に潰しておく。
+fn sanitize_folder_component(raw: &str) -> String {
+    let mut s: String = raw
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '\0' => '_',
+            _ => c,
+        })
+        .collect();
+    s = s.trim().to_string();
+    if s.is_empty() {
+        return "_".to_string();
+    }
+    if s.starts_with('.') {
+        s.insert(0, '_');
+    }
+    s
+}
+
+impl ServerConfig {
+    /// クエリファイルの保存フォルダ名を返す。
+    /// folder_name が設定されていればそれを使い、無ければ
+    /// <host>_<engine>_<schema>_<user> を組み立てる (name は使わない)。
+    /// パス要素として安全になるよう区切り文字等はサニタイズする。
+    pub fn sqlfiles_folder_name(&self) -> String {
+        if let Some(folder) = self.folder_name.as_deref() {
+            let folder = folder.trim();
+            if !folder.is_empty() {
+                return sanitize_folder_component(folder);
+            }
+        }
+        let joined = [
+            self.host.as_deref().unwrap_or(""),
+            self.engine.as_str(),
+            self.schema.as_deref().unwrap_or(""),
+            self.user.as_deref().unwrap_or(""),
+        ]
+        .join("_");
+        sanitize_folder_component(&joined)
+    }
 }
 
 /// フロントエンドに渡す SSH トンネル情報。パスワードや鍵等の機密は含めない。
@@ -990,6 +1043,7 @@ sql_servers:
         let server = ServerConfig {
             name: "s".into(),
             description: None,
+            folder_name: None,
             engine: "mysql".into(),
             host: Some("h".into()),
             port: Some(3306),
@@ -1003,5 +1057,57 @@ sql_servers:
         let info = ConnectionInfo::from(&server);
         let json = serde_json::to_string(&info).unwrap();
         assert!(!json.contains("secret"));
+    }
+
+    fn server_with(
+        folder_name: Option<&str>,
+        host: Option<&str>,
+        engine: &str,
+        schema: Option<&str>,
+        user: Option<&str>,
+    ) -> ServerConfig {
+        ServerConfig {
+            name: "conn-name".into(),
+            description: None,
+            folder_name: folder_name.map(|s| s.to_string()),
+            engine: engine.into(),
+            host: host.map(|s| s.to_string()),
+            port: None,
+            schema: schema.map(|s| s.to_string()),
+            user: user.map(|s| s.to_string()),
+            password: None,
+            ssh_tunnel: None,
+            readonly: false,
+            allow_dangerous_statements: false,
+        }
+    }
+
+    #[test]
+    fn test_sqlfiles_folder_name() {
+        // folder_name があればそれを使う (name は使わない)
+        let s = server_with(Some("my-folder"), Some("h"), "mysql", Some("db"), Some("u"));
+        assert_eq!(s.sqlfiles_folder_name(), "my-folder");
+
+        // folder_name が空文字列ならフォールバック
+        let s = server_with(Some("   "), Some("h"), "mysql", Some("db"), Some("u"));
+        assert_eq!(s.sqlfiles_folder_name(), "h_mysql_db_u");
+
+        // folder_name 無し → <host>_<engine>_<schema>_<user>
+        let s = server_with(
+            None,
+            Some("db.example.com"),
+            "postgres",
+            Some("prod"),
+            Some("app"),
+        );
+        assert_eq!(s.sqlfiles_folder_name(), "db.example.com_postgres_prod_app");
+
+        // sqlite: host/user 無し、schema はファイルパス → 区切りをサニタイズ
+        let s = server_with(None, None, "sqlite", Some("/Users/me/data.db"), None);
+        assert_eq!(s.sqlfiles_folder_name(), "_sqlite__Users_me_data.db_");
+
+        // 先頭ドットは避ける (不可視/相対パス化を防ぐ)
+        let s = server_with(Some(".hidden"), None, "sqlite", None, None);
+        assert_eq!(s.sqlfiles_folder_name(), "_.hidden");
     }
 }
