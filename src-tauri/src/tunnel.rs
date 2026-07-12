@@ -568,7 +568,7 @@ fn expand_env_vars(input: &str) -> String {
 }
 
 /// Include のパス列を展開する。相対パスは `~/.ssh/` からの相対とみなす。
-/// 末尾コンポーネントの glob (`~/.ssh/config.d/*` 等) に対応する。
+/// glob パターン (`*` `?` `[...]`) は glob crate で展開する (OpenSSH は glob(3) 準拠)。
 fn expand_include_paths(rest: &str, home: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for token in rest.split_whitespace() {
@@ -580,34 +580,16 @@ fn expand_include_paths(rest: &str, home: &Path) -> Vec<PathBuf> {
         } else {
             home.join(".ssh").join(token)
         };
-        if token.contains('*') || token.contains('?') || token.contains('[') {
-            expand_glob_last_component(&resolved, &mut out);
+        if token.contains(['*', '?', '[']) {
+            // glob crate は既定でソート済みの順で返す。
+            if let Ok(paths) = glob::glob(&resolved.to_string_lossy()) {
+                out.extend(paths.flatten());
+            }
         } else {
             out.push(resolved);
         }
     }
     out
-}
-
-/// パスの末尾コンポーネントだけを glob 展開する。ディレクトリ部に glob を含む
-/// 多段パターンは未対応。結果は OpenSSH に倣い辞書順にソートする。
-fn expand_glob_last_component(pattern_path: &Path, out: &mut Vec<PathBuf>) {
-    let (Some(dir), Some(file)) = (pattern_path.parent(), pattern_path.file_name()) else {
-        return;
-    };
-    if dir.to_string_lossy().contains(['*', '?', '[']) {
-        return;
-    }
-    let file_pattern = file.to_string_lossy();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        let mut matched: Vec<PathBuf> = entries
-            .flatten()
-            .filter(|entry| glob_match(&file_pattern, &entry.file_name().to_string_lossy()))
-            .map(|entry| entry.path())
-            .collect();
-        matched.sort();
-        out.extend(matched);
-    }
 }
 
 /// ローカル TCP 接続 1 本を SSH direct-tcpip チャンネルへ中継する。
@@ -930,15 +912,22 @@ mod tests {
     }
 
     #[test]
-    fn glob_include_expands_last_component() {
+    fn glob_include_expands_star_and_bracket() {
         let home = Path::new("/home/u");
         let dir = unique_temp("ssh_incdir");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("10-agent.conf"), "Host *\n  IdentityAgent ~/from-glob.sock\n").unwrap();
+        // `*` glob
         let body = format!("Include {}/*.conf\n", dir.display());
         match resolve(&body, "any.host", home) {
             Some(AgentSocket::Path(p)) => assert_eq!(p, PathBuf::from("/home/u/from-glob.sock")),
-            other => panic!("expected glob-included path, resolved={}", other.is_some()),
+            other => panic!("expected star-glob path, resolved={}", other.is_some()),
+        }
+        // `[...]` bracket glob (OpenSSH は glob(3) の文字クラスに対応)
+        let body = format!("Include {}/[0-9]*.conf\n", dir.display());
+        match resolve(&body, "any.host", home) {
+            Some(AgentSocket::Path(p)) => assert_eq!(p, PathBuf::from("/home/u/from-glob.sock")),
+            other => panic!("expected bracket-glob path, resolved={}", other.is_some()),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
