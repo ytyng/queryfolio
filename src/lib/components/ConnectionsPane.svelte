@@ -49,41 +49,56 @@
     return rows;
   };
 
-  /// ホバー中の接続とツールチップ表示位置 (viewport 座標)。
+  /// ホバー中の接続とアンカー (カーソル) 位置・ツールチップ表示位置 (viewport 座標)。
   let hovered = $state<ConnectionInfo | null>(null);
+  let anchorX = $state(0);
+  let anchorY = $state(0);
   let tipX = $state(0);
   let tipY = $state(0);
+  /// レンダリング済みツールチップ要素 ($state にすることで bind:this 後に
+  /// clamp の $effect が再実行され、実寸法で位置補正できる)。
+  let tipEl = $state<HTMLDivElement | null>(null);
+
+  const TIP_MARGIN = 16;
 
   const showTip = (c: ConnectionInfo, e: MouseEvent) => {
     hovered = c;
-    positionTip(c, e);
+    setAnchor(e);
   };
 
-  const positionTip = (c: ConnectionInfo, e: MouseEvent) => {
-    // カーソルの右下に少しずらして出す。画面右端で溢れる場合は左側に、
-    // 画面下端で溢れる場合はカーソルの上側に反転させる (下部の項目でも
-    // ツールチップ全体が収まるように)。
-    const margin = 16;
-    const estWidth = 320;
-    // ヘッダ + 詳細行数からツールチップの高さを概算する
-    const estHeight = 40 + detailRows(c).length * 18;
-
-    let x = e.clientX + margin;
-    if (x + estWidth > window.innerWidth) {
-      x = Math.max(margin, e.clientX - margin - estWidth);
-    }
-    tipX = x;
-
-    let y = e.clientY + margin;
-    if (y + estHeight > window.innerHeight) {
-      y = Math.max(margin, e.clientY - margin - estHeight);
-    }
-    tipY = y;
+  const setAnchor = (e: MouseEvent) => {
+    anchorX = e.clientX;
+    anchorY = e.clientY;
+    // 実測クランプ ($effect) の前でもカーソル付近に出しておく (初回表示時に
+    // 前回位置や左上へ一瞬ちらつくのを防ぐ)。溢れ補正は $effect が行う。
+    tipX = e.clientX + TIP_MARGIN;
+    tipY = e.clientY + TIP_MARGIN;
   };
 
   const hideTip = () => {
     hovered = null;
   };
+
+  // アンカー位置とレンダリング済みツールチップの実寸法から、ビューポート内に
+  // 収まる表示位置を決める。カーソルの右下に出し、右端・下端で溢れる場合は
+  // 左側・上側へ反転させる。長い値 (SQLite パスや description) で折り返して
+  // 高さ/幅が変わっても、実測サイズを使うので確実に画面内へ収まる。
+  $effect(() => {
+    // hovered / anchor / tipEl を依存に取る (tipEl 確定後に再実行される)
+    if (!hovered || !tipEl) return;
+    const w = tipEl.offsetWidth;
+    const h = tipEl.offsetHeight;
+    let x = anchorX + TIP_MARGIN;
+    if (x + w > window.innerWidth) {
+      x = Math.max(TIP_MARGIN, anchorX - TIP_MARGIN - w);
+    }
+    let y = anchorY + TIP_MARGIN;
+    if (y + h > window.innerHeight) {
+      y = Math.max(TIP_MARGIN, anchorY - TIP_MARGIN - h);
+    }
+    tipX = x;
+    tipY = y;
+  });
 </script>
 
 <div class="flex h-full w-full flex-col border-r border-zinc-700 bg-zinc-900">
@@ -116,7 +131,7 @@
           data-annotate="button-connection-{connection.name}"
           onclick={() => appStore.selectConnection(connection.name)}
           onmouseenter={(e) => showTip(connection, e)}
-          onmousemove={(e) => hovered && positionTip(connection, e)}
+          onmousemove={(e) => hovered && setAnchor(e)}
           onmouseleave={hideTip}
         >
           <span class="truncate text-sm text-zinc-200">{connection.name}</span>
@@ -147,6 +162,7 @@
 
 {#if hovered}
   <div
+    bind:this={tipEl}
     class="pointer-events-none fixed z-50 max-w-sm rounded border border-zinc-600 bg-zinc-800 px-3 py-2 shadow-lg"
     style="left: {tipX}px; top: {tipY}px;"
     data-annotate="tooltip-connection-{hovered.name}"
