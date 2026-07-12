@@ -304,6 +304,11 @@ const pickTabForConnection = (name: string): number | null => {
 
 const selectConnection = async (name: string) => {
   if (name === selectedConnection) {
+    // 現在の接続を再選択したら、進行中の別接続への切替 (applyConnectionContext は
+    // commit まで selectedConnection を変えないため、その最中は現接続が選択中に
+    // 見える) をキャンセルする。世代を進めておくと in-flight の切替は commit されず、
+    // 「今の接続に留まる」という操作の意図どおりになる。
+    connectionContextGeneration++;
     return;
   }
   if (!(await flushPendingSave())) {
