@@ -162,6 +162,24 @@ pub struct ServerConfig {
     pub allow_dangerous_statements: bool,
 }
 
+/// フロントエンドに渡す SSH トンネル情報。パスワードや鍵等の機密は含めない。
+#[derive(Debug, Clone, Serialize)]
+pub struct SshTunnelInfo {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+}
+
+impl From<&SshTunnelConfig> for SshTunnelInfo {
+    fn from(tunnel: &SshTunnelConfig) -> Self {
+        Self {
+            host: tunnel.host.clone(),
+            port: tunnel.port,
+            user: tunnel.user.clone(),
+        }
+    }
+}
+
 /// フロントエンドに渡す接続先情報。パスワード等の機密は含めない。
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectionInfo {
@@ -169,8 +187,16 @@ pub struct ConnectionInfo {
     pub description: Option<String>,
     pub engine: String,
     pub has_ssh_tunnel: bool,
+    /// 接続先ホスト (未設定なら null)
+    pub host: Option<String>,
+    /// 接続先ポート (未設定なら null)
+    pub port: Option<u16>,
+    /// 接続ユーザー (未設定なら null)
+    pub user: Option<String>,
     /// 設定上のデフォルト database (スキーマ)
     pub schema: Option<String>,
+    /// SSH トンネル情報 (機密を除く)。トンネル未使用なら null
+    pub ssh_tunnel: Option<SshTunnelInfo>,
     /// 読み取り専用接続 (書き込み系の文の実行を拒否する)
     pub readonly: bool,
     /// 危険な文 (WHERE 無し UPDATE/DELETE、DROP/TRUNCATE 等) の実行を許可する。
@@ -185,7 +211,11 @@ impl From<&ServerConfig> for ConnectionInfo {
             description: server.description.clone(),
             engine: server.engine.clone(),
             has_ssh_tunnel: server.ssh_tunnel.is_some(),
+            host: server.host.clone(),
+            port: server.port,
+            user: server.user.clone(),
             schema: server.schema.clone(),
+            ssh_tunnel: server.ssh_tunnel.as_ref().map(SshTunnelInfo::from),
             readonly: server.readonly,
             allow_dangerous_statements: server.allow_dangerous_statements,
         }
@@ -673,6 +703,45 @@ sql_servers:
         assert!(servers[1].readonly);
         assert!(!ConnectionInfo::from(&servers[0]).readonly);
         assert!(ConnectionInfo::from(&servers[1]).readonly);
+    }
+
+    #[tokio::test]
+    async fn test_connection_info_exposes_host_port_user_and_ssh() {
+        // ConnectionInfo は host/port/user と SSH トンネル情報 (機密を除く) を
+        // フロントへ渡す。パスワードや鍵は含めない。
+        let config = config_from_yaml(
+            r#"
+sql_servers:
+  - name: tunneled-db
+    engine: postgres
+    host: 10.0.0.5
+    port: 5432
+    user: app_user
+    password: db-secret
+    schema: app_db
+    ssh_tunnel:
+      host: bastion.example.com
+      port: 2222
+      user: jump
+      password: ssh-secret
+      private_key_path: /home/me/.ssh/id_ed25519
+"#,
+        );
+        let servers = config.resolve_servers().await.unwrap().servers;
+        let info = ConnectionInfo::from(&servers[0]);
+        assert_eq!(info.host.as_deref(), Some("10.0.0.5"));
+        assert_eq!(info.port, Some(5432));
+        assert_eq!(info.user.as_deref(), Some("app_user"));
+        assert!(info.has_ssh_tunnel);
+        // 機密がシリアライズに漏れないことを確認する
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(!json.contains("db-secret"));
+        assert!(!json.contains("ssh-secret"));
+        assert!(!json.contains("id_ed25519"));
+        let ssh = info.ssh_tunnel.expect("ssh tunnel info");
+        assert_eq!(ssh.host, "bastion.example.com");
+        assert_eq!(ssh.port, 2222);
+        assert_eq!(ssh.user, "jump");
     }
 
     #[tokio::test]

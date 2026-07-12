@@ -1,11 +1,26 @@
 import { invoke } from "@tauri-apps/api/core";
 
+/// SSH トンネル情報 (機密を除く。バックエンドの config::SshTunnelInfo に対応)
+export interface SshTunnelInfo {
+  host: string;
+  port: number;
+  user: string;
+}
+
 export interface ConnectionInfo {
   name: string;
   description: string | null;
   engine: string;
   has_ssh_tunnel: boolean;
+  /// 接続先ホスト (未設定なら null)
+  host: string | null;
+  /// 接続先ポート (未設定なら null)
+  port: number | null;
+  /// 接続ユーザー (未設定なら null)
+  user: string | null;
   schema: string | null;
+  /// SSH トンネル情報 (機密を除く)。トンネル未使用なら null
+  ssh_tunnel: SshTunnelInfo | null;
   readonly: boolean;
   /// 危険な文 (WHERE 無し UPDATE/DELETE、DROP/TRUNCATE) の実行を許可する接続。
   /// true でも実行前に確認を求める
