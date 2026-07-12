@@ -10,7 +10,7 @@ SQL client desktop app built with Tauri 2 + SvelteKit. A lightweight alternative
 - SSH tunnel with known_hosts verification
 - Connection config in YAML, compatible with the sql-agent-mcp-server format
   - Secrets can stay in 1Password: the config YAML is fetched lazily via a getter command like `op read "op://..."`
-- Query files per connection, auto-saved (`~/.config/queryfolio/sqlfiles/<connection>/*.sql`)
+- Query files per connection, auto-saved (`~/.config/queryfolio/sqlfiles/<folder>/*.sql`, where `<folder>` is `folder_name` or `<host>_<engine>_<schema>_<user>`)
 - CodeMirror 6 SQL editor with per-engine dialect, statement highlighting, Cmd+Enter to run the statement under the cursor, and schema-based autocompletion (table / column names)
 - SQL formatting for SELECT statements (conservative: unsupported or unparsable statements are left untouched)
 - Schema browser (TABLES pane) with lazy-loaded columns

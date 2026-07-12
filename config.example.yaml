@@ -124,3 +124,14 @@ sql_server_templates:
 
 # --- クエリファイルの保存先 (任意。デフォルト ~/.config/queryfolio/sqlfiles) ---
 # sqlfiles_dir: ~/queries
+#
+# クエリファイルは <sqlfiles_dir>/<フォルダ名>/<name>.sql に保存される。
+# フォルダ名は接続ごとに次のルールで決まる (接続 name は使わない):
+#   - サーバーに folder_name を指定していればそれを使う
+#   - 無ければ <host>_<engine>_<schema>_<user> を組み立てる
+# 例: 上の dev-postgres は "localhost_postgres_development_db_dev_user"。
+# folder_name を明示するとフォルダ名を固定できる (host 等を変えても移動しない):
+#   - name: dev-postgres
+#     folder_name: dev-pg
+#     engine: postgres
+#     ...

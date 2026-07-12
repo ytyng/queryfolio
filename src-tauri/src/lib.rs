@@ -79,6 +79,13 @@ impl AppState {
             })
     }
 
+    /// クエリファイルの保存フォルダ名を接続設定から解決する。
+    /// folder_name → <host>_<engine>_<schema>_<user> の順で決まる
+    /// (接続 name はフォルダ名には使わない)。
+    async fn resolve_sqlfiles_folder(&self, connection: &str) -> Result<String, AppError> {
+        Ok(self.find_server(connection).await?.sqlfiles_folder_name())
+    }
+
     /// スキーマキャッシュのキーになるアクティブスキーマ名を返す
     /// (オーバーライド > 設定のデフォルト > 空文字)。
     async fn active_schema_key(&self, server: &ServerConfig) -> String {
@@ -301,7 +308,8 @@ async fn list_query_files(
     state: tauri::State<'_, AppState>,
     connection: String,
 ) -> Result<Vec<String>, AppError> {
-    query_files::list_query_files(&state.resolve_sqlfiles_dir().await?, &connection)
+    let folder = state.resolve_sqlfiles_folder(&connection).await?;
+    query_files::list_query_files(&state.resolve_sqlfiles_dir().await?, &folder)
 }
 
 #[tauri::command]
@@ -310,9 +318,10 @@ async fn read_query_file(
     connection: String,
     file_name: String,
 ) -> Result<String, AppError> {
+    let folder = state.resolve_sqlfiles_folder(&connection).await?;
     query_files::read_query_file(
         &state.resolve_sqlfiles_dir().await?,
-        &connection,
+        &folder,
         &file_name,
     )
 }
@@ -324,9 +333,10 @@ async fn write_query_file(
     file_name: String,
     content: String,
 ) -> Result<(), AppError> {
+    let folder = state.resolve_sqlfiles_folder(&connection).await?;
     query_files::write_query_file(
         &state.resolve_sqlfiles_dir().await?,
-        &connection,
+        &folder,
         &file_name,
         &content,
     )
@@ -338,9 +348,10 @@ async fn create_query_file(
     connection: String,
     file_name: String,
 ) -> Result<String, AppError> {
+    let folder = state.resolve_sqlfiles_folder(&connection).await?;
     query_files::create_query_file(
         &state.resolve_sqlfiles_dir().await?,
-        &connection,
+        &folder,
         &file_name,
     )
 }
@@ -351,9 +362,10 @@ async fn delete_query_file(
     connection: String,
     file_name: String,
 ) -> Result<(), AppError> {
+    let folder = state.resolve_sqlfiles_folder(&connection).await?;
     query_files::delete_query_file(
         &state.resolve_sqlfiles_dir().await?,
-        &connection,
+        &folder,
         &file_name,
     )
 }
@@ -365,9 +377,10 @@ async fn rename_query_file(
     old_name: String,
     new_name: String,
 ) -> Result<String, AppError> {
+    let folder = state.resolve_sqlfiles_folder(&connection).await?;
     query_files::rename_query_file(
         &state.resolve_sqlfiles_dir().await?,
-        &connection,
+        &folder,
         &old_name,
         &new_name,
     )
