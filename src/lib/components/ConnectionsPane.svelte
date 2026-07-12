@@ -27,7 +27,10 @@
     const rows: { label: string; value: string }[] = [];
     rows.push({ label: "Engine", value: engineLabel(c.engine) });
     if (isSqlite(c.engine)) {
-      if (c.schema) rows.push({ label: "File", value: c.schema });
+      // sqlite は DB ファイルパスを schema に置くが、無ければ host に置いた
+      // 設定も backend (db.rs の connect) がサポートする。同じフォールバックで表示する。
+      const file = c.schema ?? c.host;
+      if (file) rows.push({ label: "File", value: file });
     } else {
       if (c.host) {
         rows.push({
