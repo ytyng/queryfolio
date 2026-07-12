@@ -399,7 +399,7 @@ fn collect_ssh_config_lines(path: &Path, home: &Path, out: &mut Vec<String>, dep
     *depth += 1;
     if let Ok(content) = std::fs::read_to_string(path) {
         for raw_line in content.lines() {
-            let line = raw_line.trim();
+            let line = strip_inline_comment(raw_line.trim());
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
@@ -414,6 +414,24 @@ fn collect_ssh_config_lines(path: &Path, home: &Path, out: &mut Vec<String>, dep
         }
     }
     *depth -= 1;
+}
+
+/// OpenSSH に倣い行内コメントを除去する。`#` はダブルクオートの外側かつ
+/// 直前が空白 (または行頭) のときだけコメント開始とみなす。
+/// (`/a#b.sock` の `#` は値の一部、`"/a#b.sock"` の `#` はクオート内なので残す。
+///  `ssh -G` の挙動で確認済み。)
+fn strip_inline_comment(line: &str) -> &str {
+    let mut in_quotes = false;
+    let mut prev_is_ws = true; // 行頭は「空白の後」とみなす
+    for (i, ch) in line.char_indices() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            '#' if !in_quotes && prev_is_ws => return line[..i].trim_end(),
+            _ => {}
+        }
+        prev_is_ws = ch.is_whitespace();
+    }
+    line
 }
 
 /// ssh_config の 1 行を「キーワード」と「残り」に分割する。
@@ -838,6 +856,33 @@ mod tests {
         // 未定義変数は空に展開される
         std::env::remove_var("QF_TEST_UNDEFINED");
         assert_eq!(expand_env_vars("x${QF_TEST_UNDEFINED}y"), "xy");
+    }
+
+    #[test]
+    fn strips_inline_comments_like_openssh() {
+        // クオート外かつ空白前の `#` はコメント。
+        assert_eq!(strip_inline_comment("IdentityAgent none # disable"), "IdentityAgent none");
+        // トークン途中の `#` は値の一部。
+        assert_eq!(strip_inline_comment("IdentityAgent /a#b.sock"), "IdentityAgent /a#b.sock");
+        // クオート内の `#` は残す。
+        assert_eq!(
+            strip_inline_comment("IdentityAgent \"/a#b.sock\" # c"),
+            "IdentityAgent \"/a#b.sock\""
+        );
+        assert_eq!(strip_inline_comment("# whole line"), "");
+    }
+
+    #[test]
+    fn inline_comment_on_identity_agent_is_ignored() {
+        let home = Path::new("/home/u");
+        assert!(matches!(
+            resolve("Host *\n  IdentityAgent none # disable\n", "db", home),
+            Some(AgentSocket::Disabled)
+        ));
+        match resolve("Host *\n  IdentityAgent ~/a.sock # use this\n", "db", home) {
+            Some(AgentSocket::Path(p)) => assert_eq!(p, PathBuf::from("/home/u/a.sock")),
+            other => panic!("expected path, resolved={}", other.is_some()),
+        }
     }
 
     #[test]
