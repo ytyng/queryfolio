@@ -46,6 +46,45 @@ export const toCsv = (result: QueryResult): string => {
   return lines.join("\n");
 };
 
+// 結果テーブルの矩形選択範囲。行・列とも 0 始まりの閉区間 (両端を含む)。
+export interface CellRange {
+  rowStart: number;
+  rowEnd: number;
+  colStart: number;
+  colEnd: number;
+}
+
+// 選択範囲だけを CSV 化する (Cmd+C コピー用)。withHeaders でヘッダ行を含める。
+// 範囲は呼び出し側で結果サイズにクランプ済みである前提。
+export const toCsvRange = (
+  result: QueryResult,
+  range: CellRange,
+  withHeaders: boolean,
+): string => {
+  const { rowStart, rowEnd, colStart, colEnd } = range;
+  const lines: string[] = [];
+  if (withHeaders) {
+    const header: string[] = [];
+    for (let c = colStart; c <= colEnd; c++) {
+      header.push(escapeCsvField(escapeHeaderFormula(result.columns[c])));
+    }
+    lines.push(header.join(","));
+  }
+  for (let r = rowStart; r <= rowEnd; r++) {
+    const row = result.rows[r];
+    if (!row) {
+      continue;
+    }
+    const fields: string[] = [];
+    for (let c = colStart; c <= colEnd; c++) {
+      const v = row[c];
+      fields.push(escapeCsvField(escapeFormulaInjection(v, cellToString(v))));
+    }
+    lines.push(fields.join(","));
+  }
+  return lines.join("\n");
+};
+
 export const toTsv = (result: QueryResult): string => {
   const sanitize = (field: string) =>
     field.replace(/\t/g, " ").replace(/\r?\n/g, " ");
