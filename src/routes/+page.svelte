@@ -11,6 +11,7 @@
   import HistoryPane from "$lib/components/HistoryPane.svelte";
   import TablesPane from "$lib/components/TablesPane.svelte";
   import SqlEditor from "$lib/components/SqlEditor.svelte";
+  import ReplaceMultilinePane from "$lib/components/ReplaceMultilinePane.svelte";
   import ResultsPane from "$lib/components/ResultsPane.svelte";
   import ConfigInfoModal from "$lib/components/ConfigInfoModal.svelte";
   import AiAnalysisModal from "$lib/components/AiAnalysisModal.svelte";
@@ -19,6 +20,58 @@
 
   let showSettings = $state(false);
   let editor: SqlEditor | undefined = $state();
+
+  // Replace Multiline: エディタの複数行選択状態と、右側の置換ペインの表示。
+  // ペインを開いた時点の選択範囲を snapshot し、差し込み時に範囲がズレて
+  // いないか照合してから置換する (ファイル切替・編集での誤挿入を防ぐ)
+  let hasMultilineSelection = $state(false);
+  let showReplacePane = $state(false);
+  let replaceInitialLines = $state("");
+  let replaceSnapshot: { from: number; to: number; text: string } | null = null;
+  // ペインを開き直すたびに増やし、#key で再マウントして Lines を作り直す
+  let replaceOpenToken = $state(0);
+
+  function openReplacePane() {
+    const snap = editor?.getMainSelection();
+    if (!snap) {
+      return;
+    }
+    replaceSnapshot = snap;
+    replaceInitialLines = snap.text;
+    replaceOpenToken += 1;
+    showReplacePane = true;
+  }
+
+  function applyReplace(result: string) {
+    const snap = replaceSnapshot;
+    const ok =
+      snap != null &&
+      (editor?.replaceRangeIfMatches(
+        snap.from,
+        snap.to,
+        snap.text,
+        result,
+      ) ??
+        false);
+    if (ok) {
+      showReplacePane = false;
+    } else {
+      // 選択範囲がズレた (ファイル切替や編集) 場合は破壊せずに知らせる
+      toast.error("The editor selection changed — nothing was replaced.", {
+        description: "Use Copy to grab the result instead.",
+      });
+    }
+  }
+
+  // ファイル切替・クローズで選択追跡状態と置換ペインをリセットする。
+  // selectFile は null を経由せず別ファイルへ差し替えるため selectedFile を
+  // 依存にして毎回リセットし、stale な選択でのボタン表示・誤挿入を防ぐ
+  $effect(() => {
+    void appStore.selectedFile;
+    hasMultilineSelection = false;
+    showReplacePane = false;
+    replaceSnapshot = null;
+  });
   /// 左ペイン 2 列目のタブ (クエリファイル一覧 / クエリ履歴 / テーブル一覧)
   let leftPaneTab = $state<"files" | "history" | "tables">("files");
 
@@ -194,6 +247,9 @@
           onExplainSql={() =>
             appStore.explainSql(editor?.getCurrentStatement() ?? "")}
           onFormat={() => editor?.formatCurrentStatement()}
+          showReplaceMultiline={hasMultilineSelection &&
+            appStore.selectedFile !== null}
+          onReplaceMultiline={openReplacePane}
         />
       {/if}
       <div
@@ -202,14 +258,35 @@
         bind:this={editorPaneEl}
       >
         {#if appStore.selectedFile}
-          <SqlEditor
-            bind:this={editor}
-            content={appStore.editorContent}
-            engine={selectedEngine}
-            schemaMap={appStore.schemaMap}
-            onChange={(content) => appStore.updateEditorContent(content)}
-            onRun={(sql) => appStore.runQuery(sql)}
-          />
+          <!-- エディタと Replace Multiline ペインを横並びにする -->
+          <div class="flex h-full min-h-0">
+            <div class="min-w-0 flex-1">
+              <SqlEditor
+                bind:this={editor}
+                content={appStore.editorContent}
+                engine={selectedEngine}
+                schemaMap={appStore.schemaMap}
+                onChange={(content) => appStore.updateEditorContent(content)}
+                onRun={(sql) => appStore.runQuery(sql)}
+                onSelectionChange={(info) => {
+                  hasMultilineSelection = info.hasMultilineSelection;
+                }}
+              />
+            </div>
+            {#if showReplacePane}
+              <div class="w-96 shrink-0 border-l border-zinc-700">
+                {#key replaceOpenToken}
+                  <ReplaceMultilinePane
+                    initialLines={replaceInitialLines}
+                    onReplace={applyReplace}
+                    onClose={() => {
+                      showReplacePane = false;
+                    }}
+                  />
+                {/key}
+              </div>
+            {/if}
+          </div>
         {:else}
           <div class="flex h-full items-center justify-center">
             <p class="text-sm text-zinc-600">

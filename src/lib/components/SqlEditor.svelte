@@ -27,9 +27,20 @@
     schemaMap: Record<string, string[]> | null;
     onChange: (content: string) => void;
     onRun: (sql: string) => void;
+    /// 選択範囲が変わるたびに呼ぶ。複数行選択かどうか (Replace Multiline
+    /// ボタンの表示条件) を通知する。選択テキスト自体は開く時点で
+    /// getMainSelection() で snapshot するのでここでは渡さない
+    onSelectionChange?: (info: { hasMultilineSelection: boolean }) => void;
   }
 
-  let { content, engine, schemaMap, onChange, onRun }: Props = $props();
+  let {
+    content,
+    engine,
+    schemaMap,
+    onChange,
+    onRun,
+    onSelectionChange,
+  }: Props = $props();
 
   let editorElement: HTMLDivElement;
   let view: EditorView | null = null;
@@ -169,6 +180,65 @@
     }
     return range;
   };
+
+  // 現在の主選択が複数行にまたがっているかを通知する
+  const emitSelectionChange = (state: EditorState) => {
+    if (!onSelectionChange) {
+      return;
+    }
+    const sel = state.selection.main;
+    const startLine = state.doc.lineAt(sel.from).number;
+    const endLine = state.doc.lineAt(sel.to).number;
+    onSelectionChange({
+      hasMultilineSelection: !sel.empty && endLine > startLine,
+    });
+  };
+
+  // 現在の主選択のスナップショット (Replace Multiline を開いた時点で取得)。
+  // 後で範囲がドキュメント編集でズレていないかを text で照合する
+  export function getMainSelection(): {
+    from: number;
+    to: number;
+    text: string;
+  } {
+    if (!view) {
+      return { from: 0, to: 0, text: "" };
+    }
+    const sel = view.state.selection.main;
+    return {
+      from: sel.from,
+      to: sel.to,
+      text: view.state.sliceDoc(sel.from, sel.to),
+    };
+  }
+
+  // スナップショットした範囲 [from, to) を text で置換する公開メソッド。
+  // その範囲の現在テキストが expected と一致する時だけ実行し、ファイル切替や
+  // 編集で範囲がズレている場合は何もせず false を返す (無関係な箇所への
+  // 誤挿入・破壊を防ぐ)。置換後は挿入テキスト全体を選択状態にする
+  export function replaceRangeIfMatches(
+    from: number,
+    to: number,
+    expected: string,
+    text: string,
+  ): boolean {
+    if (!view) {
+      return false;
+    }
+    const docLength = view.state.doc.length;
+    if (from < 0 || to < from || to > docLength) {
+      return false;
+    }
+    if (view.state.sliceDoc(from, to) !== expected) {
+      return false;
+    }
+    view.dispatch({
+      changes: { from, to, insert: text },
+      selection: { anchor: from, head: from + text.length },
+    });
+    view.focus();
+    return true;
+  }
 
   const currentStatementText = (state: EditorState): string => {
     const range = executionTargetRange(state, state.selection.main.head);
@@ -322,6 +392,10 @@
           EditorView.updateListener.of((update) => {
             if (update.docChanged) {
               onChange(update.state.doc.toString());
+            }
+            // 選択の変化 (ドキュメント変更でズレる場合も含む) を通知する
+            if (update.selectionSet || update.docChanged) {
+              emitSelectionChange(update.state);
             }
           }),
         ],
