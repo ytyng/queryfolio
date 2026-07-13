@@ -5,4 +5,7 @@ html,
 body {
   height: 100%;
   overscroll-behavior: none;
+  /* UI はダーク固定。ネイティブ枠・スクロールバー・フォーム部品も
+     ダーク表示に揃える (WKWebView にダーク外観を宣言する) */
+  color-scheme: dark;
 }
