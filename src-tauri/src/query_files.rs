@@ -52,6 +52,9 @@ fn file_path(
 /// ディレクトリ直下の .sql ファイル名を昇順で返す。存在しなければ空。
 /// (list_query_files と search_query_files で列挙条件を共有し、
 ///  隠しファイル/拡張子判定/ソートが片方だけズレるのを防ぐ)
+/// dot 始まりの隠しファイルは除外する。validate_component が dot 始まりの名前を
+/// 拒否する (= CRUD で開けない) のと一貫させ、手動配置された隠し .sql の中身が
+/// 検索プレビューから漏れないようにする。
 fn list_sql_file_names(dir: &Path) -> Result<Vec<String>, AppError> {
     if !dir.exists() {
         return Ok(vec![]);
@@ -60,6 +63,7 @@ fn list_sql_file_names(dir: &Path) -> Result<Vec<String>, AppError> {
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.path().is_file())
         .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| !name.starts_with('.'))
         .filter(|name| name.to_ascii_lowercase().ends_with(".sql"))
         .collect();
     names.sort();
@@ -435,6 +439,22 @@ mod tests {
 
         // どちらにも無い語は 0 件
         assert!(search_query_files(&dir, connection, "zzz").unwrap().is_empty());
+
+        // 手動配置された隠し .sql は検索対象外 (中身プレビューを漏らさない)。
+        // validate_component が dot 始まりを拒否するため create 経由では作れないので
+        // 直接ファイルを書き込んで再現する
+        fs::write(
+            connection_dir(&dir, connection).unwrap().join(".secret.sql"),
+            "SELECT secret_total FROM vault;",
+        )
+        .unwrap();
+        assert!(search_query_files(&dir, connection, "secret")
+            .unwrap()
+            .is_empty());
+        assert!(!list_query_files(&dir, connection)
+            .unwrap()
+            .iter()
+            .any(|f| f.starts_with('.')));
 
         // 存在しない接続ディレクトリは 0 件
         assert!(search_query_files(&dir, "no-such-conn", "users")
