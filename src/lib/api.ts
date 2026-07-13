@@ -122,6 +122,20 @@ export const listQueryHistory = (
 export const listQueryFiles = (connection: string) =>
   invoke<string[]>("list_query_files", { connection });
 
+/// クエリファイル検索の 1 ヒット (バックエンドの query_files::FileSearchHit に対応)
+export interface FileSearchHit {
+  /// ヒットしたファイル名 (.sql 付き)
+  file_name: string;
+  /// ファイル名が query に一致したか
+  name_match: boolean;
+  /// 中身が一致した最初の行 (プレビュー用。名前のみ一致なら null)
+  content_preview: string | null;
+}
+
+/// 接続のクエリファイルをファイル名・中身で検索する (大文字小文字を区別しない部分一致)。
+export const searchQueryFiles = (connection: string, query: string) =>
+  invoke<FileSearchHit[]>("search_query_files", { connection, query });
+
 export const readQueryFile = (connection: string, fileName: string) =>
   invoke<string>("read_query_file", { connection, fileName });
 

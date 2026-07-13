@@ -17,9 +17,19 @@
   import ConfigInfoModal from "$lib/components/ConfigInfoModal.svelte";
   import AiAnalysisModal from "$lib/components/AiAnalysisModal.svelte";
   import DangerousConfirmModal from "$lib/components/DangerousConfirmModal.svelte";
+  import SearchModal from "$lib/components/SearchModal.svelte";
   import PaneDivider from "$lib/components/PaneDivider.svelte";
 
   let showSettings = $state(false);
+  let showSearch = $state(false);
+
+  /// グローバルショートカット。Cmd+K (mac) / Ctrl+K で検索モーダルを開閉する。
+  function handleGlobalKeydown(e: KeyboardEvent) {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      showSearch = !showSearch;
+    }
+  }
   let editor: SqlEditor | undefined = $state();
 
   // Replace Multiline: エディタの複数行選択状態と、右側の置換ペインの表示。
@@ -170,9 +180,14 @@
   });
 </script>
 
+<svelte:window onkeydown={handleGlobalKeydown} />
+
 <div class="flex h-screen flex-col bg-zinc-950 text-zinc-200">
   <Toolbar
     onRunCurrent={() => editor?.runCurrentStatement()}
+    onOpenSearch={() => {
+      showSearch = true;
+    }}
     onOpenSettings={() => {
       showSettings = true;
     }}
@@ -335,6 +350,14 @@
     </div>
   </div>
 </div>
+
+{#if showSearch}
+  <SearchModal
+    onClose={() => {
+      showSearch = false;
+    }}
+  />
+{/if}
 
 {#if showSettings}
   <ConfigInfoModal

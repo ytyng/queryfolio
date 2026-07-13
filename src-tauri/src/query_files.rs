@@ -49,16 +49,14 @@ fn file_path(
     Ok(connection_dir(sqlfiles_dir, connection)?.join(file_name))
 }
 
-/// 接続のクエリファイル一覧を返す (名前昇順)。
-pub fn list_query_files(
-    sqlfiles_dir: &Path,
-    connection: &str,
-) -> Result<Vec<String>, AppError> {
-    let dir = connection_dir(sqlfiles_dir, connection)?;
+/// ディレクトリ直下の .sql ファイル名を昇順で返す。存在しなければ空。
+/// (list_query_files と search_query_files で列挙条件を共有し、
+///  隠しファイル/拡張子判定/ソートが片方だけズレるのを防ぐ)
+fn list_sql_file_names(dir: &Path) -> Result<Vec<String>, AppError> {
     if !dir.exists() {
         return Ok(vec![]);
     }
-    let mut names: Vec<String> = fs::read_dir(&dir)?
+    let mut names: Vec<String> = fs::read_dir(dir)?
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.path().is_file())
         .filter_map(|entry| entry.file_name().into_string().ok())
@@ -66,6 +64,86 @@ pub fn list_query_files(
         .collect();
     names.sort();
     Ok(names)
+}
+
+/// 接続のクエリファイル一覧を返す (名前昇順)。
+pub fn list_query_files(
+    sqlfiles_dir: &Path,
+    connection: &str,
+) -> Result<Vec<String>, AppError> {
+    list_sql_file_names(&connection_dir(sqlfiles_dir, connection)?)
+}
+
+/// クエリファイル検索の 1 ヒット。
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct FileSearchHit {
+    /// ヒットしたファイル名 (.sql 付き)
+    pub file_name: String,
+    /// ファイル名が query に一致したか
+    pub name_match: bool,
+    /// 中身が一致した最初の行 (プレビュー用。名前のみ一致なら None)
+    pub content_preview: Option<String>,
+}
+
+/// プレビュー行の最大文字数 (これを超えたら末尾を省略記号にする)。
+const PREVIEW_MAX_CHARS: usize = 120;
+
+/// 検索結果の最大件数。名前昇順で先頭からこの数で打ち切る
+/// (モーダルの一覧を短く保ち、多数ファイル環境での読み取りコストも抑える)。
+const MAX_SEARCH_HITS: usize = 50;
+
+/// プレビュー行を前後の空白除去 + 長さ制限で整形する。
+fn truncate_preview(line: &str) -> String {
+    let trimmed = line.trim();
+    if trimmed.chars().count() <= PREVIEW_MAX_CHARS {
+        return trimmed.to_string();
+    }
+    let cut: String = trimmed.chars().take(PREVIEW_MAX_CHARS).collect();
+    format!("{cut}…")
+}
+
+/// 接続のクエリファイルをファイル名・中身で検索する。
+/// 大文字小文字を区別しない部分一致。中身は最初に一致した行をプレビューとして返す。
+/// 名前昇順で、名前一致または中身一致したファイルのみ返す。
+/// (rg/grep のような外部プロセスは使わない。クエリファイルは少数のため
+///  純 Rust で読み取る方が堅牢で、外部依存・インジェクション面も持たない)
+pub fn search_query_files(
+    sqlfiles_dir: &Path,
+    connection: &str,
+    query: &str,
+) -> Result<Vec<FileSearchHit>, AppError> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Ok(vec![]);
+    }
+    let dir = connection_dir(sqlfiles_dir, connection)?;
+    let names = list_sql_file_names(&dir)?;
+
+    let mut hits = Vec::new();
+    for name in names {
+        let name_match = name.to_lowercase().contains(&needle);
+        // 中身検索。読めないファイル (バイナリ等) はスキップし、名前一致だけで拾う
+        let content_preview = fs::read_to_string(dir.join(&name))
+            .ok()
+            .and_then(|content| {
+                content
+                    .lines()
+                    .find(|line| line.to_lowercase().contains(&needle))
+                    .map(truncate_preview)
+            });
+        if name_match || content_preview.is_some() {
+            hits.push(FileSearchHit {
+                file_name: name,
+                name_match,
+                content_preview,
+            });
+            // 名前昇順で先頭から上限まで。以降のファイルは読まずに打ち切る
+            if hits.len() >= MAX_SEARCH_HITS {
+                break;
+            }
+        }
+    }
+    Ok(hits)
 }
 
 pub fn read_query_file(
@@ -310,5 +388,68 @@ mod tests {
         assert!(!files.contains(&"Report.sql".to_string()));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_search_query_files() {
+        let dir = test_dir().join("search");
+        let connection = "test-conn";
+
+        create_query_file(&dir, connection, "users report").unwrap();
+        write_query_file(
+            &dir,
+            connection,
+            "users report",
+            "SELECT * FROM users WHERE active = 1;",
+        )
+        .unwrap();
+        create_query_file(&dir, connection, "orders").unwrap();
+        write_query_file(
+            &dir,
+            connection,
+            "orders",
+            "SELECT id, total FROM orders;",
+        )
+        .unwrap();
+
+        // 空クエリは空
+        assert!(search_query_files(&dir, connection, "  ").unwrap().is_empty());
+
+        // ファイル名一致 (大文字小文字を区別しない)
+        let hits = search_query_files(&dir, connection, "USERS").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].file_name, "users report.sql");
+        assert!(hits[0].name_match);
+        // "users" は中身にもあるのでプレビューが付く
+        assert!(hits[0].content_preview.as_deref().unwrap().contains("users"));
+
+        // 中身のみ一致 (ファイル名は "orders" だが中身に total がある)
+        let hits = search_query_files(&dir, connection, "total").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].file_name, "orders.sql");
+        assert!(!hits[0].name_match);
+        assert_eq!(
+            hits[0].content_preview.as_deref(),
+            Some("SELECT id, total FROM orders;")
+        );
+
+        // どちらにも無い語は 0 件
+        assert!(search_query_files(&dir, connection, "zzz").unwrap().is_empty());
+
+        // 存在しない接続ディレクトリは 0 件
+        assert!(search_query_files(&dir, "no-such-conn", "users")
+            .unwrap()
+            .is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_truncate_preview() {
+        assert_eq!(truncate_preview("  SELECT 1  "), "SELECT 1");
+        let long = "x".repeat(200);
+        let out = truncate_preview(&long);
+        assert_eq!(out.chars().count(), PREVIEW_MAX_CHARS + 1); // +1 は省略記号
+        assert!(out.ends_with('…'));
     }
 }

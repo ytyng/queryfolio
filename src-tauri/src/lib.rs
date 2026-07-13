@@ -323,6 +323,21 @@ async fn list_query_files(
     query_files::list_query_files(&state.resolve_sqlfiles_dir().await?, &folder)
 }
 
+/// 接続のクエリファイルをファイル名・中身で検索する (大文字小文字を区別しない部分一致)。
+#[tauri::command]
+async fn search_query_files(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    query: String,
+) -> Result<Vec<query_files::FileSearchHit>, AppError> {
+    let folder = state.resolve_sqlfiles_folder(&connection).await?;
+    query_files::search_query_files(
+        &state.resolve_sqlfiles_dir().await?,
+        &folder,
+        &query,
+    )
+}
+
 #[tauri::command]
 async fn read_query_file(
     state: tauri::State<'_, AppState>,
@@ -742,6 +757,7 @@ pub fn run() {
             cancel_query,
             list_query_history,
             list_query_files,
+            search_query_files,
             read_query_file,
             write_query_file,
             create_query_file,
