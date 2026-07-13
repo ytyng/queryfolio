@@ -766,12 +766,18 @@ const dismissFixSuggestion = (tabId: number) => {
   }
 };
 
+/// セル編集を適用中 (run_statements 実行中) の接続。クエリ実行と同様に
+/// 同一接続の並列実行を抑止するため isConnectionRunning に含める。
+let applyingConnections = $state(new Set<string>());
+
 /// 指定した接続でクエリ実行中のタブがあるかを返す。
 /// バックエンドのキャンセルレジストリは接続単位で最後の実行しか
 /// 管理しないため、同一接続の並列実行はフロント側で抑止する
 /// (許すとキャンセル対象の取り違えや取りこぼしが起きる)。
+/// セル編集の適用中 (applyingConnections) も実行中として扱う。
 const isConnectionRunning = (connection: string): boolean =>
-  resultTabs.some((t) => t.running && t.connection === connection);
+  resultTabs.some((t) => t.running && t.connection === connection) ||
+  applyingConnections.has(connection);
 
 /// 実行結果の書き込み先タブを決める。
 /// アクティブな非ピン留めタブがあれば使い回し、無ければ新規タブを作る。
@@ -1118,6 +1124,59 @@ const rerunTab = async (id: number) => {
   await executeTab(tab);
 };
 
+/// 結果グリッドのセル編集 (UPDATE 群) を 1 トランザクションで適用する。
+/// 適用は「アクティブ接続かつ Writable ON」の時だけ (UI でも抑止しているが、
+/// 別接続タブの誤適用や無駄な往復を防ぐためここでもガードする)。成功したら
+/// 表示値を実際の DB 状態に合わせるため再実行し、true を返す。
+const submitCellEdits = async (
+  tabId: number,
+  statements: string[],
+): Promise<boolean> => {
+  const tab = resultTabs.find((t) => t.id === tabId);
+  if (!tab || statements.length === 0) {
+    return false;
+  }
+  if (!effectiveWritable(tab.connection)) {
+    toast.warning(
+      "Turn on the Writable switch for this connection to apply edits.",
+    );
+    return false;
+  }
+  // 同一接続で実行中 (クエリまたは別の適用) なら適用しない
+  // (キャンセル対象の取り違え防止・Submit 連打防止。runQuery と同じ不変条件)
+  if (isConnectionRunning(tab.connection)) {
+    toast.warning(
+      "A query is already running on this connection. Wait for it to finish.",
+    );
+    return false;
+  }
+  const connection = tab.connection;
+  // 適用中は接続を「実行中」に登録し、並列実行・二重 Submit を抑止する
+  applyingConnections = new Set(applyingConnections).add(connection);
+  let affected: number;
+  try {
+    affected = await api.runStatements(
+      connection,
+      statements,
+      effectiveWritable(connection),
+    );
+  } catch (e) {
+    toast.error("Failed to apply the changes", {
+      description: toErrorMessage(e),
+    });
+    return false;
+  } finally {
+    // rerunTab は isConnectionRunning を見て早期 return するため、再取得の前に外す
+    const next = new Set(applyingConnections);
+    next.delete(connection);
+    applyingConnections = next;
+  }
+  toast.success(`Applied ${affected} row change${affected === 1 ? "" : "s"}`);
+  // 表示を DB の実際の値に合わせるため再取得する (適用自体は成功済み)
+  await rerunTab(tabId);
+  return true;
+};
+
 const selectResultTab = (id: number) => {
   if (resultTabs.some((t) => t.id === id)) {
     activeTabId = id;
@@ -1284,6 +1343,7 @@ export default {
   closeAiExplanation,
   cancelQuery,
   rerunTab,
+  submitCellEdits,
   selectResultTab,
   closeResultTab,
   toggleResultTabPin,

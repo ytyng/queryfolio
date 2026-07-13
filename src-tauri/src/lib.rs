@@ -521,6 +521,47 @@ async fn get_schema_map(
     state.resolve_schema_map(&server, &schema_key).await
 }
 
+/// テーブルの主キーを構成するカラム名を返す (結果グリッドのセル編集用)。
+/// 主キーが無いテーブルでは空を返す。
+#[tauri::command]
+async fn get_primary_keys(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    table: String,
+) -> Result<Vec<String>, AppError> {
+    let server = state.find_server(&connection).await?;
+    let pool = state.db.get_pool(&server).await?;
+    schema_info::fetch_primary_keys(&pool, &table).await
+}
+
+/// 結果グリッドのセル編集を UPDATE 群として 1 トランザクションで適用する。
+/// writable の解決は run_query と同じ (config readonly が最優先、次にスイッチ)。
+/// 合計の影響行数を返す。
+#[tauri::command]
+async fn run_statements(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    statements: Vec<String>,
+    writable: Option<bool>,
+) -> Result<u64, AppError> {
+    let server = state.find_server(&connection).await?;
+    let readonly_guard = if server.readonly {
+        db::ReadonlyGuard::Config
+    } else if writable.unwrap_or(false) {
+        db::ReadonlyGuard::Off
+    } else {
+        db::ReadonlyGuard::Switch
+    };
+    let pool = state.db.get_pool(&server).await?;
+    db::run_statements(
+        &pool,
+        &statements,
+        readonly_guard,
+        server.allow_dangerous_statements,
+    )
+    .await
+}
+
 /// AI 設定の情報 (configured / model) を返す。api_key は含めない。
 /// `ai:` セクションが無い場合はエラーではなく configured: false。
 /// セクションはあるが不正 (不明 provider 等) な場合はエラーを返す。
@@ -769,6 +810,8 @@ pub fn run() {
             list_tables,
             list_columns,
             get_schema_map,
+            get_primary_keys,
+            run_statements,
             get_ai_info,
             ai_generate_sql,
             build_explain_sql,

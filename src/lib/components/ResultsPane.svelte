@@ -1,8 +1,16 @@
 <script lang="ts">
   import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+  import * as api from "$lib/api";
   import appStore, { isExplainSql } from "$lib/stores/app.svelte";
   import type { ResultTab } from "$lib/stores/app.svelte";
   import { toCsv, toCsvRange, toJson, toTsv, type CellRange } from "$lib/export";
+  import {
+    singleTableSelectTable,
+    buildUpdateStatements,
+    normalizeEngine,
+    type NormalizedEngine,
+    type CellEdit,
+  } from "$lib/editableResult";
   import CellInspector from "./CellInspector.svelte";
   import AiAnalysisModal from "./AiAnalysisModal.svelte";
 
@@ -366,6 +374,261 @@
         : "AI is not configured. Add an 'ai:' section (provider: openai, " +
           "api_key: ...) to config.yml or the connection YAML.",
   );
+
+  // ------- 結果セルの編集 (ダブルクリック → 保留 → Preview/Edit/Submit/Cancel) -------
+
+  /// あるタブの編集可否と対象テーブル / 主キー / 編集可能列。
+  interface EditContext {
+    table: string;
+    pkColumns: string[];
+    editableColumns: Set<string>;
+  }
+
+  // tabId ごとにキャッシュ。値 null = 判定済みで編集不可、キー無し = 未判定。
+  let editContexts = $state(new Map<number, EditContext | null>());
+  // tabId -> (`${rowIndex}:${column}` -> 編集内容)
+  let pendingEdits = $state(new Map<number, Map<string, CellEdit>>());
+  // インライン編集中のセル (1 つ)
+  let editingCell = $state<{
+    tabId: number;
+    rowIndex: number;
+    colIndex: number;
+  } | null>(null);
+  let editingValue = $state("");
+  // Preview モーダルに出す UPDATE 文 (非表示中は null)
+  let previewStatements = $state<string[] | null>(null);
+  // 結果が再取得された (executedAt 変化) タブの編集状態を破棄するための記録
+  const seenExecutedAt = new Map<number, number>();
+
+  const activeEngine = $derived.by<NormalizedEngine | null>(() => {
+    const conn = activeTab?.connection;
+    if (!conn) return null;
+    const info = appStore.connections.find((c) => c.name === conn);
+    return info ? normalizeEngine(info.engine) : null;
+  });
+
+  /// 編集はアクティブ接続かつ Writable ON かつ config readonly でない時のみ。
+  /// さらにタブの実行時スキーマが現在のアクティブスキーマと一致する時だけ許可する。
+  /// 生成する UPDATE はスキーマ未修飾で「接続の現在のアクティブスキーマ」に対して
+  /// 走るため、実行後にスキーマを切り替えていると別スキーマの同名テーブルを
+  /// 更新してしまう。スキーマ不一致時は編集不可にしてこれを防ぐ。
+  const canEditActiveConnection = $derived(
+    activeTab !== null &&
+      activeTab.connection === appStore.selectedConnection &&
+      appStore.writable &&
+      !appStore.selectedConnectionReadonly &&
+      activeTab.schema === appStore.activeSchema,
+  );
+
+  const activeEditContext = $derived(
+    activeTab ? (editContexts.get(activeTab.id) ?? null) : null,
+  );
+  const activePending = $derived(
+    activeTab ? (pendingEdits.get(activeTab.id) ?? null) : null,
+  );
+  const pendingCount = $derived(activePending ? activePending.size : 0);
+  // 適用中 (または同一接続でクエリ実行中) は Submit を無効化し、二重 Submit や
+  // 並列実行を防ぐ (submitCellEdits 側の isConnectionRunning ガードと二重の防御)。
+  const submitDisabled = $derived(
+    activeTab === null || appStore.isConnectionRunning(activeTab.connection),
+  );
+
+  // 結果の入れ替わりで編集状態を破棄し、編集可能な状況なら editContext を求める
+  $effect(() => {
+    const tab = activeTab;
+    if (!tab) return;
+    const seen = seenExecutedAt.get(tab.id);
+    if (seen !== tab.executedAt) {
+      seenExecutedAt.set(tab.id, tab.executedAt);
+      if (pendingEdits.has(tab.id)) {
+        pendingEdits.delete(tab.id);
+        pendingEdits = new Map(pendingEdits);
+      }
+      if (editContexts.has(tab.id)) {
+        editContexts.delete(tab.id);
+        editContexts = new Map(editContexts);
+      }
+      if (editingCell?.tabId === tab.id) editingCell = null;
+    }
+    if (canEditActiveConnection && tab.result && !editContexts.has(tab.id)) {
+      void deriveEditContext(tab);
+    }
+  });
+
+  async function deriveEditContext(tab: ResultTab) {
+    const result = tab.result;
+    if (!result) return;
+    const table = singleTableSelectTable(tab.sql);
+    let ctx: EditContext | null = null;
+    if (table) {
+      try {
+        const [pk, cols] = await Promise.all([
+          api.getPrimaryKeys(tab.connection, table),
+          api.listColumns(tab.connection, table),
+        ]);
+        const colNames = new Set(cols.map((c) => c.name));
+        // 列名に重複があると行/列の対応が曖昧なため編集不可 (安全側)
+        const hasDup = result.columns.length !== new Set(result.columns).size;
+        const pkPresent =
+          pk.length > 0 && pk.every((k) => result.columns.includes(k));
+        if (!hasDup && pkPresent) {
+          const editable = new Set(
+            result.columns.filter((c) => colNames.has(c) && !pk.includes(c)),
+          );
+          if (editable.size > 0) {
+            ctx = { table, pkColumns: pk, editableColumns: editable };
+          }
+        }
+      } catch {
+        ctx = null; // 取得失敗は編集不可に倒す
+      }
+    }
+    // 応答が古い (結果が入れ替わった) なら捨てる
+    const current = appStore.resultTabs.find((t) => t.id === tab.id);
+    if (!current || current.executedAt !== tab.executedAt) return;
+    editContexts.set(tab.id, ctx);
+    editContexts = new Map(editContexts);
+  }
+
+  const editText = (v: unknown): string =>
+    v === null || v === undefined ? "" : String(v);
+
+  const isColumnEditable = (colIndex: number): boolean => {
+    if (!canEditActiveConnection) return false;
+    const ctx = activeEditContext;
+    const col = activeTab?.result?.columns[colIndex];
+    return !!ctx && col != null && ctx.editableColumns.has(col);
+  };
+
+  // オブジェクト (JSON / blob) セルはインライン編集の対象外にする
+  const isCellEditable = (rowIndex: number, colIndex: number): boolean => {
+    if (!isColumnEditable(colIndex)) return false;
+    const v = activeTab?.result?.rows[rowIndex]?.[colIndex];
+    return typeof v !== "object" || v === null;
+  };
+
+  const pendingInput = (rowIndex: number, colIndex: number): string | null => {
+    const col = activeTab?.result?.columns[colIndex];
+    if (!col || !activePending) return null;
+    return activePending.get(`${rowIndex}:${col}`)?.input ?? null;
+  };
+
+  const isEditingCell = (rowIndex: number, colIndex: number): boolean =>
+    editingCell !== null &&
+    editingCell.tabId === activeTab?.id &&
+    editingCell.rowIndex === rowIndex &&
+    editingCell.colIndex === colIndex;
+
+  const beginCellEdit = (rowIndex: number, colIndex: number) => {
+    if (!activeTab?.result || !isCellEditable(rowIndex, colIndex)) return;
+    const col = activeTab.result.columns[colIndex];
+    const existing = activePending?.get(`${rowIndex}:${col}`);
+    const original = activeTab.result.rows[rowIndex][colIndex];
+    editingCell = { tabId: activeTab.id, rowIndex, colIndex };
+    editingValue = existing ? existing.input : editText(original);
+  };
+
+  const commitCellEdit = () => {
+    const ec = editingCell;
+    if (!ec || !activeTab || ec.tabId !== activeTab.id || !activeTab.result) {
+      editingCell = null;
+      return;
+    }
+    const col = activeTab.result.columns[ec.colIndex];
+    const original = activeTab.result.rows[ec.rowIndex][ec.colIndex];
+    const key = `${ec.rowIndex}:${col}`;
+    const map = new Map(pendingEdits.get(activeTab.id) ?? []);
+    // 元の表示と同じに戻したら保留を解除する
+    if (editingValue === editText(original)) {
+      map.delete(key);
+    } else {
+      map.set(key, {
+        rowIndex: ec.rowIndex,
+        column: col,
+        original,
+        input: editingValue,
+      });
+    }
+    if (map.size > 0) pendingEdits.set(activeTab.id, map);
+    else pendingEdits.delete(activeTab.id);
+    pendingEdits = new Map(pendingEdits);
+    editingCell = null;
+  };
+
+  const cancelCellEdit = () => {
+    editingCell = null;
+  };
+
+  const onEditKeydown = (e: KeyboardEvent) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      commitCellEdit();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      cancelCellEdit();
+    }
+  };
+
+  const clearPending = () => {
+    const tab = activeTab;
+    if (!tab) return;
+    if (pendingEdits.has(tab.id)) {
+      pendingEdits.delete(tab.id);
+      pendingEdits = new Map(pendingEdits);
+    }
+    editingCell = null;
+  };
+
+  const buildActiveStatements = (): string[] => {
+    const tab = activeTab;
+    const ctx = activeEditContext;
+    const eng = activeEngine;
+    const pending = activePending;
+    if (!tab?.result || !ctx || !eng || !pending || pending.size === 0) {
+      return [];
+    }
+    return buildUpdateStatements(
+      eng,
+      ctx.table,
+      ctx.pkColumns,
+      tab.result.columns,
+      tab.result.rows,
+      [...pending.values()],
+    );
+  };
+
+  const openPreview = () => {
+    const stmts = buildActiveStatements();
+    if (stmts.length > 0) previewStatements = stmts;
+  };
+
+  // 生成した UPDATE をエディタへ貼り、保留は解除する (以降は手動で実行する想定)
+  const editInEditor = () => {
+    const stmts = buildActiveStatements();
+    if (stmts.length === 0) return;
+    const text = stmts.map((s) => `${s};`).join("\n");
+    if (appStore.insertSqlSnippet(text)) {
+      clearPending();
+      previewStatements = null;
+    }
+  };
+
+  const submitEdits = async () => {
+    const tab = activeTab;
+    const stmts = buildActiveStatements();
+    if (!tab || stmts.length === 0) return;
+    const ok = await appStore.submitCellEdits(tab.id, stmts);
+    if (ok) {
+      // 成功時は再実行で結果が入れ替わり effect が保留を破棄するが、明示的にも消す
+      clearPending();
+      previewStatements = null;
+    }
+  };
+
+  const cancelAllEdits = () => {
+    clearPending();
+    previewStatements = null;
+  };
 </script>
 
 <!-- ドラッグ選択はセルの pointerenter で追跡するため、
@@ -564,6 +827,53 @@
     </div>
   {/if}
 
+  <!-- 保留中のセル編集バー (未確定の編集がある時のみ) -->
+  {#if pendingCount > 0}
+    <div
+      class="flex shrink-0 items-center gap-3 border-b border-amber-700/60 bg-amber-950/40 px-3 py-1.5 text-xs text-amber-200"
+      data-annotate="bar-pending-edits"
+    >
+      <span class="font-semibold">
+        {pendingCount} pending edit{pendingCount === 1 ? "" : "s"}
+      </span>
+      <span class="ml-auto flex items-center gap-1">
+        <button
+          class="rounded border border-amber-600/60 px-1.5 py-0.5 hover:bg-amber-800/50"
+          title="Preview the UPDATE statements"
+          data-annotate="button-edits-preview"
+          onclick={openPreview}
+        >
+          <i class="bi bi-eye" aria-hidden="true"></i> Preview
+        </button>
+        <button
+          class="rounded border border-amber-600/60 px-1.5 py-0.5 hover:bg-amber-800/50"
+          title="Paste the UPDATE statements into the editor (does not run them)"
+          data-annotate="button-edits-edit"
+          onclick={editInEditor}
+        >
+          <i class="bi bi-pencil" aria-hidden="true"></i> Edit
+        </button>
+        <button
+          class="rounded border border-emerald-600/60 bg-emerald-900/40 px-1.5 py-0.5 text-emerald-200 hover:bg-emerald-800/50 disabled:cursor-default disabled:opacity-40 disabled:hover:bg-emerald-900/40"
+          title="Run the UPDATE statements in one transaction"
+          data-annotate="button-edits-submit"
+          disabled={submitDisabled}
+          onclick={submitEdits}
+        >
+          <i class="bi bi-check2" aria-hidden="true"></i> Submit
+        </button>
+        <button
+          class="rounded border border-zinc-600 px-1.5 py-0.5 text-zinc-300 hover:bg-zinc-700"
+          title="Discard all pending edits"
+          data-annotate="button-edits-cancel"
+          onclick={cancelAllEdits}
+        >
+          <i class="bi bi-x" aria-hidden="true"></i> Cancel
+        </button>
+      </span>
+    </div>
+  {/if}
+
   <div class="flex min-h-0 flex-1">
     <!-- tabindex/bind: セル選択後の Cmd+C コピーを結果グリッドに限定する
          (window の keydown で gridEl 内にフォーカスがある時だけ処理) -->
@@ -707,29 +1017,50 @@
                   </button>
                 </td>
                 {#each row as value, colIndex (colIndex)}
-                  <!-- クリックでセルインスペクタを開く。ドラッグで矩形選択。
-                       truncate のためボタンをセル全面に敷く -->
+                  {@const pending = pendingInput(rowIndex, colIndex)}
+                  {@const editable = isCellEditable(rowIndex, colIndex)}
+                  <!-- クリックでセルインスペクタ、ドラッグで矩形選択、
+                       ダブルクリックで編集 (編集可能セルのみ)。
+                       truncate のためボタン/入力をセル全面に敷く -->
                   <td
-                    class="max-w-96 border-b border-r border-zinc-800 p-0 {cellBgClass(
-                      rowIndex,
-                      colIndex,
-                    )}"
+                    class="max-w-96 border-b border-r border-zinc-800 p-0 {pending !==
+                    null
+                      ? 'bg-amber-900/40'
+                      : cellBgClass(rowIndex, colIndex)}"
                   >
-                    <button
-                      class="block w-full cursor-pointer truncate px-2 py-0.5 text-left {value ===
-                      null
-                        ? 'italic text-zinc-600'
-                        : 'text-zinc-200'}"
-                      title={cellText(value)}
-                      data-annotate="button-result-cell-{rowIndex}-{colIndex}"
-                      onpointerdown={(e) =>
-                        beginSelect("cell", rowIndex, colIndex, e)}
-                      onpointerenter={(e) =>
-                        extendSelect("cell", rowIndex, colIndex, e)}
-                      onclick={() => onCellClick(rowIndex, colIndex)}
-                    >
-                      {cellText(value)}
-                    </button>
+                    {#if isEditingCell(rowIndex, colIndex)}
+                      <!-- svelte-ignore a11y_autofocus -->
+                      <input
+                        class="block w-full bg-zinc-950 px-2 py-0.5 font-mono text-xs text-amber-100 ring-1 ring-amber-500 outline-none"
+                        data-annotate="input-result-cell-{rowIndex}-{colIndex}"
+                        bind:value={editingValue}
+                        autofocus
+                        onkeydown={onEditKeydown}
+                        onblur={commitCellEdit}
+                      />
+                    {:else}
+                      <button
+                        class="block w-full truncate px-2 py-0.5 text-left {editable
+                          ? 'cursor-cell'
+                          : 'cursor-pointer'} {pending !== null
+                          ? 'text-amber-200'
+                          : value === null
+                            ? 'italic text-zinc-600'
+                            : 'text-zinc-200'}"
+                        title={editable
+                          ? "Double-click to edit"
+                          : cellText(value)}
+                        data-annotate="button-result-cell-{rowIndex}-{colIndex}"
+                        onpointerdown={(e) =>
+                          beginSelect("cell", rowIndex, colIndex, e)}
+                        onpointerenter={(e) =>
+                          extendSelect("cell", rowIndex, colIndex, e)}
+                        onclick={() => onCellClick(rowIndex, colIndex)}
+                        ondblclick={() => beginCellEdit(rowIndex, colIndex)}
+                      >
+                        {pending !== null ? pending : cellText(value)}
+                      </button>
+                    {/if}
                   </td>
                 {/each}
               </tr>
@@ -763,4 +1094,60 @@
     text={appStore.aiAnalysis}
     onClose={() => appStore.closeAiAnalysis()}
   />
+{/if}
+
+<!-- セル編集の UPDATE プレビュー -->
+{#if previewStatements !== null}
+  <div
+    class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6"
+    data-annotate="modal-edits-preview"
+  >
+    <div
+      class="flex max-h-[80vh] w-full max-w-3xl flex-col rounded border border-zinc-700 bg-zinc-900 shadow-xl"
+    >
+      <div
+        class="flex items-center gap-2 border-b border-zinc-700 px-3 py-2 text-sm text-zinc-300"
+      >
+        <span class="font-semibold">
+          SQL to run ({previewStatements.length} statement{previewStatements.length ===
+          1
+            ? ""
+            : "s"}, one transaction)
+        </span>
+        <button
+          class="ml-auto rounded px-1.5 py-0.5 text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200"
+          title="Close"
+          aria-label="Close"
+          data-annotate="button-edits-preview-close"
+          onclick={() => (previewStatements = null)}
+        >
+          <i class="bi bi-x-lg" aria-hidden="true"></i>
+        </button>
+      </div>
+      <pre
+        class="min-h-0 flex-1 overflow-auto px-3 py-2 font-mono text-xs text-zinc-200"
+        data-annotate="text-edits-preview-sql">{previewStatements
+          .map((s) => `${s};`)
+          .join("\n")}</pre>
+      <div
+        class="flex items-center justify-end gap-1 border-t border-zinc-700 px-3 py-2 text-xs"
+      >
+        <button
+          class="rounded border border-zinc-700 px-2 py-0.5 text-zinc-300 hover:bg-zinc-700"
+          data-annotate="button-edits-preview-to-editor"
+          onclick={editInEditor}
+        >
+          Paste to editor
+        </button>
+        <button
+          class="rounded border border-emerald-600/60 bg-emerald-900/40 px-2 py-0.5 text-emerald-200 hover:bg-emerald-800/50 disabled:cursor-default disabled:opacity-40 disabled:hover:bg-emerald-900/40"
+          data-annotate="button-edits-preview-submit"
+          disabled={submitDisabled}
+          onclick={submitEdits}
+        >
+          Submit
+        </button>
+      </div>
+    </div>
+  </div>
 {/if}
