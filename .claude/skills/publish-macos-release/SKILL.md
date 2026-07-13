@@ -132,5 +132,8 @@ export に `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` を追加し、Releas
   ステップのログが "building with ad-hoc signing (test build)" になる。配布ビルドには
   「初回セットアップ」を実施する。
   「初回セットアップ」を実施する。
+- **`draft=false` でジョブが即失敗する** → 署名 Secrets が未設定のまま公開しようとしている。
+  未署名 (ad-hoc) ビルドを公開 Release にしないための安全弁 (ワークフローが `::error::` で停止)。
+  「初回セットアップ」で署名 Secrets を設定するか、`draft=true` で試すこと。
 - **`gh run watch` がすぐ終わる / run が見つからない** → dispatch 直後で run がまだ登録されていない。
   数秒待って `gh run list --workflow=build-macos.yml` で databaseId を確認して再度 watch する。

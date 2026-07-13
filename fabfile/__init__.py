@@ -60,21 +60,31 @@ def build_mac(draft='true', watch='true'):
     if draft not in ('true', 'false'):
         raise SystemExit("draft must be 'true' or 'false', got: {!r}".format(draft))
     with lcd(PROJECT_ROOT):
-        local('gh workflow run {} -f draft={}'.format(WORKFLOW, draft))
-        if watch == 'true':
-            # Give GitHub a moment to register the run, then print which run is
-            # being followed (gh picks the most recent run for this workflow;
-            # avoid dispatching twice in quick succession).
-            local(
-                'sleep 5 && '
-                'RUN_ID="$(gh run list --workflow={wf} --limit 1 '
-                "--json databaseId --jq '.[0].databaseId')\" && "
-                'echo "Watching run $RUN_ID: '
-                'https://github.com/ytyng/queryfolio/actions/runs/$RUN_ID" && '
-                # --exit-status: fail the task if the build fails, so a broken
-                # macOS build stops the release flow instead of looking done.
-                'gh run watch "$RUN_ID" --exit-status'.format(wf=WORKFLOW)
-            )
+        if watch != 'true':
+            local('gh workflow run {} -f draft={}'.format(WORKFLOW, draft))
+            return
+        # `gh workflow run` does not return the created run id, so record the
+        # latest run id first, dispatch, then wait for a *new* run id to appear
+        # and watch exactly that run (not an unrelated concurrent one).
+        # `gh run watch --exit-status` fails the task if the build fails, so a
+        # broken macOS build stops the release flow instead of looking done.
+        local(
+            'PREV=$(gh run list --workflow={wf} --limit 1 '
+            "--json databaseId --jq '.[0].databaseId // empty') && "
+            'gh workflow run {wf} -f draft={draft} && '
+            'RUN_ID="" && '
+            'for i in $(seq 1 20); do sleep 3; '
+            'RID=$(gh run list --workflow={wf} --limit 1 '
+            "--json databaseId --jq '.[0].databaseId // empty'); "
+            'if [ -n "$RID" ] && [ "$RID" != "$PREV" ]; then RUN_ID="$RID"; break; fi; '
+            'done && '
+            'if [ -z "$RUN_ID" ]; then '
+            'echo "Could not find the dispatched run; check: gh run list --workflow={wf}"; '
+            'exit 1; fi && '
+            'echo "Watching run $RUN_ID: '
+            'https://github.com/ytyng/queryfolio/actions/runs/$RUN_ID" && '
+            'gh run watch "$RUN_ID" --exit-status'.format(wf=WORKFLOW, draft=draft)
+        )
 
 
 @task

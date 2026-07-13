@@ -67,6 +67,7 @@ jobs:
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          DRAFT: ${{ inputs.draft }}
         run: |
           if [ -n "$APPLE_CERTIFICATE" ]; then
             {
@@ -81,14 +82,21 @@ jobs:
             } >> "$GITHUB_ENV"
             echo "Code signing enabled (Developer ID)."
           else
-            # No certificate: ad-hoc sign (APPLE_SIGNING_IDENTITY=-) so the Apple
-            # Silicon build still opens instead of being flagged as damaged when
-            # downloaded from the Release. This is a test build, not distributable.
+            # No certificate: refuse to PUBLISH (non-draft) an ad-hoc test build to
+            # avoid shipping an unsigned DMG to users. Draft builds are allowed so
+            # the pipeline can be exercised before the signing secrets are set up.
+            if [ "$DRAFT" != "true" ]; then
+              echo "::error::APPLE_CERTIFICATE is not set. Refusing to publish a non-draft Release with an ad-hoc (unsigned) build. Configure the signing secrets, or run with draft=true."
+              exit 1
+            fi
+            # Ad-hoc sign (APPLE_SIGNING_IDENTITY=-) so the Apple Silicon build still
+            # opens instead of being flagged as damaged when downloaded from the
+            # (draft) Release. This is a test build, not for distribution.
             {
               echo "APPLE_SIGNING_IDENTITY=-"
               echo "SIGNING_NOTE=Ad-hoc signed only (no Developer ID, not notarized) - a test build, not for distribution. macOS treats it as from an unidentified developer; right-click the app and choose Open to run it."
             } >> "$GITHUB_ENV"
-            echo "APPLE_CERTIFICATE secret not set - building with ad-hoc signing (test build)."
+            echo "APPLE_CERTIFICATE secret not set - building with ad-hoc signing (draft/test build)."
           fi
 
       - name: Build and release
