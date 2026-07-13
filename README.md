@@ -2,6 +2,8 @@
 
 SQL client desktop app built with Tauri 2 + SvelteKit. A lightweight alternative to JetBrains DataGrip.
 
+![QueryFolio Demo Video](https://github.com/user-attachments/assets/90439816-49c8-4ebd-a068-b102cfe9c7aa)
+
 ![QueryFolio screenshot](docs/screenshot.png)
 
 ## Features
