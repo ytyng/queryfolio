@@ -32,6 +32,38 @@
   {/if}
 
   <span class="ml-auto flex items-center gap-2">
+    <!--
+      Writable スイッチ。OFF (既定) では SELECT/SHOW 等の副作用の無い文しか
+      実行できない (バックエンドが強制)。config で readonly: true の接続では
+      スイッチでは解除できないためロック表示にする。
+    -->
+    {#if appStore.selectedConnectionReadonly}
+      <span
+        class="flex items-center gap-1 rounded border border-zinc-700 px-2 py-1 text-xs text-zinc-500"
+        title="This connection is read-only (readonly: true in config)"
+        data-annotate="writable-locked"
+      >
+        <i class="bi bi-lock-fill" aria-hidden="true"></i> Read-only
+      </span>
+    {:else}
+      <button
+        class="flex items-center gap-1 rounded border px-2 py-1 text-xs transition-colors {appStore.writable
+          ? 'border-amber-500 bg-amber-600/20 text-amber-300 hover:bg-amber-600/30'
+          : 'border-zinc-600 text-zinc-400 hover:bg-zinc-800'}"
+        title={appStore.writable
+          ? "Writable: write statements (INSERT/UPDATE/DELETE etc.) are allowed. Click to switch to read-only."
+          : "Read-only: only SELECT/SHOW and other side-effect-free statements run. Click to allow writes."}
+        aria-pressed={appStore.writable}
+        data-annotate="toggle-writable"
+        onclick={() => appStore.toggleWritable()}
+      >
+        {#if appStore.writable}
+          <i class="bi bi-unlock-fill" aria-hidden="true"></i> Writable
+        {:else}
+          <i class="bi bi-lock-fill" aria-hidden="true"></i> Read-only
+        {/if}
+      </button>
+    {/if}
     {#if appStore.running}
       <button
         class="rounded bg-red-800 px-3 py-1 text-xs text-white hover:bg-red-700"

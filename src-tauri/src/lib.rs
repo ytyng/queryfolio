@@ -219,8 +219,19 @@ async fn run_query(
     connection: String,
     sql: String,
     max_rows: Option<usize>,
+    // ツールバーの Writable スイッチの状態。省略・false は読み取り専用
+    // (安全側の既定)。config の readonly: true はこれより優先される。
+    writable: Option<bool>,
 ) -> Result<QueryResult, AppError> {
     let server = state.find_server(&connection).await?;
+    // config の readonly が最優先のハードロック。次にスイッチ。
+    let readonly_guard = if server.readonly {
+        db::ReadonlyGuard::Config
+    } else if writable.unwrap_or(false) {
+        db::ReadonlyGuard::Off
+    } else {
+        db::ReadonlyGuard::Switch
+    };
     // 履歴記録用に実行時点のアクティブスキーマを控えておく
     let schema = match state.db.schema_override(&connection).await {
         Some(schema) => Some(schema),
@@ -240,7 +251,7 @@ async fn run_query(
             &sql,
             max_rows.unwrap_or(DEFAULT_MAX_ROWS),
             auto_limit,
-            server.readonly,
+            readonly_guard,
             server.allow_dangerous_statements,
         )
         .await

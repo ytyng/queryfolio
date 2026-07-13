@@ -49,6 +49,10 @@ export interface EditorTab {
 
 let connections = $state<ConnectionInfo[]>([]);
 let selectedConnection = $state<string | null>(null);
+/// Writable スイッチ。false (既定) の間は SELECT/SHOW 等の副作用の無い
+/// 文しか実行できない (バックエンドが強制)。事故防止のためセッションごとに
+/// OFF から始め、永続化しない (再起動で勝手に書き込み可にはしない)。
+let writable = $state(false);
 let files = $state<string[]>([]);
 let editorTabs = $state<EditorTab[]>([]);
 let activeEditorTabId = $state<number | null>(null);
@@ -107,6 +111,13 @@ let autoSavePendingTabId: number | null = null;
 const toErrorMessage = (e: unknown): string =>
   typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
 
+/// 指定接続に対する実効 Writable。Writable スイッチはツールバーに 1 つで、
+/// 現在選択中の接続の状態を表すため、別接続 (別接続タブの再実行など) では
+/// 常に false (読み取り専用) になる。実行ガードと危険文確認の両方でこの値を使い、
+/// 「トグルが示す接続にだけ書き込みを許可する」意味を一貫させる。
+const effectiveWritable = (connection: string): boolean =>
+  connection === selectedConnection && writable;
+
 const loadConnections = async () => {
   loadingConnections = true;
   errorMessage = null;
@@ -153,6 +164,8 @@ const reloadConnections = async (): Promise<boolean> => {
   }
   const previousConnection = selectedConnection;
   selectedConnection = null;
+  // 設定リロードで接続が入れ替わるため、Writable も安全側 (OFF) へ戻す
+  writable = false;
   files = [];
   // 設定が丸ごと入れ替わるため、開いているエディタタブを全て破棄する
   if (autoSaveTimer) {
@@ -295,6 +308,12 @@ const applyConnectionContext = async (name: string): Promise<boolean> => {
     return false;
   }
   // ここから resolve まで await を挟まず、接続コンテキストを一括反映する。
+  // 別の接続へ切り替わったら Writable を安全側 (OFF) へ戻す。ある接続で
+  // 書き込みを許可したまま別接続 (本番など) に移り、誤って書き込む事故を防ぐ。
+  // 同一接続の再選択 (同接続のエディタタブ切替など) では維持する。
+  if (selectedConnection !== name) {
+    writable = false;
+  }
   selectedConnection = name;
   errorMessage = filesError;
   files = filesError ? [] : loadedFiles;
@@ -819,7 +838,12 @@ const executeTab = async (tab: ResultTab) => {
   let error: string | null = null;
   let cancelled = false;
   try {
-    result = await api.runQuery(tab.connection, tab.sql);
+    result = await api.runQuery(
+      tab.connection,
+      tab.sql,
+      undefined,
+      effectiveWritable(tab.connection),
+    );
   } catch (e) {
     const message = toErrorMessage(e);
     // キャンセルによる中断はエラーではなく「Query cancelled」として表示する
@@ -890,6 +914,14 @@ const confirmIfDangerous = async (
   sql: string,
 ): Promise<boolean> => {
   const info = connections.find((c) => c.name === connection);
+  // 読み取り専用が効いている間 (config readonly、またはこの接続に対する実効
+  // Writable が OFF) は、書き込み系の文をバックエンドが Read-only として拒否する。
+  // 破壊的操作の確認は実際に実行され得る文にだけ意味があるため、ここでは確認を
+  // 出さず実行へ委ねる (バックエンドが明快な Read-only エラーを返す)。実効 Writable
+  // を使うので、別接続のタブ再実行 (常に読み取り専用扱い) でも無駄な確認を出さない。
+  if (info?.readonly || !effectiveWritable(connection)) {
+    return true;
+  }
   if (!info?.allow_dangerous_statements) {
     return true;
   }
@@ -1124,6 +1156,22 @@ export default {
   },
   get selectedConnection() {
     return selectedConnection;
+  },
+  /// Writable スイッチの状態。false の間は書き込み系の文を実行できない
+  get writable() {
+    return writable;
+  },
+  /// 選択中の接続が config で readonly: true か (スイッチでは解除できない)。
+  /// 接続未選択なら false。トグルのロック表示に使う
+  get selectedConnectionReadonly() {
+    return (
+      connections.find((c) => c.name === selectedConnection)?.readonly ?? false
+    );
+  },
+  /// Writable スイッチを切り替える。config readonly 接続では書き込みは
+  /// バックエンドが拒否するが、状態自体は接続横断のセッション設定として保持する
+  toggleWritable() {
+    writable = !writable;
   },
   get files() {
     return files;
