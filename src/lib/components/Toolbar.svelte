@@ -3,10 +3,11 @@
 
   interface Props {
     onRunCurrent: () => void;
+    onOpenSearch: () => void;
     onOpenSettings: () => void;
   }
 
-  let { onRunCurrent, onOpenSettings }: Props = $props();
+  let { onRunCurrent, onOpenSearch, onOpenSettings }: Props = $props();
 
   // 実行中は Run ボタンを Cancel ボタンに切り替え、
   // 実行中のタブ (接続単位で 1 つ) のクエリをキャンセルする
@@ -32,6 +33,17 @@
   {/if}
 
   <span class="ml-auto flex items-center gap-2">
+    <!-- 検索 (接続・クエリファイル)。Cmd+K でも開く -->
+    <button
+      class="flex items-center gap-1 rounded border border-zinc-600 px-2 py-1 text-xs text-zinc-400 hover:bg-zinc-800"
+      title="Search connections and query files (Cmd+K)"
+      aria-label="Search"
+      data-annotate="button-open-search"
+      onclick={onOpenSearch}
+    >
+      <i class="bi bi-search" aria-hidden="true"></i>
+      <span class="text-zinc-500">⌘K</span>
+    </button>
     <!--
       Writable スイッチ。OFF (既定) では SELECT/SHOW 等の副作用の無い文しか
       実行できない (バックエンドが強制)。config で readonly: true の接続では
