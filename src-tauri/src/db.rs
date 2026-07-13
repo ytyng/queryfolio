@@ -960,10 +960,15 @@ fn contains_returning(sql: &str) -> bool {
 ///   拒否する (SELECT INTO のテーブル作成や INTO OUTFILE のファイル
 ///   書き込みも実行されてしまうため)。ANALYZE 無しの EXPLAIN は実行を
 ///   伴わないので DML でも許可する
+/// - PRAGMA: SQLite の代入形 PRAGMA (`PRAGMA user_version = 1`、
+///   `PRAGMA journal_mode = WAL` 等) は DB を変更するため、cleaned に `=`
+///   を含む PRAGMA は拒否する。読み取り形 (`PRAGMA table_info(t)`、
+///   `PRAGMA user_version` 等) は許可する
 /// リテラル内の単語は scan_sql が除去し、カラム名等への部分一致は
 /// 単語境界の分割で誤検知しない。
 /// 弱点: SELECT に副作用のある関数 (nextval 等) や CALL のプロシージャ内の
-/// 書き込みまでは防げない。あくまで事故防止のガードである。
+/// 書き込み、括弧形の設定 PRAGMA (`PRAGMA journal_mode(WAL)` 等) までは
+/// 防げない。あくまで事故防止のガードである。
 fn is_readonly_allowed(sql: &str, engine: Engine) -> bool {
     if !is_fetch_statement(sql) {
         return false;
@@ -984,6 +989,8 @@ fn is_readonly_allowed(sql: &str, engine: Engine) -> bool {
                     || has_word("replace")
                     || DML_WORDS.iter().any(|w| has_word(w))))
         }
+        // 代入形 PRAGMA (`= value`) は DB を変更するので拒否する
+        "pragma" => !cleaned.contains('='),
         _ => true,
     }
 }
@@ -1324,6 +1331,13 @@ mod tests {
         assert!(f("EXPLAIN SELECT 1"));
         assert!(f("SHOW TABLES"));
         assert!(f("PRAGMA table_info(t)"));
+        // 読み取り形 PRAGMA は許可
+        assert!(f("PRAGMA user_version"));
+        assert!(f("PRAGMA journal_mode"));
+        // 代入形 PRAGMA (DB を変更する) は拒否
+        assert!(!f("PRAGMA user_version = 1"));
+        assert!(!f("PRAGMA journal_mode = WAL"));
+        assert!(!f("PRAGMA foreign_keys=ON"));
         // 書き込み系は拒否
         assert!(!f("UPDATE t SET a = 1"));
         assert!(!f("INSERT INTO t VALUES (1)"));
