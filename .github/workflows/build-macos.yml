@@ -6,7 +6,7 @@
 #
 # Code signing (Developer ID Application: Cyberneura K.K.) happens when these
 # repository secrets are set. If they are absent, the build still succeeds but
-# produces an UNSIGNED app:
+# produces an AD-HOC signed test app (openable, but not for distribution):
 #   APPLE_CERTIFICATE           base64 of the Developer ID Application .p12
 #   APPLE_CERTIFICATE_PASSWORD  password of that .p12
 #   APPLE_SIGNING_IDENTITY      "Developer ID Application: Cyberneura K.K. (2YN5TLNQ9J)"
@@ -77,10 +77,18 @@ jobs:
               echo "APPLE_CERTIFICATE_PASSWORD=$APPLE_CERTIFICATE_PASSWORD"
               echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY"
               echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD"
+              echo "SIGNING_NOTE=Signed with a Developer ID certificate (Cyberneura K.K.) but not notarized. On first launch, right-click the app and choose Open, or allow it under System Settings > Privacy & Security."
             } >> "$GITHUB_ENV"
             echo "Code signing enabled (Developer ID)."
           else
-            echo "APPLE_CERTIFICATE secret not set - building UNSIGNED."
+            # No certificate: ad-hoc sign (APPLE_SIGNING_IDENTITY=-) so the Apple
+            # Silicon build still opens instead of being flagged as damaged when
+            # downloaded from the Release. This is a test build, not distributable.
+            {
+              echo "APPLE_SIGNING_IDENTITY=-"
+              echo "SIGNING_NOTE=Ad-hoc signed only (no Developer ID, not notarized) - a test build, not for distribution. macOS treats it as from an unidentified developer; right-click the app and choose Open to run it."
+            } >> "$GITHUB_ENV"
+            echo "APPLE_CERTIFICATE secret not set - building with ad-hoc signing (test build)."
           fi
 
       - name: Build and release
@@ -97,9 +105,7 @@ jobs:
           releaseBody: |
             macOS universal build (Apple Silicon + Intel).
 
-            Signed with a Developer ID certificate (Cyberneura K.K.) but **not
-            notarized**. On first launch, right-click the app and choose Open, or
-            allow it under System Settings › Privacy & Security.
+            ${{ env.SIGNING_NOTE }}
 
             Download the `.dmg` below.
           releaseDraft: ${{ inputs.draft }}
