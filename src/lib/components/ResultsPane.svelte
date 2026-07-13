@@ -8,6 +8,7 @@
     singleTableSelectTable,
     buildUpdateStatements,
     normalizeEngine,
+    normalizeTableName,
     type NormalizedEngine,
     type CellEdit,
   } from "$lib/editableResult";
@@ -458,7 +459,12 @@
   async function deriveEditContext(tab: ResultTab) {
     const result = tab.result;
     if (!result) return;
-    const table = singleTableSelectTable(tab.sql);
+    const rawTable = singleTableSelectTable(tab.sql);
+    // 実テーブルに合わせてエンジン別に表名を正規化する (PG は小文字化)。
+    // 正規化名を PK / カラム照会と生成 UPDATE の両方で一貫して使う。
+    const info = appStore.connections.find((c) => c.name === tab.connection);
+    const engine = info ? normalizeEngine(info.engine) : null;
+    const table = rawTable && engine ? normalizeTableName(engine, rawTable) : null;
     let ctx: EditContext | null = null;
     if (table) {
       try {

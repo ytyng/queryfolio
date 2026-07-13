@@ -174,6 +174,20 @@ function extractOriginalTable(cleaned: string, lowerTable: string): string | nul
   return m ? m[1] : lowerTable;
 }
 
+/// 検出した (引用符なし単純) テーブル名を、エンジンの引用符なし識別子の
+/// 畳み込み規則に合わせて正規化する。これを引用してから UPDATE に埋め込む。
+/// - PostgreSQL: 引用符なし識別子は小文字に畳まれるため小文字化する
+///   (`FROM Users` は実テーブル `users`。畳まないと `UPDATE "Users"` が
+///   relation does not exist で失敗する)。
+/// - MySQL: 引用符なし識別子は畳まれない (大小はストレージ依存) ため保持。
+/// - SQLite: 識別子照合が大小無視なので保持で問題ない。
+export function normalizeTableName(
+  engine: NormalizedEngine,
+  table: string,
+): string {
+  return engine === "postgres" ? table.toLowerCase() : table;
+}
+
 /// 識別子をエンジン別にクオートする。
 export function quoteIdent(engine: NormalizedEngine, ident: string): string {
   if (engine === "mysql") return "`" + ident.replace(/`/g, "``") + "`";
