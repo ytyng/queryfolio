@@ -122,8 +122,12 @@ export function singleTableSelectTable(sql: string): string | null {
 
   // SELECT で始まること (WITH / EXPLAIN / VALUES などは対象外)
   if (!/^\s*select\b/.test(topText)) return null;
-  // 集合演算・JOIN・深さ 0 のカンマ結合があれば単一テーブルではない
-  if (/\b(join|union|intersect|except)\b/.test(topText)) return null;
+  // 集合演算・JOIN・深さ 0 のカンマ結合があれば単一テーブルではない。
+  // GROUP BY / HAVING は行を集約し、表示される PK 列が「グループの代表行」の
+  // 任意の値になり得る (WHERE pk = <代表値> が意図しない実行を更新する) ため弾く。
+  if (/\b(join|union|intersect|except|group|having)\b/.test(topText)) {
+    return null;
+  }
 
   // 深さ 0 の FROM を探す
   const fromMatch = /\bfrom\b/.exec(topText);
