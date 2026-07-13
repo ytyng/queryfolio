@@ -80,6 +80,22 @@ pnpm tauri build             # release build (macOS: signed with Developer ID vi
 
 See `AGENTS.md` for architecture details.
 
+## Release (macOS)
+
+The signed macOS build is produced on GitHub Actions (`.github/workflows/build-macos.yml`,
+manual trigger only) and published as a GitHub Release. Kick it off with Fabric:
+
+```shell
+fab build_mac                # build a universal (Apple Silicon + Intel) app, draft Release
+fab build_mac:draft=false    # publish the Release directly
+fab -l                       # list all tasks (dev / check / unittest / build_local / build_mac / releases)
+```
+
+The workflow signs with the Developer ID certificate (Cyberneura K.K.) when the signing
+secrets are configured; it is not notarized. See the `publish-macos-release` skill
+(`.claude/skills/publish-macos-release/`) for the full build → verify → publish runbook,
+including the one-time signing-secrets setup.
+
 ## License
 
 MIT
