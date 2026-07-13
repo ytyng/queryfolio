@@ -500,9 +500,23 @@
     return !!ctx && col != null && ctx.editableColumns.has(col);
   };
 
+  // その行の主キー値がすべて非 NULL か。NULL を含む主キーは行を一意に
+  // 同定できず (特に SQLite は複合 / 非整数 PK に NULL を許し、WHERE pk IS NULL が
+  // 複数行に当たる)、UPDATE が意図しない行にも及ぶため編集不可にする。
+  const rowPkComplete = (rowIndex: number): boolean => {
+    const ctx = activeEditContext;
+    const result = activeTab?.result;
+    if (!ctx || !result) return false;
+    return ctx.pkColumns.every((pk) => {
+      const ci = result.columns.indexOf(pk);
+      return ci >= 0 && result.rows[rowIndex]?.[ci] != null;
+    });
+  };
+
   // オブジェクト (JSON / blob) セルはインライン編集の対象外にする
   const isCellEditable = (rowIndex: number, colIndex: number): boolean => {
     if (!isColumnEditable(colIndex)) return false;
+    if (!rowPkComplete(rowIndex)) return false;
     const v = activeTab?.result?.rows[rowIndex]?.[colIndex];
     return typeof v !== "object" || v === null;
   };

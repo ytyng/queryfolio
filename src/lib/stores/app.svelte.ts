@@ -1142,6 +1142,16 @@ const submitCellEdits = async (
     );
     return false;
   }
+  // 生成 UPDATE はスキーマ未修飾で「接続の現在のアクティブスキーマ」に走るため、
+  // 編集後にスキーマを切り替えていると別スキーマの同名テーブルを更新し得る。
+  // タブの実行時スキーマと現在のアクティブスキーマが違えば適用しない
+  // (UI の canEditActiveConnection は新規編集のみ抑止するので、Submit 側でも防ぐ)。
+  if (tab.schema !== activeSchema) {
+    toast.warning(
+      "The active schema changed since these edits were made. Cancel them and re-run the query.",
+    );
+    return false;
+  }
   // 同一接続で実行中 (クエリまたは別の適用) なら適用しない
   // (キャンセル対象の取り違え防止・Submit 連打防止。runQuery と同じ不変条件)
   if (isConnectionRunning(tab.connection)) {
