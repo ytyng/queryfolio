@@ -46,7 +46,7 @@ fab build_mac              # draft の Release を作り、実行をフォロー
 
 ```shell
 gh workflow run build-macos.yml -f draft=true
-gh run watch "$(gh run list --workflow=build-macos.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+gh run watch "$(gh run list --workflow=build-macos.yml --limit 1 --json databaseId --jq '.[0].databaseId')" --exit-status
 ```
 
 ワークフローは universal (Apple Silicon + Intel) でビルドし、署名付きの `.dmg` を

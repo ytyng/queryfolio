@@ -71,7 +71,9 @@ def build_mac(draft='true', watch='true'):
                 "--json databaseId --jq '.[0].databaseId')\" && "
                 'echo "Watching run $RUN_ID: '
                 'https://github.com/ytyng/queryfolio/actions/runs/$RUN_ID" && '
-                'gh run watch "$RUN_ID"'.format(wf=WORKFLOW)
+                # --exit-status: fail the task if the build fails, so a broken
+                # macOS build stops the release flow instead of looking done.
+                'gh run watch "$RUN_ID" --exit-status'.format(wf=WORKFLOW)
             )
 
 
