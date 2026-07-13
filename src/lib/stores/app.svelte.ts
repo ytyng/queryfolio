@@ -111,6 +111,13 @@ let autoSavePendingTabId: number | null = null;
 const toErrorMessage = (e: unknown): string =>
   typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
 
+/// 指定接続に対する実効 Writable。Writable スイッチはツールバーに 1 つで、
+/// 現在選択中の接続の状態を表すため、別接続 (別接続タブの再実行など) では
+/// 常に false (読み取り専用) になる。実行ガードと危険文確認の両方でこの値を使い、
+/// 「トグルが示す接続にだけ書き込みを許可する」意味を一貫させる。
+const effectiveWritable = (connection: string): boolean =>
+  connection === selectedConnection && writable;
+
 const loadConnections = async () => {
   loadingConnections = true;
   errorMessage = null;
@@ -831,11 +838,12 @@ const executeTab = async (tab: ResultTab) => {
   let error: string | null = null;
   let cancelled = false;
   try {
-    // Writable スイッチは現在選択中の接続に対する状態なので、別接続のタブを
-    // 再実行する場合は writable を適用しない (安全側=読み取り専用で実行する)。
-    // これで「トグルが示す接続にだけ書き込みを許可する」意味が一貫する。
-    const effectiveWritable = tab.connection === selectedConnection && writable;
-    result = await api.runQuery(tab.connection, tab.sql, undefined, effectiveWritable);
+    result = await api.runQuery(
+      tab.connection,
+      tab.sql,
+      undefined,
+      effectiveWritable(tab.connection),
+    );
   } catch (e) {
     const message = toErrorMessage(e);
     // キャンセルによる中断はエラーではなく「Query cancelled」として表示する
@@ -906,11 +914,12 @@ const confirmIfDangerous = async (
   sql: string,
 ): Promise<boolean> => {
   const info = connections.find((c) => c.name === connection);
-  // 読み取り専用が効いている間 (config readonly、または Writable スイッチ OFF) は
-  // 書き込み系の文をバックエンドが Read-only として拒否する。破壊的操作の確認は
-  // 実際に実行され得る文にだけ意味があるため、ここでは確認を出さず実行へ委ねる
-  // (バックエンドが明快な Read-only エラーを返す)。
-  if (info?.readonly || !writable) {
+  // 読み取り専用が効いている間 (config readonly、またはこの接続に対する実効
+  // Writable が OFF) は、書き込み系の文をバックエンドが Read-only として拒否する。
+  // 破壊的操作の確認は実際に実行され得る文にだけ意味があるため、ここでは確認を
+  // 出さず実行へ委ねる (バックエンドが明快な Read-only エラーを返す)。実効 Writable
+  // を使うので、別接続のタブ再実行 (常に読み取り専用扱い) でも無駄な確認を出さない。
+  if (info?.readonly || !effectiveWritable(connection)) {
     return true;
   }
   if (!info?.allow_dangerous_statements) {
