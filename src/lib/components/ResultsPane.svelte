@@ -1,5 +1,6 @@
 <script lang="ts">
   import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+  import { toast } from "svelte-sonner";
   import * as api from "$lib/api";
   import appStore, { isExplainSql } from "$lib/stores/app.svelte";
   import type { ResultTab } from "$lib/stores/app.svelte";
@@ -622,8 +623,19 @@
     if (stmts.length > 0) previewStatements = stmts;
   };
 
-  // 生成した UPDATE をエディタへ貼り、保留は解除する (以降は手動で実行する想定)
+  // 生成した UPDATE をエディタへ貼り、保留は解除する (以降は手動で実行する想定)。
+  // insertSqlSnippet は「現在選択中の接続」のエディタへ挿入するため、結果タブの
+  // 接続と選択中接続が違う時は貼らない (別接続の同名テーブルへ A の UPDATE を
+  // 流し込む事故を防ぐ。Submit の接続ガードと揃える)。
   const editInEditor = () => {
+    const tab = activeTab;
+    if (!tab) return;
+    if (tab.connection !== appStore.selectedConnection) {
+      toast.warning(
+        `These edits are for '${tab.connection}'. Switch to that connection to paste them into the editor.`,
+      );
+      return;
+    }
     const stmts = buildActiveStatements();
     if (stmts.length === 0) return;
     const text = stmts.map((s) => `${s};`).join("\n");
