@@ -23,7 +23,11 @@ pnpm check              # svelte-check (型チェック)
 cd src-tauri && cargo test   # Rust ユニットテスト
 cd src-tauri && cargo check  # Rust 型チェック
 pnpm tauri build        # リリースビルド
+fab build_mac           # macOS 版を GitHub Actions でビルド → draft Release 作成 (手動トリガー。公開は publish-macos-release スキル参照)
+fab -l                  # fab タスク一覧 (dev / check / unittest / build_local / build_mac / releases)
 ```
+
+macOS 版のリリースは `.github/workflows/build-macos.yml` (workflow_dispatch のみ) で universal ビルドし GitHub Release に署名付き DMG を添付する。起動は `fabfile/__init__.py` の `build_mac` タスク (`gh workflow run`)。公開までの runbook は `publish-macos-release` スキル (`.claude/skills/publish-macos-release/`。署名 Secrets の初回設定手順を含む)。
 
 ## アーキテクチャ
 

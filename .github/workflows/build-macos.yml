@@ -1,0 +1,116 @@
+# Builds the macOS app (universal: Apple Silicon + Intel) and publishes it as a
+# GitHub Release so it can be downloaded from the site.
+#
+# Triggered manually only (workflow_dispatch). The canonical way to run it is
+# `fab build_mac` (see fabfile/__init__.py), which calls `gh workflow run`.
+#
+# Code signing (Developer ID Application: Cyberneura K.K.) happens when these
+# repository secrets are set. If they are absent, the build still succeeds but
+# produces an UNSIGNED app:
+#   APPLE_CERTIFICATE           base64 of the Developer ID Application .p12
+#   APPLE_CERTIFICATE_PASSWORD  password of that .p12
+#   APPLE_SIGNING_IDENTITY      "Developer ID Application: Cyberneura K.K. (2YN5TLNQ9J)"
+#   KEYCHAIN_PASSWORD           any random string (temp keychain password)
+# Notarization is not performed (see the `publish-macos-release` skill for how to
+# enable it later). See that skill for the full runbook.
+
+name: Build macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      draft:
+        description: 'Create the GitHub Release as a draft (review before it goes public)'
+        type: boolean
+        default: true
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.26.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      - name: Install Rust (with universal macOS targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Configure code signing
+        # Export the Apple signing vars ONLY when the certificate secret is set.
+        # Referencing a missing secret yields "" (not unset), and Tauri's bundler
+        # gates on presence (Some("")), so blindly setting these would make it try
+        # to import an empty .p12 and FAIL. Exporting conditionally lets a run
+        # without secrets produce a genuinely unsigned build instead.
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          if [ -n "$APPLE_CERTIFICATE" ]; then
+            {
+              # base64 secrets may span multiple lines -> heredoc delimiter form.
+              echo "APPLE_CERTIFICATE<<__QF_EOF__"
+              echo "$APPLE_CERTIFICATE"
+              echo "__QF_EOF__"
+              echo "APPLE_CERTIFICATE_PASSWORD=$APPLE_CERTIFICATE_PASSWORD"
+              echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY"
+              echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD"
+            } >> "$GITHUB_ENV"
+            echo "Code signing enabled (Developer ID)."
+          else
+            echo "APPLE_CERTIFICATE secret not set - building UNSIGNED."
+          fi
+
+      - name: Build and release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Run the tauri CLI directly, bypassing the package.json "tauri" script
+          # which hard-codes APPLE_SIGNING_IDENTITY (that would force signing even
+          # on an unsigned run). Signing is driven solely by the env exported above.
+          tauriScript: pnpm exec tauri
+          tagName: queryfolio-v__VERSION__
+          releaseName: 'QueryFolio v__VERSION__ (macOS)'
+          releaseBody: |
+            macOS universal build (Apple Silicon + Intel).
+
+            Signed with a Developer ID certificate (Cyberneura K.K.) but **not
+            notarized**. On first launch, right-click the app and choose Open, or
+            allow it under System Settings › Privacy & Security.
+
+            Download the `.dmg` below.
+          releaseDraft: ${{ inputs.draft }}
+          prerelease: false
+          args: --target universal-apple-darwin
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: queryfolio-macos-universal
+          path: |
+            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
+          if-no-files-found: warn
