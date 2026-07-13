@@ -46,7 +46,8 @@ pnpm tauri build        # リリースビルド
 
 - `lib/api.ts` — invoke の型付きラッパー (バックエンドとの境界)
 - `lib/stores/app.svelte.ts` — Svelte 5 runes ストア (getter + メソッドを default export)
-- `lib/components/` — Toolbar / ConnectionsPane / FilesPane / HistoryPane / TablesPane (スキーマブラウザ) / SqlEditor / EditorToolbar / ResultsPane / CellInspector / ConfigInfoModal (読み取り専用の設定表示) / AiAnalysisModal (EXPLAIN / 選択 SQL の AI 解説表示) / PaneDivider (ドラッグ可能なペイン区切り線)
+- `lib/components/` — Toolbar (グローバルツールバー。Writable スイッチを含む) / ConnectionsPane / FilesPane / HistoryPane / TablesPane (スキーマブラウザ) / SqlEditor / EditorToolbar / ResultsPane / CellInspector / ConfigInfoModal (読み取り専用の設定表示) / AiAnalysisModal (EXPLAIN / 選択 SQL の AI 解説表示) / PaneDivider (ドラッグ可能なペイン区切り線)
+- Writable スイッチ — ツールバーの `data-annotate="toggle-writable"` トグル。OFF (既定、セッションごとに OFF から始め永続化しない) の間は SELECT/SHOW 等の副作用の無い文しか実行できない。app.svelte.ts の `writable` state が run_query に `writable` として渡り、バックエンド (lib.rs) が readonly ガードの由来を `db.rs` の `ReadonlyGuard` (Off / Config / Switch) で決めて強制する。実効 readonly = `config readonly || !writable`。config で `readonly: true` の接続はスイッチより優先 (ロック表示 = `writable-locked`) で解除できない。ブロック時のメッセージは由来で出し分ける (Config / Switch)
 - ペインのサイズ変更 — `+page.svelte` が接続一覧幅 / サイドバー幅 / エディタ縦割合を `$state` で管理し、`PaneDivider` (Pointer Events + setPointerCapture) のドラッグで変更する。ドラッグ終了時に localStorage (`queryfolio.layout.*`) へ保存し起動時に復元。各ペインコンポーネントの root は `w-full` で、幅は `+page.svelte` のラッパー div が inline style で与える
 - `lib/export.ts` — CSV/TSV/JSON 変換 (formula injection 対策込み)
 - `lib/sqlFormat.ts` — SQL 整形器 (自前トークナイザ。SELECT / UNION 系のみ整形し、INSERT / UPDATE / WITH 等やパース不能な文は原文維持。整形結果を再トークナイズして入力とトークン列が一致しなければ原文に戻す安全ネット付き)

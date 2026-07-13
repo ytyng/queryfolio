@@ -432,7 +432,13 @@ pub(crate) async fn run_query(
     allow_dangerous: bool,
 ) -> Result<QueryResult, AppError> {
     let mut conn = DbConnection::acquire(pool).await?;
-    run_query_on(&mut conn, sql, max_rows, auto_limit, readonly, allow_dangerous).await
+    // テストは config readonly 相当の bool を渡す。
+    let guard = if readonly {
+        ReadonlyGuard::Config
+    } else {
+        ReadonlyGuard::Off
+    };
+    run_query_on(&mut conn, sql, max_rows, auto_limit, guard, allow_dangerous).await
 }
 
 /// SQL を実行して結果を返す (キャンセル対応版)。
@@ -452,7 +458,7 @@ pub async fn run_query_cancellable(
     sql: &str,
     max_rows: usize,
     auto_limit: Option<u64>,
-    readonly: bool,
+    readonly: ReadonlyGuard,
     allow_dangerous: bool,
 ) -> Result<QueryResult, AppError> {
     let mut conn = DbConnection::acquire(pool).await?;
@@ -523,13 +529,25 @@ pub async fn run_query_cancellable(
     result
 }
 
+/// 読み取り専用ガードの由来。ブロック時のメッセージを由来に応じて
+/// 出し分けるために使う (config の readonly か、ツールバーの Writable スイッチか)。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ReadonlyGuard {
+    /// 書き込み許可 (readonly ガードなし)
+    Off,
+    /// config の readonly: true による読み取り専用 (スイッチでは解除できない)
+    Config,
+    /// ツールバーの Writable スイッチ OFF による読み取り専用
+    Switch,
+}
+
 /// run_query の本体。確保済みのコネクション上で実行する。
 async fn run_query_on(
     conn: &mut DbConnection,
     sql: &str,
     max_rows: usize,
     auto_limit: Option<u64>,
-    readonly: bool,
+    readonly: ReadonlyGuard,
     allow_dangerous: bool,
 ) -> Result<QueryResult, AppError> {
     let engine = conn.engine();
@@ -544,12 +562,20 @@ async fn run_query_on(
     // readonly 接続では読み取り系の文のみ許可する。
     // メタコマンドは読み取り系のカタログ照会にしか変換されないため、
     // 変換後の SQL はこの判定を常に通る。
-    if readonly && !is_readonly_allowed(sql, engine) {
-        return Err(AppError::Readonly(
-            "This connection is read-only (readonly: true in config). \
-             Statement was not executed."
-                .into(),
-        ));
+    if readonly != ReadonlyGuard::Off && !is_readonly_allowed(sql, engine) {
+        let message = match readonly {
+            ReadonlyGuard::Config => {
+                "This connection is read-only (readonly: true in config). \
+                 Statement was not executed."
+            }
+            ReadonlyGuard::Switch => {
+                "Read-only mode is on. Turn on the Writable switch in the \
+                 toolbar to run write statements. Statement was not executed."
+            }
+            // Off はこの分岐に入らない (上の条件で除外済み)
+            ReadonlyGuard::Off => unreachable!(),
+        };
+        return Err(AppError::Readonly(message.into()));
     }
 
     // 危険な文 (WHERE 無しの UPDATE / DELETE、DROP / TRUNCATE) は、
@@ -1910,7 +1936,7 @@ mod tests {
                 heavy_sql,
                 10,
                 None,
-                false,
+                ReadonlyGuard::Off,
                 false,
             )
             .await
@@ -1939,7 +1965,7 @@ mod tests {
         // 同じ接続 (max_connections=1 なので同一コネクション) で
         // 次のクエリが正常に実行できる = プールの接続が壊れていない
         let result =
-            run_query_cancellable(&pool, &registry, "test-conn", "SELECT 1", 10, None, false, false)
+            run_query_cancellable(&pool, &registry, "test-conn", "SELECT 1", 10, None, ReadonlyGuard::Off, false)
                 .await
                 .unwrap();
         assert_eq!(result.row_count, 1);
@@ -1953,7 +1979,7 @@ mod tests {
 
         // 完了済みのクエリ (登録解除済み) へのキャンセルは no-op
         let result =
-            run_query_cancellable(&pool, &registry, "test-conn", "SELECT 1", 10, None, false, false)
+            run_query_cancellable(&pool, &registry, "test-conn", "SELECT 1", 10, None, ReadonlyGuard::Off, false)
                 .await
                 .unwrap();
         assert_eq!(result.row_count, 1);
@@ -1961,7 +1987,7 @@ mod tests {
 
         // その後のクエリも正常に実行できる
         let result =
-            run_query_cancellable(&pool, &registry, "test-conn", "SELECT 2", 10, None, false, false)
+            run_query_cancellable(&pool, &registry, "test-conn", "SELECT 2", 10, None, ReadonlyGuard::Off, false)
                 .await
                 .unwrap();
         assert_eq!(result.rows[0][0], serde_json::json!(2));
@@ -1980,7 +2006,7 @@ mod tests {
             "SELECT * FROM no_such_table",
             10,
             None,
-            false,
+            ReadonlyGuard::Off,
             false,
         )
         .await;
@@ -2069,5 +2095,47 @@ mod tests {
             .unwrap();
         assert_eq!(result.row_count, 1);
         assert_eq!(result.rows[0][1], serde_json::json!("alice"));
+    }
+
+    // Writable スイッチ OFF (ReadonlyGuard::Switch) では書き込みを拒否し、
+    // ON (ReadonlyGuard::Off) では書き込みを許可する。
+    #[tokio::test]
+    async fn test_writable_switch_guard() {
+        let pool = make_test_pool().await;
+        let registry = Arc::new(CancelRegistry::default());
+        let run = |guard, sql: &'static str| {
+            let pool = pool.clone();
+            let registry = registry.clone();
+            async move {
+                run_query_cancellable(&pool, &registry, "c", sql, 10, None, guard, false).await
+            }
+        };
+
+        // テーブル作成はスイッチ ON でのみ通る (下準備を兼ねる)
+        run(ReadonlyGuard::Off, "CREATE TABLE t (id INTEGER, name TEXT)")
+            .await
+            .unwrap();
+
+        // スイッチ OFF では読み取りは許可、書き込みは拒否 (スイッチ由来のメッセージ)
+        run(ReadonlyGuard::Switch, "SELECT * FROM t")
+            .await
+            .unwrap();
+        let err = run(ReadonlyGuard::Switch, "INSERT INTO t VALUES (1, 'a')")
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Writable switch"),
+            "unexpected message: {message}"
+        );
+
+        // スイッチ ON では書き込みが通る
+        run(ReadonlyGuard::Off, "INSERT INTO t VALUES (1, 'a')")
+            .await
+            .unwrap();
+        let result = run(ReadonlyGuard::Off, "SELECT count(*) FROM t")
+            .await
+            .unwrap();
+        assert_eq!(result.rows[0][0], serde_json::json!(1));
     }
 }
