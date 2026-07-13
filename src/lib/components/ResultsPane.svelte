@@ -636,6 +636,15 @@
       );
       return;
     }
+    // 生成 UPDATE はスキーマ未修飾。実行時からスキーマを切り替えていると、
+    // 貼り付けた UPDATE が別スキーマの同名テーブルに走り得るため貼らない
+    // (Submit の tab.schema !== activeSchema ガードと揃える)。
+    if (tab.schema !== appStore.activeSchema) {
+      toast.warning(
+        "The active schema changed since these edits were made. Cancel them and re-run the query.",
+      );
+      return;
+    }
     const stmts = buildActiveStatements();
     if (stmts.length === 0) return;
     const text = stmts.map((s) => `${s};`).join("\n");
