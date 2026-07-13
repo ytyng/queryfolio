@@ -529,6 +529,101 @@ pub async fn run_query_cancellable(
     result
 }
 
+/// 読み取り専用ガードでブロックする際のエラー (由来別メッセージ)。
+/// run_query_on と run_statements で共有する。
+fn readonly_block_error(readonly: ReadonlyGuard) -> AppError {
+    let message = match readonly {
+        ReadonlyGuard::Config => {
+            "This connection is read-only (readonly: true in config). \
+             Statement was not executed."
+        }
+        ReadonlyGuard::Switch => {
+            "Read-only mode is on. Turn on the Writable switch in the \
+             toolbar to run write statements. Statement was not executed."
+        }
+        // Off はブロックしないためこのエラーは作られない
+        ReadonlyGuard::Off => unreachable!(),
+    };
+    AppError::Readonly(message.into())
+}
+
+/// 危険な文 (WHERE 無しの UPDATE/DELETE 等) でブロックする際のエラー。
+fn dangerous_block_error(reason: &str) -> AppError {
+    AppError::Dangerous(format!(
+        "{reason} Set \"allow_dangerous_statements: true\" for this connection \
+         in config to run it. Statement was not executed."
+    ))
+}
+
+/// 確保済みコネクション上で 1 文を実行し、影響行数を返す (結果セットは読まない)。
+async fn execute_statement(conn: &mut DbConnection, sql: &str) -> Result<u64, AppError> {
+    Ok(match conn {
+        DbConnection::MySql(c) => (&mut **c).execute(sql).await?.rows_affected(),
+        DbConnection::Postgres(c) => (&mut **c).execute(sql).await?.rows_affected(),
+        DbConnection::Sqlite(c) => (&mut **c).execute(sql).await?.rows_affected(),
+    })
+}
+
+/// 結果グリッドのセル編集を UPDATE 群として 1 トランザクションで適用する。
+/// 全文が成功したら COMMIT、途中で失敗したら ROLLBACK して最初のエラーを返す
+/// (all-or-nothing)。この経路は一般の複数文実行の裏口にならないよう、
+/// 各文が UPDATE であることを必須とし、readonly / 危険文ガードも run_query と
+/// 同様に適用する。合計の影響行数を返す。
+pub async fn run_statements(
+    pool: &DbPool,
+    statements: &[String],
+    readonly: ReadonlyGuard,
+    allow_dangerous: bool,
+) -> Result<u64, AppError> {
+    if statements.is_empty() {
+        return Err(AppError::Config("There are no changes to apply".into()));
+    }
+    let mut conn = DbConnection::acquire(pool).await?;
+    let engine = conn.engine();
+
+    // 何も書き込む前に全文を検証する (一部だけ適用される事態を防ぐ)。
+    for sql in statements {
+        let sql = sql.trim();
+        // セル編集の適用は UPDATE のみ。他の文はこの経路では拒否する。
+        if leading_keyword(sql) != "update" {
+            return Err(AppError::Config(
+                "Only UPDATE statements can be applied from the results grid.".into(),
+            ));
+        }
+        if readonly != ReadonlyGuard::Off && !is_readonly_allowed(sql, engine) {
+            return Err(readonly_block_error(readonly));
+        }
+        if !allow_dangerous {
+            if let Some(reason) = dangerous_reason(sql, engine) {
+                return Err(dangerous_block_error(reason));
+            }
+        }
+    }
+
+    // 1 トランザクションで全文を適用する。DDL は含めない (UPDATE のみ) ため、
+    // 暗黙コミットは起きない。COMMIT/ROLLBACK まで必ず到達させてから
+    // コネクションをプールへ返す。
+    execute_statement(&mut conn, "BEGIN").await?;
+    let mut total: u64 = 0;
+    for sql in statements {
+        match execute_statement(&mut conn, sql.trim()).await {
+            Ok(affected) => total += affected,
+            Err(e) => {
+                // ロールバック自体の失敗は握り潰し、元のエラーを返す
+                let _ = execute_statement(&mut conn, "ROLLBACK").await;
+                return Err(e);
+            }
+        }
+    }
+    // COMMIT が失敗 (deferred 制約違反 / SQLite busy 等) しても、コネクションを
+    // トランザクション状態のままプールへ返さないよう ROLLBACK を試みる。
+    if let Err(e) = execute_statement(&mut conn, "COMMIT").await {
+        let _ = execute_statement(&mut conn, "ROLLBACK").await;
+        return Err(e);
+    }
+    Ok(total)
+}
+
 /// 読み取り専用ガードの由来。ブロック時のメッセージを由来に応じて
 /// 出し分けるために使う (config の readonly か、ツールバーの Writable スイッチか)。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -563,19 +658,7 @@ async fn run_query_on(
     // メタコマンドは読み取り系のカタログ照会にしか変換されないため、
     // 変換後の SQL はこの判定を常に通る。
     if readonly != ReadonlyGuard::Off && !is_readonly_allowed(sql, engine) {
-        let message = match readonly {
-            ReadonlyGuard::Config => {
-                "This connection is read-only (readonly: true in config). \
-                 Statement was not executed."
-            }
-            ReadonlyGuard::Switch => {
-                "Read-only mode is on. Turn on the Writable switch in the \
-                 toolbar to run write statements. Statement was not executed."
-            }
-            // Off はこの分岐に入らない (上の条件で除外済み)
-            ReadonlyGuard::Off => unreachable!(),
-        };
-        return Err(AppError::Readonly(message.into()));
+        return Err(readonly_block_error(readonly));
     }
 
     // 危険な文 (WHERE 無しの UPDATE / DELETE、DROP / TRUNCATE) は、
@@ -583,10 +666,7 @@ async fn run_query_on(
     // 誤操作による全行破壊・テーブル消失を防ぐ事故防止ガード。
     if !allow_dangerous {
         if let Some(reason) = dangerous_reason(sql, engine) {
-            return Err(AppError::Dangerous(format!(
-                "{reason} Set \"allow_dangerous_statements: true\" for this connection \
-                 in config to run it. Statement was not executed."
-            )));
+            return Err(dangerous_block_error(reason));
         }
     }
 
@@ -2151,5 +2231,171 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.rows[0][0], serde_json::json!(1));
+    }
+
+    async fn sqlite_mem_pool() -> DbPool {
+        // :memory: はコネクションごとに別 DB になるため 1 接続に固定する
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .in_memory(true),
+            )
+            .await
+            .unwrap();
+        DbPool::Sqlite(pool)
+    }
+
+    #[tokio::test]
+    async fn test_run_statements_transaction_commit() {
+        let pool = sqlite_mem_pool().await;
+        run_query(&pool, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)", 10, None, false, false)
+            .await
+            .unwrap();
+        run_query(&pool, "INSERT INTO t VALUES (1, 'a'), (2, 'b')", 10, None, false, false)
+            .await
+            .unwrap();
+
+        // 2 件の UPDATE を 1 トランザクションで適用する
+        let affected = run_statements(
+            &pool,
+            &[
+                "UPDATE t SET name = 'x' WHERE id = 1".into(),
+                "UPDATE t SET name = 'y' WHERE id = 2".into(),
+            ],
+            ReadonlyGuard::Off,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(affected, 2);
+
+        let result = run_query(&pool, "SELECT name FROM t ORDER BY id", 10, None, false, false)
+            .await
+            .unwrap();
+        assert_eq!(result.rows[0][0], serde_json::json!("x"));
+        assert_eq!(result.rows[1][0], serde_json::json!("y"));
+    }
+
+    #[tokio::test]
+    async fn test_run_statements_rollback_on_error() {
+        let pool = sqlite_mem_pool().await;
+        run_query(&pool, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)", 10, None, false, false)
+            .await
+            .unwrap();
+        run_query(&pool, "INSERT INTO t VALUES (1, 'a')", 10, None, false, false)
+            .await
+            .unwrap();
+
+        // 1 文目は成功するが 2 文目が構文/参照エラー。全体がロールバックされる
+        let err = run_statements(
+            &pool,
+            &[
+                "UPDATE t SET name = 'changed' WHERE id = 1".into(),
+                "UPDATE no_such_table SET name = 'z' WHERE id = 1".into(),
+            ],
+            ReadonlyGuard::Off,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(!err.to_string().is_empty());
+
+        // ロールバックされたので 1 文目の変更も残っていない
+        let result = run_query(&pool, "SELECT name FROM t WHERE id = 1", 10, None, false, false)
+            .await
+            .unwrap();
+        assert_eq!(result.rows[0][0], serde_json::json!("a"));
+    }
+
+    #[tokio::test]
+    async fn test_run_statements_rejects_non_update() {
+        let pool = sqlite_mem_pool().await;
+        run_query(&pool, "CREATE TABLE t (id INTEGER PRIMARY KEY)", 10, None, false, false)
+            .await
+            .unwrap();
+        // UPDATE 以外は拒否する (何も適用されない)
+        let err = run_statements(
+            &pool,
+            &["DELETE FROM t WHERE id = 1".into()],
+            ReadonlyGuard::Off,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("Only UPDATE"));
+    }
+
+    #[tokio::test]
+    async fn test_run_statements_readonly_switch_blocks() {
+        let pool = sqlite_mem_pool().await;
+        run_query(&pool, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)", 10, None, false, false)
+            .await
+            .unwrap();
+        run_query(&pool, "INSERT INTO t VALUES (1, 'a')", 10, None, false, false)
+            .await
+            .unwrap();
+        // Writable スイッチ OFF (Switch) では UPDATE がブロックされる
+        let err = run_statements(
+            &pool,
+            &["UPDATE t SET name = 'x' WHERE id = 1".into()],
+            ReadonlyGuard::Switch,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("Writable switch"));
+        // 変更されていないこと
+        let result = run_query(&pool, "SELECT name FROM t WHERE id = 1", 10, None, false, false)
+            .await
+            .unwrap();
+        assert_eq!(result.rows[0][0], serde_json::json!("a"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_primary_keys_sqlite() {
+        let pool = sqlite_mem_pool().await;
+        run_query(
+            &pool,
+            "CREATE TABLE single (id INTEGER PRIMARY KEY, name TEXT)",
+            10,
+            None,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        run_query(
+            &pool,
+            "CREATE TABLE composite (a INTEGER, b INTEGER, v TEXT, PRIMARY KEY (a, b))",
+            10,
+            None,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        run_query(&pool, "CREATE TABLE nokey (x INTEGER, y TEXT)", 10, None, false, false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            crate::schema_info::fetch_primary_keys(&pool, "single")
+                .await
+                .unwrap(),
+            vec!["id".to_string()]
+        );
+        assert_eq!(
+            crate::schema_info::fetch_primary_keys(&pool, "composite")
+                .await
+                .unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // 主キーの無いテーブルは空
+        assert!(crate::schema_info::fetch_primary_keys(&pool, "nokey")
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

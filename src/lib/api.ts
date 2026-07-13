@@ -178,6 +178,20 @@ export const listColumns = (connection: string, table: string) =>
 export const getSchemaMap = (connection: string) =>
   invoke<Record<string, string[]>>("get_schema_map", { connection });
 
+/// テーブルの主キーを構成するカラム名を返す (結果グリッドのセル編集用)。
+/// 主キーが無いテーブルでは空配列。
+export const getPrimaryKeys = (connection: string, table: string) =>
+  invoke<string[]>("get_primary_keys", { connection, table });
+
+/// 結果グリッドのセル編集を UPDATE 群として 1 トランザクションで適用する。
+/// writable の意味は runQuery と同じ (未指定・false は読み取り専用)。
+/// 合計の影響行数を返す。
+export const runStatements = (
+  connection: string,
+  statements: string[],
+  writable?: boolean,
+) => invoke<number>("run_statements", { connection, statements, writable });
+
 /// AI 設定の情報を返す。`ai:` セクションが無い場合は configured: false。
 /// セクションはあるが不正 (不明 provider 等) な場合は reject される。
 export const getAiInfo = () => invoke<AiInfo>("get_ai_info");

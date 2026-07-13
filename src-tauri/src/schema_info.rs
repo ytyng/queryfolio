@@ -201,6 +201,76 @@ pub async fn fetch_columns(pool: &DbPool, table: &str) -> Result<Vec<ColumnInfo>
     Ok(columns)
 }
 
+/// テーブルの主キー (PRIMARY KEY) を構成するカラム名を返す。
+/// 結果グリッドのセル編集で UPDATE の WHERE 句を組むために使う。
+/// 主キーが無いテーブルでは空を返す (呼び出し側で編集不可にする)。
+/// テーブル名は SQL に埋め込む箇所があるため fetch_columns と同じ識別子
+/// 検証を通す (SQL インジェクション対策)。
+pub async fn fetch_primary_keys(pool: &DbPool, table: &str) -> Result<Vec<String>, AppError> {
+    let table = validate_relation_name(table)?;
+    let keys: Vec<String> = match pool {
+        DbPool::Postgres(p) => {
+            // pg_index.indisprimary で主キー索引の対象カラムを引く。
+            // 複合主キーの並び順は WHERE の組立に影響しないため attnum 順でよい。
+            let sql = format!(
+                "SELECT a.attname \
+                 FROM pg_catalog.pg_index i \
+                 JOIN pg_catalog.pg_attribute a \
+                   ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+                 WHERE i.indrelid = '{table}'::regclass AND i.indisprimary \
+                 ORDER BY a.attnum"
+            );
+            sqlx::query(&sql)
+                .fetch_all(p)
+                .await?
+                .iter()
+                .map(|row| row.try_get::<String, _>(0).unwrap_or_default())
+                .collect()
+        }
+        DbPool::MySql(p) => {
+            // db.table 形式なら TABLE_SCHEMA も絞り込む (バインドなので安全)
+            let (schema_part, table_part) = match table.split_once('.') {
+                Some((s, t)) => (Some(s.to_string()), t),
+                None => (None, table),
+            };
+            sqlx::query(
+                "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+                 WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_NAME = ? \
+                   AND COLUMN_KEY = 'PRI' \
+                 ORDER BY ORDINAL_POSITION",
+            )
+            .bind(schema_part)
+            .bind(table_part)
+            .fetch_all(p)
+            .await?
+            .iter()
+            .map(|row| row.try_get::<String, _>(0).unwrap_or_default())
+            .collect()
+        }
+        DbPool::Sqlite(p) => {
+            // PRAGMA table_info: (cid, name, type, notnull, dflt_value, pk)。
+            // pk > 0 が主キー構成カラム (値は 1 始まりの並び順)。
+            let sql = format!("PRAGMA table_info(\"{table}\")");
+            let mut rows: Vec<(i64, String)> = sqlx::query(&sql)
+                .fetch_all(p)
+                .await?
+                .iter()
+                .filter_map(|row| {
+                    let pk: i64 = row.try_get(5).unwrap_or(0);
+                    if pk > 0 {
+                        Some((pk, row.try_get::<String, _>(1).unwrap_or_default()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            rows.sort_by_key(|(pk, _)| *pk);
+            rows.into_iter().map(|(_, name)| name).collect()
+        }
+    };
+    Ok(keys)
+}
+
 /// 全テーブルの全カラムを一括取得し、修飾テーブル名 → カラム一覧の
 /// マップを返す。get_schema_map (SQL 補完) のキャッシュ充填用。
 pub async fn fetch_all_columns(
