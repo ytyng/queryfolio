@@ -84,11 +84,17 @@
     return Object.fromEntries(tables.map((table) => [table, []]));
   };
 
-  // languageCompartment に入れる SQL 言語拡張 (方言 + スキーマ補完)
+  // languageCompartment に入れる SQL 言語拡張 (方言 + スキーマ補完)。
+  // 予約語の補完は大文字で挿入する (SQL の慣習に合わせる)
   const languageExtension = (
     engineName: string | null,
     map: Record<string, string[]> | null,
-  ) => sql({ dialect: dialectFor(engineName), schema: schemaNamespace(map) });
+  ) =>
+    sql({
+      dialect: dialectFor(engineName),
+      schema: schemaNamespace(map),
+      upperCaseKeywords: true,
+    });
 
   // カーソル位置を含む Statement ノードの範囲を返す。
   // カーソルが文と文の間にある場合は直前の文を返す (DataGrip と同様の挙動)。
