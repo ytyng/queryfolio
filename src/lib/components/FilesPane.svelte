@@ -20,7 +20,8 @@
   let renamingFile = $state<string | null>(null);
   let renameValue = $state("");
 
-  // デフォルトのファイル名: query-YYYYMMDD-HHMM (.sql はバックエンドが付与)。
+  // デフォルトのファイル名: YYYYMMDD-HHMM (.sql はバックエンドが付与)。
+  // 日付が先頭にあると名前順ソートが時系列になり探しやすい。
   // 同一分内の連続作成で衝突しないよう、既存ファイルと重複する場合は
   // -2, -3 ... を付けて一意化する。
   const defaultFileName = () => {
@@ -28,7 +29,7 @@
     const pad = (n: number) => String(n).padStart(2, "0");
     const date = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
     const time = `${pad(now.getHours())}${pad(now.getMinutes())}`;
-    const base = `query-${date}-${time}`;
+    const base = `${date}-${time}`;
     if (!appStore.files.includes(`${base}.sql`)) {
       return base;
     }
