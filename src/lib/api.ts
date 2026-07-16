@@ -25,6 +25,8 @@ export interface ConnectionInfo {
   /// 危険な文 (WHERE 無し UPDATE/DELETE、DROP/TRUNCATE) の実行を許可する接続。
   /// true でも実行前に確認を求める
   allow_dangerous_statements: boolean;
+  /// 接続一覧での表示グループ名 (グループ未所属なら null)
+  group_name: string | null;
 }
 
 export interface QueryResult {

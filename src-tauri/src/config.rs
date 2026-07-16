@@ -169,6 +169,13 @@ pub struct ServerConfig {
     /// true にしても、フロントエンドは実行前に確認を求める。
     #[serde(default)]
     pub allow_dangerous_statements: bool,
+    /// queryfolio 独自拡張: 接続一覧での表示グループ名。
+    /// sql_servers のグループエントリ (group_name + sql_servers) に
+    /// 属するサーバーへ parse_server_entries が設定する。
+    /// サーバーエントリ直下の group_name: はグループエントリの検証
+    /// (空チェック・未知キー拒否) を迂回するため受け付けない (無視される)。
+    #[serde(default, skip_deserializing)]
+    pub group_name: Option<String>,
 }
 
 /// フォルダ名としてファイルシステム上安全になるようサニタイズする。
@@ -255,6 +262,8 @@ pub struct ConnectionInfo {
     /// 危険な文 (WHERE 無し UPDATE/DELETE、DROP/TRUNCATE 等) の実行を許可する。
     /// フロントエンドは true の接続でも実行前に確認を求める
     pub allow_dangerous_statements: bool,
+    /// 接続一覧での表示グループ名 (グループ未所属なら null)
+    pub group_name: Option<String>,
 }
 
 impl From<&ServerConfig> for ConnectionInfo {
@@ -271,6 +280,7 @@ impl From<&ServerConfig> for ConnectionInfo {
             ssh_tunnel: server.ssh_tunnel.as_ref().map(SshTunnelInfo::from),
             readonly: server.readonly,
             allow_dangerous_statements: server.allow_dangerous_statements,
+            group_name: server.group_name.clone(),
         }
     }
 }
@@ -570,22 +580,82 @@ fn parse_fetched_servers(
     })
 }
 
+/// sql_servers のリスト項目をパースする。項目は次のどちらか:
+/// - サーバー定義そのもの
+/// - グループエントリ (group_name + ネストした sql_servers リスト)。
+///   ネストしたサーバーへフラット化し、各サーバーの group_name に記録する。
+///   グループの中にさらにグループを書く再帰は禁止 (深さ 1 まで)。
 fn parse_server_entries(
     servers: &[serde_yaml::Value],
     templates: &[serde_yaml::Value],
     source: &str,
 ) -> Result<Vec<ServerConfig>, AppError> {
     let mut result = Vec::new();
-    for server_value in servers {
-        let expanded = expand_template(server_value, templates)?;
-        let server: ServerConfig = serde_yaml::from_value(expanded).map_err(|e| {
-            AppError::Config(format!(
-                "Failed to parse a sql_servers entry in {source}: {e}"
-            ))
+    for entry_value in servers {
+        let entry = entry_value.as_mapping().ok_or_else(|| {
+            AppError::Config(format!("A sql_servers entry in {source} is not a mapping"))
         })?;
-        result.push(server);
+        if !entry.contains_key("sql_servers") {
+            result.push(parse_server_entry(entry_value, templates, source)?);
+            continue;
+        }
+
+        // グループエントリ。typo をサイレントに飲み込まないよう未知キーは拒否する
+        for (key, _) in entry {
+            let key = key.as_str().unwrap_or_default();
+            if key != "group_name" && key != "sql_servers" {
+                return Err(AppError::Config(format!(
+                    "Unknown key '{key}' in a sql_servers group entry in {source} \
+                     (only group_name / sql_servers are allowed)"
+                )));
+            }
+        }
+        let group_name = entry
+            .get("group_name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                AppError::Config(format!(
+                    "A sql_servers group entry in {source} requires a non-empty group_name"
+                ))
+            })?;
+        let grouped = entry
+            .get("sql_servers")
+            .and_then(|v| v.as_sequence())
+            .ok_or_else(|| {
+                AppError::Config(format!(
+                    "sql_servers in group '{group_name}' in {source} must be a list"
+                ))
+            })?;
+        for server_value in grouped {
+            let is_nested_group = server_value
+                .as_mapping()
+                .is_some_and(|m| m.contains_key("sql_servers"));
+            if is_nested_group {
+                return Err(AppError::Config(format!(
+                    "Nested groups are not allowed in group '{group_name}' in {source}"
+                )));
+            }
+            let mut server = parse_server_entry(server_value, templates, source)?;
+            server.group_name = Some(group_name.to_string());
+            result.push(server);
+        }
     }
     Ok(result)
+}
+
+fn parse_server_entry(
+    server_value: &serde_yaml::Value,
+    templates: &[serde_yaml::Value],
+    source: &str,
+) -> Result<ServerConfig, AppError> {
+    let expanded = expand_template(server_value, templates)?;
+    serde_yaml::from_value(expanded).map_err(|e| {
+        AppError::Config(format!(
+            "Failed to parse a sql_servers entry in {source}: {e}"
+        ))
+    })
 }
 
 /// ソース宣言の command を実行して stdout を返す。
@@ -734,6 +804,144 @@ sql_servers:
         assert_eq!(servers[0].name, "dev-postgres");
         assert_eq!(servers[0].port, Some(5432));
         assert!(servers[0].ssh_tunnel.is_none());
+        assert!(servers[0].group_name.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_grouped_servers() {
+        // グループエントリはフラット化され、各サーバーに group_name が付く。
+        // グループと直書きサーバーの混在も設定順のまま解決される
+        let config = config_from_yaml(
+            r#"
+sql_servers:
+  - group_name: production
+    sql_servers:
+      - name: prod-main
+        engine: mysql
+        host: prod.example.com
+      - name: prod-replica
+        engine: mysql
+        host: replica.example.com
+  - name: standalone
+    engine: sqlite
+    schema: /tmp/x.db
+  - group_name: development
+    sql_servers:
+      - name: dev-db
+        engine: postgres
+        host: localhost
+"#,
+        );
+        let servers = config.resolve_servers().await.unwrap().servers;
+        let summary: Vec<(&str, Option<&str>)> = servers
+            .iter()
+            .map(|s| (s.name.as_str(), s.group_name.as_deref()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("prod-main", Some("production")),
+                ("prod-replica", Some("production")),
+                ("standalone", None),
+                ("dev-db", Some("development")),
+            ]
+        );
+        // ConnectionInfo にも伝わる
+        let info = ConnectionInfo::from(&servers[0]);
+        assert_eq!(info.group_name.as_deref(), Some("production"));
+    }
+
+    #[tokio::test]
+    async fn test_flat_entry_group_name_is_ignored() {
+        // サーバーエントリ直下の group_name: はグループエントリの検証を
+        // 迂回できてしまうため、デシリアライズしない (無視される)
+        let config = config_from_yaml(
+            r#"
+sql_servers:
+  - name: sneaky
+    engine: sqlite
+    schema: /tmp/x.db
+    group_name: bypassed
+"#,
+        );
+        let servers = config.resolve_servers().await.unwrap().servers;
+        assert!(servers[0].group_name.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_group_requires_non_empty_group_name() {
+        let config = config_from_yaml(
+            r#"
+sql_servers:
+  - group_name: ""
+    sql_servers:
+      - name: a
+        engine: sqlite
+        schema: /tmp/a.db
+"#,
+        );
+        let err = config.resolve_servers().await.unwrap_err().to_string();
+        assert!(err.contains("group_name"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_group_rejects_nested_group() {
+        let config = config_from_yaml(
+            r#"
+sql_servers:
+  - group_name: outer
+    sql_servers:
+      - group_name: inner
+        sql_servers:
+          - name: a
+            engine: sqlite
+            schema: /tmp/a.db
+"#,
+        );
+        let err = config.resolve_servers().await.unwrap_err().to_string();
+        assert!(err.contains("Nested groups"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_group_rejects_unknown_key() {
+        // グループエントリの typo (servers: 等) をサイレントに無視しない
+        let config = config_from_yaml(
+            r#"
+sql_servers:
+  - group_name: g
+    sql_servers: []
+    description: typo-extra-key
+"#,
+        );
+        let err = config.resolve_servers().await.unwrap_err().to_string();
+        assert!(err.contains("Unknown key 'description'"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_group_with_template() {
+        // グループ内のサーバーでも sql_server_templates を継承できる
+        let config = config_from_yaml(
+            r#"
+sql_servers:
+  - group_name: shared
+    sql_servers:
+      - name: db-a
+        template: base
+        schema: a_db
+sql_server_templates:
+  - name: base
+    engine: mysql
+    host: db.example.com
+    port: 3306
+    user: shared_user
+"#,
+        );
+        let servers = config.resolve_servers().await.unwrap().servers;
+        assert_eq!(servers[0].name, "db-a");
+        assert_eq!(servers[0].engine, "mysql");
+        assert_eq!(servers[0].host.as_deref(), Some("db.example.com"));
+        assert_eq!(servers[0].schema.as_deref(), Some("a_db"));
+        assert_eq!(servers[0].group_name.as_deref(), Some("shared"));
     }
 
     #[tokio::test]
@@ -1053,6 +1261,7 @@ sql_servers:
             ssh_tunnel: None,
             readonly: false,
             allow_dangerous_statements: false,
+            group_name: None,
         };
         let info = ConnectionInfo::from(&server);
         let json = serde_json::to_string(&info).unwrap();
@@ -1079,6 +1288,7 @@ sql_servers:
             ssh_tunnel: None,
             readonly: false,
             allow_dangerous_statements: false,
+            group_name: None,
         }
     }
 

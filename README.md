@@ -46,6 +46,16 @@ sql_servers:
     readonly: true   # optional: reject write statements on this connection
     ...
 
+# Servers can be grouped for the connections list (queryfolio extension).
+# Group entries and plain servers can be mixed; order is preserved.
+# sql_servers:
+#   - group_name: production
+#     sql_servers:
+#       - name: prod-main
+#         ...
+#   - name: ungrouped-db
+#     ...
+
 # Or fetch from 1Password (exactly one of command / env / file)
 # sql_servers:
 #   command: op read "op://development/queryfolio/config-yaml"

@@ -47,10 +47,27 @@
       const t = c.ssh_tunnel;
       rows.push({ label: "SSH", value: `${t.user}@${t.host}:${t.port}` });
     }
+    if (c.group_name) rows.push({ label: "Group", value: c.group_name });
     if (c.description) rows.push({ label: "Description", value: c.description });
     if (c.readonly) rows.push({ label: "Access", value: "read-only" });
     return rows;
   };
+
+  /// 設定順を保ったまま、連続する同一グループ名の接続をセクションにまとめる。
+  /// group_name が無い接続はヘッダ無しのセクションになる。
+  const sections = $derived.by(() => {
+    const result: { group: string | null; items: ConnectionInfo[] }[] = [];
+    for (const connection of appStore.connections) {
+      const group = connection.group_name;
+      const last = result[result.length - 1];
+      if (last && last.group === group) {
+        last.items.push(connection);
+      } else {
+        result.push({ group, items: [connection] });
+      }
+    }
+    return result;
+  });
 
   /// ホバー中の接続とアンカー (カーソル) 位置・ツールチップ表示位置 (viewport 座標)。
   let hovered = $state<ConnectionInfo | null>(null);
@@ -125,39 +142,51 @@
         No connections. Review your config file.
       </p>
     {:else}
-      {#each appStore.connections as connection (connection.name)}
-        <button
-          class="flex w-full flex-col gap-0.5 px-3 py-2 text-left hover:bg-zinc-800 {appStore.selectedConnection ===
-          connection.name
-            ? 'bg-zinc-800 border-l-2 border-blue-400'
-            : 'border-l-2 border-transparent'}"
-          data-annotate="button-connection-{connection.name}"
-          onclick={() => appStore.selectConnection(connection.name)}
-          onmouseenter={(e) => showTip(connection, e)}
-          onmousemove={(e) => hovered && setAnchor(e)}
-          onmouseleave={hideTip}
-        >
-          <span class="truncate text-sm text-zinc-200">{connection.name}</span>
-          <span class="flex items-center gap-1 text-xs text-zinc-500">
-            {engineLabel(connection.engine)}
-            {#if connection.has_ssh_tunnel}
-              <span
-                class="rounded bg-zinc-700 px-1 text-[10px] text-zinc-300"
-                title="Via SSH tunnel">ssh</span
+      {#each sections as section, sectionIndex (sectionIndex)}
+        {#if section.group !== null}
+          <div
+            class="px-3 pt-2 pb-0.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-500"
+            data-annotate="connection-group-{section.group}"
+          >
+            {section.group}
+          </div>
+        {/if}
+        {#each section.items as connection (connection.name)}
+          <button
+            class="flex w-full flex-col gap-0.5 px-3 py-2 text-left hover:bg-zinc-800 {appStore.selectedConnection ===
+            connection.name
+              ? 'bg-zinc-800 border-l-2 border-blue-400'
+              : 'border-l-2 border-transparent'}"
+            data-annotate="button-connection-{connection.name}"
+            onclick={() => appStore.selectConnection(connection.name)}
+            onmouseenter={(e) => showTip(connection, e)}
+            onmousemove={(e) => hovered && setAnchor(e)}
+            onmouseleave={hideTip}
+          >
+            <span class="truncate text-sm text-zinc-200">{connection.name}</span>
+            <span class="flex items-center gap-1 text-xs text-zinc-500">
+              {engineLabel(connection.engine)}
+              {#if connection.has_ssh_tunnel}
+                <span
+                  class="rounded bg-zinc-700 px-1 text-[10px] text-zinc-300"
+                  title="Via SSH tunnel">ssh</span
+                >
+              {/if}
+              {#if connection.readonly}
+                <span
+                  class="rounded bg-yellow-500/15 px-1 text-[10px] text-yellow-400"
+                  title="Write statements are rejected (readonly: true in config)"
+                  data-annotate="badge-readonly-{connection.name}">read-only</span
+                >
+              {/if}
+            </span>
+            {#if connection.description}
+              <span class="truncate text-xs text-zinc-500"
+                >{connection.description}</span
               >
             {/if}
-            {#if connection.readonly}
-              <span
-                class="rounded bg-yellow-500/15 px-1 text-[10px] text-yellow-400"
-                title="Write statements are rejected (readonly: true in config)"
-                data-annotate="badge-readonly-{connection.name}">read-only</span
-              >
-            {/if}
-          </span>
-          {#if connection.description}
-            <span class="truncate text-xs text-zinc-500">{connection.description}</span>
-          {/if}
-        </button>
+          </button>
+        {/each}
       {/each}
     {/if}
   </div>

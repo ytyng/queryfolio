@@ -82,6 +82,33 @@ sql_servers:
       # 1Password SSH agent when launched from Finder). "none" disables the agent.
       # identity_agent: ~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock
 
+# --- sql_servers: グループ機能 (queryfolio 拡張) ---
+# リスト項目に group_name + sql_servers を書くと、その中のサーバーが
+# 接続一覧でグループ見出し付きで表示される。直書きサーバーとの混在も可
+# (設定した順序のまま表示される)。グループの中にさらにグループは書けない。
+# グループ内でも template: による雛形継承は使える。
+#
+# sql_servers:
+#   - group_name: production
+#     sql_servers:
+#       - name: prod-main
+#         engine: mysql
+#         host: prod.example.com
+#         ...
+#       - name: prod-replica
+#         engine: mysql
+#         host: replica.example.com
+#         ...
+#   - group_name: development
+#     sql_servers:
+#       - name: dev-db
+#         engine: postgres
+#         host: localhost
+#         ...
+#   - name: ungrouped-db   # グループ無しの直書きも混在できる
+#     engine: sqlite
+#     schema: ~/data/example.sqlite3
+
 # --- sql_servers: 形式 B (ソース宣言。command / env / file のどれか 1 つだけ) ---
 # 取得した YAML は sql-agent-mcp-server 互換フォーマット
 # (sql_servers リスト + sql_server_templates) としてパースされる。
