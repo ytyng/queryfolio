@@ -145,7 +145,7 @@
       {#each sections as section, sectionIndex (sectionIndex)}
         {#if section.group !== null}
           <div
-            class="px-3 pt-2 pb-0.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-500"
+            class="sticky top-0 z-10 bg-zinc-700 px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-200"
             data-annotate="connection-group-{section.group}"
           >
             {section.group}
