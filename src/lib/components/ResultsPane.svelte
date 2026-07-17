@@ -234,9 +234,12 @@
     if (!(e.metaKey || e.ctrlKey) || (e.key !== "c" && e.key !== "C")) {
       return;
     }
-    // セル入力 (編集 / 読み取り専用ビュー) にフォーカスがある間は、
+    // セル入力 (編集 input / 読み取り専用ビューの textarea) にフォーカスがある間は、
     // 入力内のテキスト選択を通常の Cmd+C でコピーできるよう横取りしない
-    if (document.activeElement instanceof HTMLInputElement) {
+    if (
+      document.activeElement instanceof HTMLInputElement ||
+      document.activeElement instanceof HTMLTextAreaElement
+    ) {
       return;
     }
     if (!selectedRange || !gridEl || !gridEl.contains(document.activeElement)) {
@@ -1107,18 +1110,20 @@
                   >
                     {#if isEditingCell(rowIndex, colIndex)}
                       {#if editingCell?.readonly}
-                        <!-- 読み取り専用ビュー: 全文を選択済みで開き、コピーだけできる -->
+                        <!-- 読み取り専用ビュー: 全文を選択済みで開き、コピーだけできる。
+                             input は値サニタイズで改行を除去するため textarea を使う -->
                         <!-- svelte-ignore a11y_autofocus -->
-                        <input
-                          class="block w-full bg-zinc-950 px-2 py-0.5 font-mono text-xs text-zinc-200 ring-1 ring-sky-500 outline-none"
+                        <textarea
+                          class="block w-full resize-none bg-zinc-950 px-2 py-0.5 font-mono text-xs text-zinc-200 ring-1 ring-sky-500 outline-none"
                           data-annotate="input-result-cell-view-{rowIndex}-{colIndex}"
                           value={editingValue}
+                          rows="1"
                           readonly
                           autofocus
                           onfocus={(e) => e.currentTarget.select()}
                           onkeydown={onEditKeydown}
                           onblur={cancelCellEdit}
-                        />
+                        ></textarea>
                       {:else}
                         <!-- svelte-ignore a11y_autofocus -->
                         <input
