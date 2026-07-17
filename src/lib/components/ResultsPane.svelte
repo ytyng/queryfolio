@@ -234,6 +234,14 @@
     if (!(e.metaKey || e.ctrlKey) || (e.key !== "c" && e.key !== "C")) {
       return;
     }
+    // セル入力 (編集 input / 読み取り専用ビューの textarea) にフォーカスがある間は、
+    // 入力内のテキスト選択を通常の Cmd+C でコピーできるよう横取りしない
+    if (
+      document.activeElement instanceof HTMLInputElement ||
+      document.activeElement instanceof HTMLTextAreaElement
+    ) {
+      return;
+    }
     if (!selectedRange || !gridEl || !gridEl.contains(document.activeElement)) {
       return;
     }
@@ -301,6 +309,22 @@
     selectedCell.tabId === activeTab?.id &&
     selectedCell.rowIndex === rowIndex &&
     selectedCell.colIndex === colIndex;
+
+  // アクティブセルのコピーアイコンの一時的なフィードバック表示 (`${row}:${col}`)
+  let copiedCellKey = $state<string | null>(null);
+
+  // アクティブセルの値をコピーする (NULL / オブジェクトの文字列化はセル表示と同じ)
+  const copyCellValue = async (rowIndex: number, colIndex: number) => {
+    const result = activeTab?.result;
+    if (!result) {
+      return;
+    }
+    await writeText(cellText(result.rows[rowIndex][colIndex]));
+    copiedCellKey = `${rowIndex}:${colIndex}`;
+    setTimeout(() => {
+      copiedCellKey = null;
+    }, 1500);
+  };
 
   // セル背景色: インスペクタで開いているセルを最優先で強調し、
   // 次に矩形選択の範囲を淡く強調する
@@ -390,11 +414,13 @@
   let editContexts = $state(new Map<number, EditContext | null>());
   // tabId -> (`${rowIndex}:${column}` -> 編集内容)
   let pendingEdits = $state(new Map<number, Map<string, CellEdit>>());
-  // インライン編集中のセル (1 つ)
+  // インライン編集中のセル (1 つ)。readonly = true は編集不可セルを
+  // 読み取り専用入力で開いている状態 (全文の選択・コピー用。書き込みはしない)
   let editingCell = $state<{
     tabId: number;
     rowIndex: number;
     colIndex: number;
+    readonly: boolean;
   } | null>(null);
   let editingValue = $state("");
   // Preview モーダルに出す UPDATE 文 (非表示中は null)
@@ -541,17 +567,30 @@
     editingCell.colIndex === colIndex;
 
   const beginCellEdit = (rowIndex: number, colIndex: number) => {
-    if (!activeTab?.result || !isCellEditable(rowIndex, colIndex)) return;
+    if (!activeTab?.result) return;
+    if (!isCellEditable(rowIndex, colIndex)) {
+      // 編集不可セルは読み取り専用入力で開き、全文を選択・コピーしやすくする
+      editingCell = { tabId: activeTab.id, rowIndex, colIndex, readonly: true };
+      editingValue = cellText(activeTab.result.rows[rowIndex][colIndex]);
+      return;
+    }
     const col = activeTab.result.columns[colIndex];
     const existing = activePending?.get(`${rowIndex}:${col}`);
     const original = activeTab.result.rows[rowIndex][colIndex];
-    editingCell = { tabId: activeTab.id, rowIndex, colIndex };
+    editingCell = { tabId: activeTab.id, rowIndex, colIndex, readonly: false };
     editingValue = existing ? existing.input : editText(original);
   };
 
   const commitCellEdit = () => {
     const ec = editingCell;
-    if (!ec || !activeTab || ec.tabId !== activeTab.id || !activeTab.result) {
+    // 読み取り専用ビューは閉じるだけで保留編集には登録しない
+    if (
+      !ec ||
+      ec.readonly ||
+      !activeTab ||
+      ec.tabId !== activeTab.id ||
+      !activeTab.result
+    ) {
       editingCell = null;
       return;
     }
@@ -1061,24 +1100,41 @@
                   {@const pending = pendingInput(rowIndex, colIndex)}
                   {@const editable = isCellEditable(rowIndex, colIndex)}
                   <!-- クリックでセルインスペクタ、ドラッグで矩形選択、
-                       ダブルクリックで編集 (編集可能セルのみ)。
+                       ダブルクリックで編集 (編集不可セルは読み取り専用ビュー)。
                        truncate のためボタン/入力をセル全面に敷く -->
                   <td
-                    class="max-w-96 border-b border-r border-zinc-800 p-0 {pending !==
+                    class="relative max-w-96 border-b border-r border-zinc-800 p-0 {pending !==
                     null
                       ? 'bg-amber-900/40'
                       : cellBgClass(rowIndex, colIndex)}"
                   >
                     {#if isEditingCell(rowIndex, colIndex)}
-                      <!-- svelte-ignore a11y_autofocus -->
-                      <input
-                        class="block w-full bg-zinc-950 px-2 py-0.5 font-mono text-xs text-amber-100 ring-1 ring-amber-500 outline-none"
-                        data-annotate="input-result-cell-{rowIndex}-{colIndex}"
-                        bind:value={editingValue}
-                        autofocus
-                        onkeydown={onEditKeydown}
-                        onblur={commitCellEdit}
-                      />
+                      {#if editingCell?.readonly}
+                        <!-- 読み取り専用ビュー: 全文を選択済みで開き、コピーだけできる。
+                             input は値サニタイズで改行を除去するため textarea を使う -->
+                        <!-- svelte-ignore a11y_autofocus -->
+                        <textarea
+                          class="block w-full resize-none bg-zinc-950 px-2 py-0.5 font-mono text-xs text-zinc-200 ring-1 ring-sky-500 outline-none"
+                          data-annotate="input-result-cell-view-{rowIndex}-{colIndex}"
+                          value={editingValue}
+                          rows="1"
+                          readonly
+                          autofocus
+                          onfocus={(e) => e.currentTarget.select()}
+                          onkeydown={onEditKeydown}
+                          onblur={cancelCellEdit}
+                        ></textarea>
+                      {:else}
+                        <!-- svelte-ignore a11y_autofocus -->
+                        <input
+                          class="block w-full bg-zinc-950 px-2 py-0.5 font-mono text-xs text-amber-100 ring-1 ring-amber-500 outline-none"
+                          data-annotate="input-result-cell-{rowIndex}-{colIndex}"
+                          bind:value={editingValue}
+                          autofocus
+                          onkeydown={onEditKeydown}
+                          onblur={commitCellEdit}
+                        />
+                      {/if}
                     {:else}
                       <button
                         class="block w-full truncate px-2 py-0.5 text-left {editable
@@ -1101,6 +1157,28 @@
                       >
                         {pending !== null ? pending : cellText(value)}
                       </button>
+                      {#if isSelectedCell(rowIndex, colIndex)}
+                        {@const copied =
+                          copiedCellKey === `${rowIndex}:${colIndex}`}
+                        <!-- アクティブセルのコピーアイコン。button の入れ子は
+                             不正なため td 直下に重ねて配置する -->
+                        <button
+                          class="absolute top-1/2 right-0.5 -translate-y-1/2 rounded bg-zinc-800/90 px-1 {copied
+                            ? 'text-emerald-400'
+                            : 'text-zinc-400 hover:text-zinc-100'}"
+                          title="Copy this cell value"
+                          aria-label="Copy this cell value"
+                          data-annotate="button-copy-cell-{rowIndex}-{colIndex}"
+                          onclick={() => copyCellValue(rowIndex, colIndex)}
+                        >
+                          <i
+                            class="bi {copied
+                              ? 'bi-clipboard-check'
+                              : 'bi-clipboard'}"
+                            aria-hidden="true"
+                          ></i>
+                        </button>
+                      {/if}
                     {/if}
                   </td>
                 {/each}
