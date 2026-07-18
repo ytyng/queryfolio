@@ -346,9 +346,17 @@ async fn switch_active_schema(
 
     match confirm {
         Ok(mut result) => {
-            // 切替後は古いスキーマのテーブル一覧・カラムを返さないようにする
-            state.schema_cache.invalidate_connection(&server.name).await;
-            result.switched_schema = Some(schema);
+            // 確認クエリの実行中にユーザーがスキーマ選択で別の database へ
+            // 変えていた場合、こちらの切替先をフロントへ報告すると
+            // 実際の接続先と表示が食い違うため報告しない
+            // (そちらの切替が自前でキャッシュ破棄と表示更新を済ませている)
+            let still_ours =
+                state.db.schema_override(&server.name).await.as_deref() == Some(schema.as_str());
+            if still_ours {
+                // 切替後は古いスキーマのテーブル一覧・カラムを返さないようにする
+                state.schema_cache.invalidate_connection(&server.name).await;
+                result.switched_schema = Some(schema);
+            }
             result.elapsed_ms = started.elapsed().as_millis() as u64;
             Ok(result)
         }
