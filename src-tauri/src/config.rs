@@ -95,6 +95,20 @@ pub fn ensure_config_file() -> Result<Option<String>, AppError> {
     ensure_config_file_in(&app_config_dir()?)
 }
 
+/// dir 内の設定ファイルのパス。config.yml を優先し、無ければ config.yaml、
+/// どちらも無ければ config.yml のパスを返す。
+fn config_path_in(dir: &std::path::Path) -> PathBuf {
+    let yml = dir.join("config.yml");
+    if yml.exists() {
+        return yml;
+    }
+    let yaml = dir.join("config.yaml");
+    if yaml.exists() {
+        return yaml;
+    }
+    yml
+}
+
 fn ensure_config_file_in(dir: &std::path::Path) -> Result<Option<String>, AppError> {
     let yml = dir.join("config.yml");
     let yaml = dir.join("config.yaml");
@@ -364,16 +378,7 @@ impl AppConfig {
     /// config.yml を優先し、無ければ config.yaml、どちらも無ければ
     /// デフォルトの config.yml のパスを返す。
     fn find_config_path() -> Result<PathBuf, AppError> {
-        let dir = app_config_dir()?;
-        let yml = dir.join("config.yml");
-        if yml.exists() {
-            return Ok(yml);
-        }
-        let yaml = dir.join("config.yaml");
-        if yaml.exists() {
-            return Ok(yaml);
-        }
-        Ok(yml)
+        Ok(config_path_in(&app_config_dir()?))
     }
 
     /// LIMIT 未指定の SELECT に自動付与する行数上限。
@@ -540,6 +545,110 @@ pub fn config_info() -> ConfigInfo {
                 sqlfiles_dir: String::new(),
             }
         }
+    }
+}
+
+/// QUERYFOLIO_CONFIG_YAML 環境変数で設定が上書きされているか。
+/// 上書き中は編集対象のファイルが存在しないため、エディタから編集できない。
+fn config_env_override() -> bool {
+    std::env::var("QUERYFOLIO_CONFIG_YAML")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// 設定エディタ用に config.yml の中身を読む。
+/// ファイルがまだ無い場合はテンプレートを作成してから読む。
+pub fn read_config_file() -> Result<String, AppError> {
+    if config_env_override() {
+        return Err(AppError::Config(
+            "The config is overridden by QUERYFOLIO_CONFIG_YAML, so there is no file to edit"
+                .into(),
+        ));
+    }
+    read_config_file_in(&app_config_dir()?)
+}
+
+fn read_config_file_in(dir: &std::path::Path) -> Result<String, AppError> {
+    ensure_config_file_in(dir)?;
+    Ok(std::fs::read_to_string(config_path_in(dir))?)
+}
+
+/// 設定エディタからの保存。YAML として妥当なことを確認してから書き込む。
+///
+/// 書き込みは一時ファイル + rename で行い、途中で失敗しても既存の設定を
+/// 半端な内容で壊さないようにする。
+pub fn write_config_file(content: &str) -> Result<String, AppError> {
+    if config_env_override() {
+        return Err(AppError::Config(
+            "The config is overridden by QUERYFOLIO_CONFIG_YAML, so it cannot be saved".into(),
+        ));
+    }
+    write_config_file_in(&app_config_dir()?, content)
+}
+
+fn write_config_file_in(dir: &std::path::Path, content: &str) -> Result<String, AppError> {
+    // 壊れた YAML をそのまま保存すると次回起動で接続一覧を失うため、
+    // 保存前にマッピングとしてパースできることを確認する
+    parse_mapping(content, "the edited config")?;
+
+    std::fs::create_dir_all(dir)?;
+    let path = config_path_in(dir);
+
+    // 既存ファイルのパーミッションを引き継ぐ。新規なら 600
+    // (接続パスワードを含み得るため他ユーザーに読ませない)
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(&path)
+            .map(|m| m.permissions().mode() & 0o777)
+            .unwrap_or(0o600)
+    };
+
+    let temp = path.with_extension("yml.tmp");
+    // 作成時からパーミッションを指定する。書いてから set_permissions すると、
+    // その間だけ umask 依存 (通常 644) の権限で中身が置かれ、パスワードを
+    // 含む設定を同一マシンの他ユーザーに読まれる隙ができる
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(&temp)?;
+        // mode は新規作成時にしか効かないため、前回の中断等で temp が
+        // 残っていた場合に備えて明示的にも設定する
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(mode))?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(&temp, content)?;
+    std::fs::rename(&temp, &path)?;
+    Ok(path.display().to_string())
+}
+
+/// sql_servers がソース宣言の `command:` かどうか。
+/// メニュー項目の出し分けに使う。設定が読めない場合は false。
+pub fn sql_servers_source_is_command() -> bool {
+    matches!(
+        AppConfig::load().and_then(|c| c.servers_source()),
+        Ok(ServersSource::Command(_))
+    )
+}
+
+/// sql_servers のソース宣言 `command:` を実行して、取得した生の YAML を返す。
+/// 読み取り専用ビュー用。command 以外のソースではエラーにする。
+pub async fn fetch_sql_servers_source_yaml() -> Result<String, AppError> {
+    let config = AppConfig::load()?;
+    match config.servers_source()? {
+        ServersSource::Command(command) => run_source_command(&command).await,
+        _ => Err(AppError::Config(
+            "sql_servers does not use a command source declaration".into(),
+        )),
     }
 }
 
@@ -1213,6 +1322,102 @@ sql_servers:
 
         // 既に存在すれば None (上書きしない)
         assert!(ensure_config_file_in(&dir).unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 設定エディタの読み書き。無ければテンプレートを作ってから読み、
+    /// 保存した内容がそのまま読み戻せる。
+    #[test]
+    fn test_read_write_config_file_in() {
+        let dir = std::env::temp_dir().join(format!(
+            "queryfolio-editor-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // ファイルが無い状態でもテンプレートが作られて読める
+        let initial = read_config_file_in(&dir).unwrap();
+        assert!(initial.contains("sql_servers"));
+
+        let edited = "sql_servers:\n  - name: edited\n    engine: sqlite\n    schema: /tmp/a.db\n";
+        let saved_path = write_config_file_in(&dir, edited).unwrap();
+        assert_eq!(saved_path, dir.join("config.yml").display().to_string());
+        assert_eq!(read_config_file_in(&dir).unwrap(), edited);
+        // 一時ファイルを残さない
+        assert!(!dir.join("config.yml.tmp").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 壊れた YAML は保存を拒否し、既存の設定を残す。
+    #[test]
+    fn test_write_config_file_in_rejects_invalid_yaml() {
+        let dir = std::env::temp_dir().join(format!(
+            "queryfolio-editor-invalid-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let valid = "sql_servers: []\n";
+        write_config_file_in(&dir, valid).unwrap();
+
+        // マッピングとしてパースできない内容
+        assert!(write_config_file_in(&dir, "sql_servers: [\n").is_err());
+        // YAML ではあるがマッピングではない
+        assert!(write_config_file_in(&dir, "- just\n- a list\n").is_err());
+        // 既存の内容は壊れていない
+        assert_eq!(read_config_file_in(&dir).unwrap(), valid);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 保存時に既存ファイルのパーミッションを引き継ぐ (新規は 600)。
+    #[cfg(unix)]
+    #[test]
+    fn test_write_config_file_in_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "queryfolio-editor-perm-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 新規作成は 600
+        write_config_file_in(&dir, "sql_servers: []\n").unwrap();
+        let path = dir.join("config.yml");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // 既存のパーミッションは維持する
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        write_config_file_in(&dir, "sql_servers: []\n# edited\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// config.yaml (拡張子 yaml) を使っている場合も、そのファイルへ保存する。
+    #[test]
+    fn test_write_config_file_in_keeps_yaml_extension() {
+        let dir = std::env::temp_dir().join(format!(
+            "queryfolio-editor-yaml-ext-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.yaml"), "sql_servers: []\n").unwrap();
+
+        let edited = "sql_servers: []\n# edited\n";
+        let saved_path = write_config_file_in(&dir, edited).unwrap();
+        assert_eq!(saved_path, dir.join("config.yaml").display().to_string());
+        assert!(!dir.join("config.yml").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.yaml")).unwrap(),
+            edited
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

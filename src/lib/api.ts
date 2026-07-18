@@ -231,3 +231,15 @@ export const getConfigInfo = () => invoke<ConfigInfo>("get_config_info");
 /// config.yml が無ければテンプレートを作成する。作成した場合はそのパスを返す。
 export const ensureConfigFile = () =>
   invoke<string | null>("ensure_config_file");
+
+/// 設定エディタ用に config.yml の中身を読む (無ければテンプレートを作成してから読む)。
+export const readConfigFile = () => invoke<string>("read_config_file");
+
+/// 設定エディタからの保存。書き込んだファイルのパスを返す。
+export const writeConfigFile = (content: string) =>
+  invoke<string>("write_config_file", { content });
+
+/// sql_servers のソース宣言 command を実行して取得した生の YAML を返す
+/// (読み取り専用ビュー用)。
+export const readSqlServersSourceYaml = () =>
+  invoke<string>("read_sql_servers_source_yaml");

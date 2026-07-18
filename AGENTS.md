@@ -35,8 +35,8 @@ macOS 版のリリースは `.github/workflows/build-macos.yml` (workflow_dispat
 
 | ファイル | 役割 |
 |---------|------|
-| lib.rs | Tauri コマンド定義と AppState (接続設定キャッシュ + DbManager) |
-| config.rs | config.yml のロード・ソース宣言解決・テンプレート展開・expand_tilde |
+| lib.rs | Tauri コマンド定義と AppState (接続設定キャッシュ + DbManager)、メニューバーの組み立て (build_menu / rebuild_menu) |
+| config.rs | config.yml のロード・ソース宣言解決・テンプレート展開・expand_tilde・設定エディタの読み書き (read_config_file / write_config_file) |
 | db.rs | sqlx プール管理、クエリ実行・キャンセル (CancelRegistry)、型別 JSON 変換、readonly ガード / 危険な文ガード (dangerous_reason) |
 | tunnel.rs | SSH ローカルポートフォワード (known_hosts 検証付き)。ssh-agent 認証時は使う agent socket を `ssh_tunnel.identity_agent` → `~/.ssh/config` の IdentityAgent → SSH_AUTH_SOCK の順で解決し libssh2 の `set_identity_path` で指定する (GUI 起動でシェルの SSH_AUTH_SOCK を継承しなくても 1Password 等の agent に届く)。ssh_config パーサは Include の条件付き展開・glob・Host マッチ・エスケープ/コメント除去に対応 (best-effort) |
 | query_files.rs | クエリファイル CRUD (パストラバーサル対策) |
@@ -50,8 +50,10 @@ macOS 版のリリースは `.github/workflows/build-macos.yml` (workflow_dispat
 
 - `lib/api.ts` — invoke の型付きラッパー (バックエンドとの境界)
 - `lib/stores/app.svelte.ts` — Svelte 5 runes ストア (getter + メソッドを default export)
-- `lib/components/` — Toolbar (グローバルツールバー。Writable スイッチ・検索ボタンを含む) / ConnectionsPane / FilesPane / HistoryPane / TablesPane (スキーマブラウザ) / SqlEditor / EditorToolbar / ResultsPane / CellInspector / ConfigInfoModal (読み取り専用の設定表示) / AiAnalysisModal (EXPLAIN / 選択 SQL の AI 解説表示) / SearchModal (接続・クエリファイル横断検索) / PaneDivider (ドラッグ可能なペイン区切り線)
+- `lib/components/` — Toolbar (グローバルツールバー。Writable スイッチ・検索ボタンを含む) / ConnectionsPane / FilesPane / HistoryPane / TablesPane (スキーマブラウザ) / SqlEditor / EditorToolbar / ResultsPane / CellInspector / ConfigInfoModal (読み取り専用の設定表示) / ConfigEditorModal (config.yml のアプリ内エディタ) / AiAnalysisModal (EXPLAIN / 選択 SQL の AI 解説表示) / SearchModal (接続・クエリファイル横断検索) / PaneDivider (ドラッグ可能なペイン区切り線)
 - 検索モーダル (SearchModal) — ツールバーの検索ボタン (`data-annotate="button-open-search"`) または Cmd+K / Ctrl+K (`+page.svelte` の `handleGlobalKeydown` + `<svelte:window>`) で開くコマンドパレット風モーダル。接続は `app.svelte.ts` の一覧を名前・説明で絞り込み (フロント)、クエリファイルは選択中接続のものを `search_query_files` コマンド (query_files.rs) でファイル名 + 中身検索 (大小無視の部分一致、中身は最初の一致行をプレビュー)。検索は純 Rust (rg/grep 等の外部プロセスは使わない。クエリファイルは少数のため堅牢・インジェクション面なし)。↑↓ で候補移動・Enter で開く (接続はその接続へ切替、ファイルは選択中接続で開く)・Esc で閉じる。デバウンス 150ms + 世代番号で古い応答の上書きを防ぐ
+- 設定エディタ (ConfigEditorModal) — メニューバー QueryFolio の `Edit config.yml` で開く CodeMirror (YAML) のモーダル。`read_config_file` / `write_config_file` コマンド (config.rs) で ~/.config/queryfolio/config.yml を読み書きする。保存時は YAML マッピングとしてパースできることを確認してから一時ファイル + rename で書き、既存ファイルのパーミッションを引き継ぐ (新規は 600)。保存後に reloadConnections まで行う。未保存で閉じようとすると破棄確認を出す。`QUERYFOLIO_CONFIG_YAML` で上書き中は編集対象のファイルが無いためエラーを返す。`sql_servers` がソース宣言の `command:` の時だけ `Edit sql_servers config yaml (Read only)` が同メニューに出て、`read_sql_servers_source_yaml` で取得した YAML を読み取り専用 (Save 無し・Copy のみ) で表示する
+- メニューバー — macOS のアプリメニュー (QueryFolio) は NSApplication がメインメニュー設置時の内容で確定するため、tauri のデフォルトメニューに後から insert しても反映されない。そのため `Menu::default` を使わず `build_menu` でアプリメニューを含めて丸ごと組み、`Builder::menu` で最初の設置時から渡す。設定リロード時 (reset_connections) は `rebuild_menu` で組み直し、読み取り専用ビューの項目を出し入れする
 - Writable スイッチ — ツールバーの `data-annotate="toggle-writable"` トグル。OFF (既定、セッションごとに OFF から始め永続化しない) の間は SELECT/SHOW 等の副作用の無い文しか実行できない。app.svelte.ts の `writable` state が run_query に `writable` として渡り、バックエンド (lib.rs) が readonly ガードの由来を `db.rs` の `ReadonlyGuard` (Off / Config / Switch) で決めて強制する。実効 readonly = `config readonly || !writable`。config で `readonly: true` の接続はスイッチより優先 (ロック表示 = `writable-locked`) で解除できない。ブロック時のメッセージは由来で出し分ける (Config / Switch)
 - ペインのサイズ変更 — `+page.svelte` が接続一覧幅 / サイドバー幅 / エディタ縦割合を `$state` で管理し、`PaneDivider` (Pointer Events + setPointerCapture) のドラッグで変更する。ドラッグ終了時に localStorage (`queryfolio.layout.*`) へ保存し起動時に復元。各ペインコンポーネントの root は `w-full` で、幅は `+page.svelte` のラッパー div が inline style で与える
 - `lib/export.ts` — CSV/TSV/JSON 変換 (formula injection 対策込み)
