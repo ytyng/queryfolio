@@ -15,6 +15,7 @@
   import ReplaceMultilinePane from "$lib/components/ReplaceMultilinePane.svelte";
   import ResultsPane from "$lib/components/ResultsPane.svelte";
   import ConfigInfoModal from "$lib/components/ConfigInfoModal.svelte";
+  import ConfigEditorModal from "$lib/components/ConfigEditorModal.svelte";
   import AiAnalysisModal from "$lib/components/AiAnalysisModal.svelte";
   import DangerousConfirmModal from "$lib/components/DangerousConfirmModal.svelte";
   import SearchModal from "$lib/components/SearchModal.svelte";
@@ -22,6 +23,20 @@
 
   let showSettings = $state(false);
   let showSearch = $state(false);
+  /// 設定エディタ。null = 閉じている
+  let configEditorMode = $state<"config" | "source" | null>(null);
+  /// 設定エディタに未保存の変更があるか (モード切替で巻き添え破棄しないため)
+  let configEditorDirty = $state(false);
+
+  /// メニューから設定エディタを開く。表示中のエディタに未保存の変更がある状態で
+  /// 別のモードへ切り替えると #key による作り直しで編集が消えるため、それを断る。
+  function openConfigEditor(mode: "config" | "source") {
+    if (configEditorMode !== null && configEditorMode !== mode && configEditorDirty) {
+      toast.warning("Save or discard your changes first");
+      return;
+    }
+    configEditorMode = mode;
+  }
 
   /// グローバルショートカット。Cmd+K (mac) / Ctrl+K で検索モーダルを開閉する。
   function handleGlobalKeydown(e: KeyboardEvent) {
@@ -158,6 +173,14 @@
       }
     });
 
+    // メニューの Edit config.yml / Edit sql_servers config yaml からの通知
+    const unlistenEditPromise = listen("menu-edit-config", () => {
+      openConfigEditor("config");
+    });
+    const unlistenEditSourcePromise = listen("menu-edit-sql-servers-source", () => {
+      openConfigEditor("source");
+    });
+
     void (async () => {
       try {
         const createdPath = await ensureConfigFile();
@@ -176,6 +199,8 @@
 
     return () => {
       void unlistenPromise.then((unlisten) => unlisten());
+      void unlistenEditPromise.then((unlisten) => unlisten());
+      void unlistenEditSourcePromise.then((unlisten) => unlisten());
     };
   });
 </script>
@@ -365,6 +390,24 @@
       showSettings = false;
     }}
   />
+{/if}
+
+<!-- 設定ファイルのエディタ (メニューから開く)。mode で編集用と読み取り専用を切り替える。
+     モーダル表示中でもネイティブメニューは操作できるため、mode が切り替わったら
+     #key で作り直す (読み込み直しと read-only 設定はマウント時に確定するため) -->
+{#if configEditorMode !== null}
+  {#key configEditorMode}
+    <ConfigEditorModal
+      mode={configEditorMode}
+      onDirtyChange={(dirty) => {
+        configEditorDirty = dirty;
+      }}
+      onClose={() => {
+        configEditorMode = null;
+        configEditorDirty = false;
+      }}
+    />
+  {/key}
 {/if}
 
 <!-- AI による選択 SQL 解説のモーダル (EXPLAIN 解説モーダルを見出し違いで再利用) -->

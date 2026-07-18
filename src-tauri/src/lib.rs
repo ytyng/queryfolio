@@ -203,13 +203,19 @@ async fn get_connections(
 /// 接続設定のキャッシュ・プール・SSH トンネルを破棄する。
 /// 設定を変更した後のリロード時に呼ぶ。
 #[tauri::command]
-async fn reset_connections(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
+async fn reset_connections(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), AppError> {
     *state.servers.lock().await = None;
     *state.sqlfiles_dir.lock().await = None;
     *state.default_limit.lock().await = None;
     *state.ai.lock().await = None;
     state.db.reset().await;
     state.schema_cache.clear().await;
+    // 設定を編集して sql_servers のソース宣言が変わることがあるため、
+    // 読み取り専用ビューのメニュー項目の要否を再判定する
+    rebuild_menu(&app);
     Ok(())
 }
 
@@ -738,6 +744,173 @@ fn ensure_config_file() -> Result<Option<String>, AppError> {
     config::ensure_config_file()
 }
 
+/// 設定エディタ用に config.yml の中身を返す (無ければテンプレートを作成してから読む)。
+#[tauri::command]
+fn read_config_file() -> Result<String, AppError> {
+    config::read_config_file()
+}
+
+/// 設定エディタからの保存。書き込んだファイルのパスを返す。
+#[tauri::command]
+fn write_config_file(content: String) -> Result<String, AppError> {
+    config::write_config_file(&content)
+}
+
+/// sql_servers のソース宣言 command を実行して取得した生の YAML を返す
+/// (読み取り専用ビュー用)。
+#[tauri::command]
+async fn read_sql_servers_source_yaml() -> Result<String, AppError> {
+    config::fetch_sql_servers_source_yaml().await
+}
+
+/// アプリのメニューバーを組み立てる。
+///
+/// macOS のアプリメニュー (QueryFolio) は NSApplication がメインメニュー設置時の
+/// 内容で確定させるため、後から項目を insert しても反映されない。そのため
+/// tauri のデフォルトメニューを流用せず、アプリメニューを含めて丸ごと自前で組み、
+/// Builder::menu で最初の設置時から渡す。設定変更時はこの関数で組み直す。
+///
+/// 「Edit sql_servers config yaml (Read only)」は sql_servers がソース宣言の
+/// `command:` の時だけ出す。
+///
+/// 構成は tauri の `Menu::default` を踏襲する (アプリメニュー / View は macOS のみ、
+/// File の quit は macOS 以外のみ)。アプリメニューを持たないプラットフォームでは
+/// 設定編集の項目を Config サブメニューの先頭に置く。
+/// About ダイアログに出すメタ情報 (tauri の Menu::default と同じ内容)。
+fn about_metadata(app: &tauri::AppHandle) -> tauri::menu::AboutMetadata<'_> {
+    let package_info = app.package_info();
+    let config = app.config();
+    tauri::menu::AboutMetadata {
+        name: Some(package_info.name.clone()),
+        version: Some(package_info.version.to_string()),
+        copyright: config.bundle.copyright.clone(),
+        authors: config.bundle.publisher.clone().map(|p| vec![p]),
+        ..Default::default()
+    }
+}
+
+fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
+
+    let edit_config_item =
+        MenuItemBuilder::with_id("edit_config_file", "Edit config.yml").build(app)?;
+    let edit_source_item = MenuItemBuilder::with_id(
+        "edit_sql_servers_source",
+        "Edit sql_servers config yaml (Read only)",
+    )
+    .build(app)?;
+    let show_source_item = config::sql_servers_source_is_command();
+
+    #[cfg(target_os = "macos")]
+    let app_menu = {
+        use tauri::menu::PredefinedMenuItem;
+
+        let package_info = app.package_info();
+        let mut builder = SubmenuBuilder::new(app, package_info.name.clone())
+            .item(&PredefinedMenuItem::about(
+                app,
+                None,
+                Some(about_metadata(app)),
+            )?)
+            .separator()
+            .item(&edit_config_item);
+        if show_source_item {
+            builder = builder.item(&edit_source_item);
+        }
+        builder
+            .separator()
+            .services()
+            .separator()
+            .hide()
+            .hide_others()
+            .separator()
+            .quit()
+            .build()?
+    };
+
+    let file_menu = {
+        let builder = SubmenuBuilder::new(app, "File").close_window();
+        #[cfg(not(target_os = "macos"))]
+        let builder = builder.quit();
+        builder.build()?
+    };
+    let edit_menu = SubmenuBuilder::new(app, "Edit")
+        .undo()
+        .redo()
+        .separator()
+        .cut()
+        .copy()
+        .paste()
+        .select_all()
+        .build()?;
+    #[cfg(target_os = "macos")]
+    let view_menu = SubmenuBuilder::new(app, "View").fullscreen().build()?;
+    // Window / Help は tauri と同じ固定 ID で作る。macOS の init_app_menu は
+    // この ID でメニューを探して NSApp の windowsMenu / helpMenu に登録するため、
+    // ID が無いとウインドウ一覧やヘルプ検索が付かなくなる
+    let window_menu = {
+        let builder = SubmenuBuilder::with_id(app, tauri::menu::WINDOW_SUBMENU_ID, "Window")
+            .minimize()
+            .maximize();
+        #[cfg(target_os = "macos")]
+        let builder = builder.separator();
+        builder.close_window().build()?
+    };
+    // tauri のデフォルトメニュー同様、macOS では中身を持たない
+    // (About はアプリメニュー側にあり、システムがヘルプ検索を足す)
+    let help_menu = {
+        let builder = SubmenuBuilder::with_id(app, tauri::menu::HELP_SUBMENU_ID, "Help");
+        #[cfg(not(target_os = "macos"))]
+        let builder = builder.about(Some(about_metadata(app)));
+        builder.build()?
+    };
+
+    let reload_item = MenuItemBuilder::with_id("reload_config_file", "Reload config file")
+        .accelerator("CmdOrCtrl+R")
+        .build(app)?;
+    let reveal_item =
+        MenuItemBuilder::with_id("reveal_config_folder", "Reveal config folder").build(app)?;
+    let config_menu = {
+        #[allow(unused_mut)]
+        let mut builder = SubmenuBuilder::new(app, "Config");
+        // アプリメニューが無いプラットフォームでは設定編集もここに置く
+        #[cfg(not(target_os = "macos"))]
+        {
+            builder = builder.item(&edit_config_item);
+            if show_source_item {
+                builder = builder.item(&edit_source_item);
+            }
+            builder = builder.separator();
+        }
+        builder.item(&reload_item).item(&reveal_item).build()?
+    };
+
+    #[allow(unused_mut)]
+    let mut menu = MenuBuilder::new(app);
+    #[cfg(target_os = "macos")]
+    {
+        menu = menu.item(&app_menu);
+    }
+    menu = menu.item(&file_menu).item(&edit_menu);
+    #[cfg(target_os = "macos")]
+    {
+        menu = menu.item(&view_menu);
+    }
+    menu.item(&window_menu)
+        .item(&help_menu)
+        .item(&config_menu)
+        .build()
+}
+
+/// 設定を読み直した後にメニューを組み直す。
+/// sql_servers のソース宣言が変わると読み取り専用ビューの項目の要否も変わるため。
+fn rebuild_menu(app: &tauri::AppHandle) {
+    match build_menu(app).and_then(|menu| app.set_menu(menu)) {
+        Ok(_) => {}
+        Err(e) => eprintln!("[menu] failed to rebuild the menu: {e}"),
+    }
+}
+
 /// config.yml (無ければ設定フォルダ) を Finder 等のファイルマネージャで表示する。
 fn reveal_config_folder() -> Result<(), AppError> {
     let target = match config::existing_config_path()? {
@@ -750,7 +923,6 @@ fn reveal_config_folder() -> Result<(), AppError> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    use tauri::menu::{Menu, MenuItemBuilder, SubmenuBuilder};
     use tauri::Emitter;
 
     tauri::Builder::default()
@@ -758,23 +930,9 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         // 終了時のウインドウサイズ・位置を保存し、起動時に復元する
         .plugin(tauri_plugin_window_state::Builder::default().build())
-        .setup(|app| {
-            // デフォルトメニューに Config サブメニューを追加する
-            let menu = Menu::default(app.handle())?;
-            let reload_item = MenuItemBuilder::with_id("reload_config_file", "Reload config file")
-                .accelerator("CmdOrCtrl+R")
-                .build(app)?;
-            let reveal_item =
-                MenuItemBuilder::with_id("reveal_config_folder", "Reveal config folder")
-                    .build(app)?;
-            let config_menu = SubmenuBuilder::new(app, "Config")
-                .item(&reload_item)
-                .item(&reveal_item)
-                .build()?;
-            menu.append(&config_menu)?;
-            app.set_menu(menu)?;
-            Ok(())
-        })
+        // setup で set_menu すると、それより前に設置される tauri のデフォルト
+        // メニューで macOS のアプリメニューが確定してしまうため、ここで渡す
+        .menu(build_menu)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "reload_config_file" => {
                 // 再読込はフロントの状態 (選択・未保存編集) と連動するため、
@@ -786,6 +944,16 @@ pub fn run() {
             "reveal_config_folder" => {
                 if let Err(e) = reveal_config_folder() {
                     eprintln!("[menu] {e}");
+                }
+            }
+            "edit_config_file" => {
+                if let Err(e) = app.emit("menu-edit-config", ()) {
+                    eprintln!("[menu] failed to emit edit config event: {e}");
+                }
+            }
+            "edit_sql_servers_source" => {
+                if let Err(e) = app.emit("menu-edit-sql-servers-source", ()) {
+                    eprintln!("[menu] failed to emit edit sql_servers source event: {e}");
                 }
             }
             _ => {}
@@ -821,6 +989,9 @@ pub fn run() {
             ai_fix_sql,
             get_config_info,
             ensure_config_file,
+            read_config_file,
+            write_config_file,
+            read_sql_servers_source_yaml,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
