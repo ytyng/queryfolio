@@ -20,6 +20,7 @@ https://github.com/user-attachments/assets/90439816-49c8-4ebd-a068-b102cfe9c7aa
 - Query cancellation while running
 - Per-connection query history (searchable, stored locally with restrictive file permissions)
 - psql-style meta commands (`\l` `\dt` `\dv` `\dn` `\du` `\d [table]`) translated to catalog queries, with MySQL / SQLite equivalents where possible
+- `\c <database>` switches the active database of the connection (MySQL / PostgreSQL). The pool is rebuilt, and the database selector, schema browser, and SQL completion follow
 - `readonly: true` per connection rejects write statements (INSERT / UPDATE / DELETE / DDL, including CTE-wrapped DML) as a safety guard
 - Auto `LIMIT` for SELECTs without one (`default_limit`, default 500)
 - AI features (OpenAI): SQL generation from natural language, Fix with AI on query errors, EXPLAIN plan analysis with index suggestions, and explanation of selected SQL. Generated SQL is inserted into the editor, never auto-executed. Only the schema (table / column names), engine dialect, statements, and plans are sent — never query results

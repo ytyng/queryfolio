@@ -248,7 +248,17 @@ async fn run_query(
         limit => Some(limit),
     };
     let started = std::time::Instant::now();
+
     let result = async {
+        // \c <database> は SQL の実行ではなく接続状態の変更なので、
+        // プールを取得する前にここで処理する。
+        // (メタコマンドの解釈エラーもここで出すことで、失敗として履歴に残る)
+        let engine = db::parse_engine(&server.engine)?;
+        if let Some(meta_commands::MetaCommand::Connect(schema)) =
+            meta_commands::translate(engine, &sql)?
+        {
+            return switch_active_schema(&state, &server, schema, started).await;
+        }
         let pool: DbPool = state.db.get_pool(&server).await?;
         db::run_query_cancellable(
             &pool,
@@ -290,6 +300,75 @@ async fn run_query(
     }
 
     result
+}
+
+/// `\c <database>` の実処理。アクティブスキーマを切り替え、切替後の接続で
+/// 確認用のクエリを実行して結果として返す (空の結果だと成功が分かりにくいため)。
+///
+/// 切替に失敗した場合 (存在しない database 等) は元のスキーマへ戻す。
+/// 戻さないと、以降すべてのクエリが接続できない状態で残ってしまう。
+async fn switch_active_schema(
+    state: &tauri::State<'_, AppState>,
+    server: &ServerConfig,
+    schema: String,
+    started: std::time::Instant,
+) -> Result<QueryResult, AppError> {
+    let previous = state.db.schema_override(&server.name).await;
+    state.db.set_schema_override(&server.name, schema.clone()).await;
+
+    // 切替後の接続で実際に繋がることを確かめる。ここで失敗したら巻き戻す
+    let confirm = async {
+        let pool: DbPool = state.db.get_pool(server).await?;
+        let sql = match db::parse_engine(&server.engine)? {
+            db::Engine::MySql => "SELECT DATABASE() AS `database`",
+            db::Engine::Postgres => "SELECT current_database() AS database",
+            // sqlite は meta_commands 側で弾いているのでここには来ない
+            db::Engine::Sqlite => {
+                return Err(AppError::Config(
+                    "\\c is not supported for SQLite".into(),
+                ));
+            }
+        };
+        db::run_query_cancellable(
+            &pool,
+            &state.query_cancels,
+            &server.name,
+            sql,
+            DEFAULT_MAX_ROWS,
+            None,
+            // 確認用の SELECT なので readonly 接続でも通る
+            db::ReadonlyGuard::Config,
+            false,
+        )
+        .await
+    }
+    .await;
+
+    match confirm {
+        Ok(mut result) => {
+            // 切替後は古いスキーマのテーブル一覧・カラムを返さないようにする
+            state.schema_cache.invalidate_connection(&server.name).await;
+            result.switched_schema = Some(schema);
+            result.elapsed_ms = started.elapsed().as_millis() as u64;
+            Ok(result)
+        }
+        Err(e) => {
+            // 切替中にユーザーがスキーマ選択で別の database へ変えていた場合は
+            // 巻き戻さない (そちらの選択を尊重する)
+            state
+                .db
+                .rollback_schema_override(&server.name, &schema, previous)
+                .await;
+            // キャンセルはフロントが「Query cancelled」の完全一致で判定して
+            // 専用表示にするため、理由を包まずそのまま返す
+            if matches!(e, AppError::Cancelled) {
+                return Err(e);
+            }
+            Err(AppError::Config(format!(
+                "Failed to switch to {schema}: {e}"
+            )))
+        }
+    }
 }
 
 /// 接続で実行中のクエリにキャンセルを要求する。
