@@ -30,8 +30,10 @@ pub fn translate(engine: Engine, input: &str) -> Result<Option<MetaCommand>, App
 
     // \c はエンジン共通で先に処理する (SQL に変換せず接続状態を変える)
     if matches!(command, "\\c" | "\\connect") {
+        // arg は消費済みなので、残りは database 名より後ろのトークン
+        let extra: Vec<&str> = parts.collect();
         return Ok(Some(MetaCommand::Connect(parse_connect_arg(
-            engine, command, arg,
+            engine, command, arg, &extra,
         )?)));
     }
 
@@ -51,6 +53,7 @@ fn parse_connect_arg(
     engine: Engine,
     command: &str,
     arg: Option<&str>,
+    extra: &[&str],
 ) -> Result<String, AppError> {
     if matches!(engine, Engine::Sqlite) {
         return Err(AppError::Config(format!(
@@ -63,6 +66,16 @@ fn parse_connect_arg(
             "{command} requires a database name (usage: {command} <database>)"
         )));
     };
+    // psql の \c は database の後ろに user / host / port を取れるが、
+    // ここで切り替えられるのは database だけ。黙って無視すると別のユーザーで
+    // 繋がったと誤解させるため、余分な引数はエラーにする
+    if !extra.is_empty() {
+        return Err(AppError::Config(format!(
+            "{command} takes only a database name (usage: {command} <database>). \
+             Connecting as another user or host is not supported; \
+             define another connection in the config instead"
+        )));
+    }
     Ok(validate_database_name(name)?.to_string())
 }
 
@@ -352,6 +365,15 @@ mod tests {
     fn test_connect_without_argument_is_error() {
         let err = translate(Engine::Postgres, "\\c").unwrap_err();
         assert!(err.to_string().contains("requires a database name"));
+    }
+
+    #[test]
+    fn test_connect_rejects_extra_arguments() {
+        // psql の `\c <db> <user>` 形式。ユーザー切替はできないので、
+        // 黙って database だけ切り替えず拒否する
+        let err = translate(Engine::Postgres, "\\c proddb readonly_user").unwrap_err();
+        assert!(err.to_string().contains("takes only a database name"));
+        assert!(translate(Engine::MySql, "\\c proddb host 3306;").is_err());
     }
 
     #[test]
