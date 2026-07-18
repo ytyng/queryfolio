@@ -871,6 +871,9 @@ const executeTab = async (tab: ResultTab) => {
   // \c でアクティブスキーマが切り替わっていたら表示を追従させる
   // (切替自体はバックエンドで完了済み)
   if (result?.switched_schema) {
+    // 確認クエリは切替後の database で実行されているので、
+    // タブが記録するスキーマもそちらに合わせる
+    tab.schema = result.switched_schema;
     applySwitchedSchema(tab.connection, result.switched_schema);
   }
 };
