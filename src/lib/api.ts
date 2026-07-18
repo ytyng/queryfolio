@@ -37,6 +37,8 @@ export interface QueryResult {
   truncated: boolean;
   applied_limit: number | null;
   elapsed_ms: number;
+  /// `\c` でアクティブスキーマを切り替えた場合の切替先 (それ以外は null)
+  switched_schema: string | null;
 }
 
 /// クエリ実行履歴の 1 件分 (バックエンドの history::HistoryEntry に対応)

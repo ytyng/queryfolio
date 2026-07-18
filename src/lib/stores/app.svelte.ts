@@ -868,6 +868,28 @@ const executeTab = async (tab: ResultTab) => {
   tab.result = result;
   tab.error = error;
   tab.cancelled = cancelled;
+  // \c でアクティブスキーマが切り替わっていたら表示を追従させる
+  // (切替自体はバックエンドで完了済み)
+  if (result?.switched_schema) {
+    // 確認クエリは切替後の database で実行されているので、
+    // タブが記録するスキーマもそちらに合わせる
+    tab.schema = result.switched_schema;
+    applySwitchedSchema(tab.connection, result.switched_schema);
+  }
+};
+
+/// `\c` によるスキーマ切替をフロントの状態へ反映する。
+/// スキーマブラウザは activeSchema の変化を購読しているので自動で追従し、
+/// SQL 補完のスキーママップはここで取り直す。
+const applySwitchedSchema = (connection: string, schema: string) => {
+  // 実行中に別接続へ移っていたら、そのスキーマ表示を新接続に適用しない
+  if (selectedConnection !== connection || activeSchema === schema) {
+    return;
+  }
+  activeSchema = schema;
+  // 補完候補は切替先のものを取り直す (待たない)
+  void loadSchemaMap();
+  toast.success(`Switched to ${schema}`);
 };
 
 /// タブで実行中のクエリのキャンセルを要求する。

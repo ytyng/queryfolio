@@ -43,6 +43,10 @@ pub struct QueryResult {
     pub elapsed_ms: u64,
     /// 自動付与した LIMIT の値 (付与していなければ None)
     pub applied_limit: Option<u64>,
+    /// `\c` で切り替えた後のアクティブスキーマ (それ以外は None)。
+    /// フロント側の表示・スキーマブラウザ・補完を追従させるために返す。
+    #[serde(default)]
+    pub switched_schema: Option<String>,
 }
 
 /// 接続名ごとのプールと SSH トンネルを保持するマネージャ。
@@ -135,9 +139,54 @@ impl DbManager {
     /// コネクション間でセッション状態が食い違うのを防ぐ)。
     /// SSH トンネルは接続先ホストが変わらないため維持する。
     pub async fn set_schema_override(&self, connection: &str, schema: String) {
+        self.replace_schema_override(connection, Some(schema)).await;
+    }
+
+    /// アクティブスキーマのオーバーライドを設定または解除する。
+    /// None を渡すと設定ファイルの schema に戻る。
+    async fn replace_schema_override(&self, connection: &str, schema: Option<String>) {
         let mut inner = self.inner.lock().await;
-        inner.schema_overrides.insert(connection.to_string(), schema);
+        match schema {
+            Some(schema) => {
+                inner.schema_overrides.insert(connection.to_string(), schema);
+            }
+            None => {
+                inner.schema_overrides.remove(connection);
+            }
+        }
         inner.pools.remove(connection);
+    }
+
+    /// 切り替えに失敗した時 (存在しない database を指定された等) に、
+    /// アクティブスキーマを previous へ戻す。
+    ///
+    /// 現在値が expected (自分が設定した値) と一致する場合だけ戻す
+    /// compare-and-swap。切り替え中にユーザーがスキーマ選択などで別の値へ
+    /// 変更していた場合、それを巻き戻さないようにするため。
+    /// 戻した場合は true を返す。
+    pub async fn rollback_schema_override(
+        &self,
+        connection: &str,
+        expected: &str,
+        previous: Option<String>,
+    ) -> bool {
+        // 判定と書き戻しの間に割り込まれないよう、同じロックスコープで行う
+        let mut inner = self.inner.lock().await;
+        if inner.schema_overrides.get(connection).map(String::as_str) != Some(expected) {
+            return false;
+        }
+        match previous {
+            Some(previous) => {
+                inner
+                    .schema_overrides
+                    .insert(connection.to_string(), previous);
+            }
+            None => {
+                inner.schema_overrides.remove(connection);
+            }
+        }
+        inner.pools.remove(connection);
+        true
     }
 
     /// 接続のアクティブスキーマのオーバーライドを返す (無ければ None)。
@@ -329,7 +378,8 @@ impl Drop for RunningQueryGuard<'_> {
     }
 }
 
-fn parse_engine(engine: &str) -> Result<Engine, AppError> {
+/// 設定の engine 文字列を Engine に解決する。
+pub fn parse_engine(engine: &str) -> Result<Engine, AppError> {
     match engine.to_ascii_lowercase().as_str() {
         "mysql" | "mariadb" => Ok(Engine::MySql),
         "postgres" | "postgresql" => Ok(Engine::Postgres),
@@ -646,8 +696,18 @@ async fn run_query_on(
     allow_dangerous: bool,
 ) -> Result<QueryResult, AppError> {
     let engine = conn.engine();
-    // psql 風メタコマンド (\l, \dt など) はカタログ照会 SQL に変換して実行する
-    let translated = crate::meta_commands::translate(engine, sql)?;
+    // psql 風メタコマンド (\l, \dt など) はカタログ照会 SQL に変換して実行する。
+    // \c (スキーマ切替) は SQL にならないため、ここへ来る前に lib.rs の
+    // run_query が処理している
+    let translated = match crate::meta_commands::translate(engine, sql)? {
+        Some(crate::meta_commands::MetaCommand::Sql(sql)) => Some(sql),
+        Some(crate::meta_commands::MetaCommand::Connect(_)) => {
+            return Err(AppError::Config(
+                "\\c must be handled before the query runs".into(),
+            ));
+        }
+        None => None,
+    };
     let sql = translated.as_deref().unwrap_or(sql);
 
     if leading_keyword(sql).is_empty() {
@@ -705,6 +765,7 @@ async fn run_query_on(
             truncated: false,
             elapsed_ms: started.elapsed().as_millis() as u64,
             applied_limit: None,
+            switched_schema: None,
         });
     }
 
@@ -771,6 +832,7 @@ async fn run_query_on(
         truncated,
         elapsed_ms: started.elapsed().as_millis() as u64,
         applied_limit,
+        switched_schema: None,
     })
 }
 
@@ -1544,6 +1606,44 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(dangerous_statement_reason("bogus", "DROP TABLE t").is_err());
+    }
+
+    /// 切替失敗時のロールバックは compare-and-swap で、
+    /// その間に別経路で変更された値は巻き戻さない。
+    #[tokio::test]
+    async fn test_rollback_schema_override_is_compare_and_swap() {
+        let manager = DbManager::default();
+
+        // 元が None (設定のデフォルト) の状態から切り替えて失敗 → 解除される
+        manager.set_schema_override("conn", "tried".to_string()).await;
+        assert!(manager.rollback_schema_override("conn", "tried", None).await);
+        assert_eq!(manager.schema_override("conn").await, None);
+
+        // 元の値がある状態から切り替えて失敗 → 元の値に戻る
+        manager.set_schema_override("conn", "before".to_string()).await;
+        manager.set_schema_override("conn", "tried".to_string()).await;
+        assert!(
+            manager
+                .rollback_schema_override("conn", "tried", Some("before".to_string()))
+                .await
+        );
+        assert_eq!(
+            manager.schema_override("conn").await,
+            Some("before".to_string())
+        );
+
+        // 切替中にユーザーが別の値へ変えていた場合は巻き戻さない
+        manager.set_schema_override("conn", "tried".to_string()).await;
+        manager.set_schema_override("conn", "chosen".to_string()).await;
+        assert!(
+            !manager
+                .rollback_schema_override("conn", "tried", Some("before".to_string()))
+                .await
+        );
+        assert_eq!(
+            manager.schema_override("conn").await,
+            Some("chosen".to_string())
+        );
     }
 
     #[tokio::test]

@@ -1,12 +1,23 @@
 use crate::db::Engine;
 use crate::error::AppError;
 
-/// psql 風メタコマンド (\l, \dt など) をカタログ照会 SQL に変換する。
+/// メタコマンドの解釈結果。
+#[derive(Debug, PartialEq, Eq)]
+pub enum MetaCommand {
+    /// カタログ照会 SQL に変換できたもの (そのまま実行する)
+    Sql(String),
+    /// `\c <schema>` — アクティブスキーマ (database) の切り替え。
+    /// SQL の実行ではなく接続状態の変更なので、実行前に lib.rs が処理する。
+    Connect(String),
+}
+
+/// psql 風メタコマンド (\l, \dt など) を解釈する。
 ///
-/// 読み取り系のカタログ照会のみ対応する。\c (接続切替) や \i (ファイル実行)
-/// のような状態を持つコマンドは対象外。
+/// 大半は読み取り系のカタログ照会 SQL に変換する。`\c <schema>` だけは
+/// SQL ではなくアクティブスキーマの切り替えを表す MetaCommand::Connect を返す。
+/// \i (ファイル実行) のようなその他の状態を持つコマンドは対象外。
 /// 入力がメタコマンドでなければ None、未対応のメタコマンドはエラーを返す。
-pub fn translate(engine: Engine, input: &str) -> Result<Option<String>, AppError> {
+pub fn translate(engine: Engine, input: &str) -> Result<Option<MetaCommand>, AppError> {
     let trimmed = input.trim();
     if !trimmed.starts_with('\\') {
         return Ok(None);
@@ -17,12 +28,72 @@ pub fn translate(engine: Engine, input: &str) -> Result<Option<String>, AppError
     let command = parts.next().unwrap_or("");
     let arg = parts.next();
 
+    // \c はエンジン共通で先に処理する (SQL に変換せず接続状態を変える)
+    if matches!(command, "\\c" | "\\connect") {
+        // arg は消費済みなので、残りは database 名より後ろのトークン
+        let extra: Vec<&str> = parts.collect();
+        return Ok(Some(MetaCommand::Connect(parse_connect_arg(
+            engine, command, arg, &extra,
+        )?)));
+    }
+
     let sql = match engine {
         Engine::Postgres => postgres_meta(command, arg)?,
         Engine::MySql => mysql_meta(command, arg)?,
         Engine::Sqlite => sqlite_meta(command, arg)?,
     };
-    Ok(Some(sql))
+    Ok(Some(MetaCommand::Sql(sql)))
+}
+
+/// `\c <schema>` の引数を検証する。
+///
+/// sqlite は schema が DB ファイルパスで、切り替えは別の DB ファイルを開くことに
+/// なるため対象外にする (設定ファイルで接続を分ける方が明快)。
+fn parse_connect_arg(
+    engine: Engine,
+    command: &str,
+    arg: Option<&str>,
+    extra: &[&str],
+) -> Result<String, AppError> {
+    if matches!(engine, Engine::Sqlite) {
+        return Err(AppError::Config(format!(
+            "{command} is not supported for SQLite \
+             (the schema is a database file path; define another connection instead)"
+        )));
+    }
+    let Some(name) = arg else {
+        return Err(AppError::Config(format!(
+            "{command} requires a database name (usage: {command} <database>)"
+        )));
+    };
+    // psql の \c は database の後ろに user / host / port を取れるが、
+    // ここで切り替えられるのは database だけ。黙って無視すると別のユーザーで
+    // 繋がったと誤解させるため、余分な引数はエラーにする
+    if !extra.is_empty() {
+        return Err(AppError::Config(format!(
+            "{command} takes only a database name (usage: {command} <database>). \
+             Connecting as another user or host is not supported; \
+             define another connection in the config instead"
+        )));
+    }
+    Ok(validate_database_name(name)?.to_string())
+}
+
+/// `\c` の引数として使う database 名を検証する。
+///
+/// 接続オプションに渡す値で SQL には埋め込まないが、タイプミスで
+/// プールを壊さないよう識別子として妥当な形だけ受け付ける。
+/// schema.table 形式を許す validate_relation_name と違いドットは許可しない。
+fn validate_database_name(name: &str) -> Result<&str, AppError> {
+    let mut chars = name.chars();
+    let valid = matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '-');
+    if !valid {
+        return Err(AppError::Config(format!(
+            "Invalid database name: {name} (only simple identifiers are supported)"
+        )));
+    }
+    Ok(name)
 }
 
 /// テーブル名引数を検証する。SQL に埋め込むため、識別子として安全な文字のみ許可する。
@@ -93,7 +164,7 @@ fn postgres_meta(command: &str, arg: Option<&str>) -> Result<String, AppError> {
         _ => {
             return Err(unsupported(
                 command,
-                "\\l \\list \\dt \\dv \\dn \\du \\d [table]",
+                "\\l \\list \\dt \\dv \\dn \\du \\d [table] \\c <database>",
             ));
         }
     };
@@ -139,7 +210,7 @@ fn mysql_meta(command: &str, arg: Option<&str>) -> Result<String, AppError> {
         _ => {
             return Err(unsupported(
                 command,
-                "\\l \\list \\dt \\dv \\du \\d [table]",
+                "\\l \\list \\dt \\dv \\du \\d [table] \\c <database>",
             ));
         }
     };
@@ -174,13 +245,21 @@ fn sqlite_meta(command: &str, arg: Option<&str>) -> Result<String, AppError> {
 mod tests {
     use super::*;
 
+    /// SQL に変換されるメタコマンドの検証用。変換結果の SQL を取り出す。
+    fn sql_of(engine: Engine, input: &str) -> String {
+        match translate(engine, input).unwrap().unwrap() {
+            MetaCommand::Sql(sql) => sql,
+            other => panic!("expected SQL, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_trailing_semicolon_is_ignored() {
-        let sql = translate(Engine::Postgres, "\\dt;").unwrap().unwrap();
+        let sql = sql_of(Engine::Postgres, "\\dt;");
         assert!(sql.contains("pg_catalog.pg_class"));
-        let sql = translate(Engine::Postgres, "\\d users;").unwrap().unwrap();
+        let sql = sql_of(Engine::Postgres, "\\d users;");
         assert!(sql.contains("'users'::regclass"));
-        let sql = translate(Engine::MySql, "\\l ;;").unwrap().unwrap();
+        let sql = sql_of(Engine::MySql, "\\l ;;");
         assert_eq!(sql, "SHOW DATABASES");
     }
 
@@ -192,56 +271,54 @@ mod tests {
 
     #[test]
     fn test_postgres_meta() {
-        let sql = translate(Engine::Postgres, "\\l").unwrap().unwrap();
+        let sql = sql_of(Engine::Postgres, "\\l");
         assert!(sql.contains("pg_database"));
-        let sql = translate(Engine::Postgres, "\\list").unwrap().unwrap();
+        let sql = sql_of(Engine::Postgres, "\\list");
         assert!(sql.contains("pg_database"));
-        let sql = translate(Engine::Postgres, "\\dt").unwrap().unwrap();
+        let sql = sql_of(Engine::Postgres, "\\dt");
         assert!(sql.contains("('r','p')"));
-        let sql = translate(Engine::Postgres, "\\d users").unwrap().unwrap();
+        let sql = sql_of(Engine::Postgres, "\\d users");
         assert!(sql.contains("'users'::regclass"));
-        let sql = translate(Engine::Postgres, "\\d public.users")
-            .unwrap()
-            .unwrap();
+        let sql = sql_of(Engine::Postgres, "\\d public.users");
         assert!(sql.contains("'public.users'::regclass"));
-        let sql = translate(Engine::Postgres, "\\du").unwrap().unwrap();
+        let sql = sql_of(Engine::Postgres, "\\du");
         assert!(sql.contains("pg_roles"));
-        let sql = translate(Engine::Postgres, "\\dn").unwrap().unwrap();
+        let sql = sql_of(Engine::Postgres, "\\dn");
         assert!(sql.contains("pg_namespace"));
     }
 
     #[test]
     fn test_mysql_meta() {
         assert_eq!(
-            translate(Engine::MySql, "\\l").unwrap().unwrap(),
+            sql_of(Engine::MySql, "\\l"),
             "SHOW DATABASES"
         );
         assert_eq!(
-            translate(Engine::MySql, "\\dt").unwrap().unwrap(),
+            sql_of(Engine::MySql, "\\dt"),
             "SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'"
         );
         assert_eq!(
-            translate(Engine::MySql, "\\d").unwrap().unwrap(),
+            sql_of(Engine::MySql, "\\d"),
             "SHOW TABLES"
         );
         assert_eq!(
-            translate(Engine::MySql, "\\d users").unwrap().unwrap(),
+            sql_of(Engine::MySql, "\\d users"),
             "DESCRIBE `users`"
         );
         assert_eq!(
-            translate(Engine::MySql, "\\d mydb.users").unwrap().unwrap(),
+            sql_of(Engine::MySql, "\\d mydb.users"),
             "DESCRIBE `mydb`.`users`"
         );
     }
 
     #[test]
     fn test_sqlite_meta() {
-        let sql = translate(Engine::Sqlite, "\\dt").unwrap().unwrap();
+        let sql = sql_of(Engine::Sqlite, "\\dt");
         assert!(sql.contains("sqlite_master"));
         // _ が LIKE ワイルドカード扱いされないよう ESCAPE 句付き
         assert!(sql.contains("ESCAPE"));
         assert_eq!(
-            translate(Engine::Sqlite, "\\d users").unwrap().unwrap(),
+            sql_of(Engine::Sqlite, "\\d users"),
             "PRAGMA table_info(\"users\")"
         );
     }
@@ -258,10 +335,60 @@ mod tests {
 
     #[test]
     fn test_unsupported_command_is_error() {
-        let err = translate(Engine::Postgres, "\\c otherdb").unwrap_err();
+        let err = translate(Engine::Postgres, "\\x").unwrap_err();
         assert!(err.to_string().contains("Unsupported meta command"));
         assert!(translate(Engine::MySql, "\\dn").is_err());
         assert!(translate(Engine::Sqlite, "\\du").is_err());
-        assert!(translate(Engine::Postgres, "\\x").is_err());
+    }
+
+    #[test]
+    fn test_connect_meta() {
+        // \c / \connect はどちらもスキーマ切替として解釈される
+        assert_eq!(
+            translate(Engine::Postgres, "\\c otherdb").unwrap().unwrap(),
+            MetaCommand::Connect("otherdb".to_string())
+        );
+        assert_eq!(
+            translate(Engine::MySql, "\\connect other_db;")
+                .unwrap()
+                .unwrap(),
+            MetaCommand::Connect("other_db".to_string())
+        );
+        // 先頭が数字の database 名 (MySQL では実在しうる) も受け付ける
+        assert_eq!(
+            translate(Engine::MySql, "\\c 2024_logs").unwrap().unwrap(),
+            MetaCommand::Connect("2024_logs".to_string())
+        );
+    }
+
+    #[test]
+    fn test_connect_without_argument_is_error() {
+        let err = translate(Engine::Postgres, "\\c").unwrap_err();
+        assert!(err.to_string().contains("requires a database name"));
+    }
+
+    #[test]
+    fn test_connect_rejects_extra_arguments() {
+        // psql の `\c <db> <user>` 形式。ユーザー切替はできないので、
+        // 黙って database だけ切り替えず拒否する
+        let err = translate(Engine::Postgres, "\\c proddb readonly_user").unwrap_err();
+        assert!(err.to_string().contains("takes only a database name"));
+        assert!(translate(Engine::MySql, "\\c proddb host 3306;").is_err());
+    }
+
+    #[test]
+    fn test_connect_rejects_unsafe_names() {
+        // 接続オプションに渡す値なので SQL インジェクションにはならないが、
+        // 識別子として不自然なものはタイプミスとして弾く
+        assert!(translate(Engine::Postgres, "\\c a;b").is_err());
+        assert!(translate(Engine::Postgres, "\\c my.db").is_err());
+        assert!(translate(Engine::MySql, "\\c `db`").is_err());
+    }
+
+    #[test]
+    fn test_connect_is_rejected_for_sqlite() {
+        // sqlite の schema は DB ファイルパスなので切替対象にしない
+        let err = translate(Engine::Sqlite, "\\c other").unwrap_err();
+        assert!(err.to_string().contains("not supported for SQLite"));
     }
 }
