@@ -113,11 +113,82 @@ fn ensure_config_file_in(dir: &std::path::Path) -> Result<Option<String>, AppErr
     let yml = dir.join("config.yml");
     let yaml = dir.join("config.yaml");
     if yml.exists() || yaml.exists() {
+        // 既存ファイルが緩い権限 (umask 依存の 644 等) で作られていた場合に
+        // 所有者のみ (600) へ是正する。config には接続パスワードや SSH 鍵の
+        // パスフレーズが平文で入り得るため。是正の主経路は AppConfig::load
+        // (起動時の build_menu から走り、フロントの ensure_config_file より
+        // 早い) だが、ここでも実施して設定エディタ (read_config_file_in) の
+        // 経路や旧バージョン・手動作成のファイルも確実に救済する。
+        #[cfg(unix)]
+        {
+            tighten_config_permissions(&yml)?;
+            tighten_config_permissions(&yaml)?;
+        }
         return Ok(None);
     }
     std::fs::create_dir_all(dir)?;
+    // 作成時からパーミッションを 600 で固定する。std::fs::write だと umask
+    // 依存 (通常 644) で作られ、書き込み直後に同一マシンの他ユーザーへ中身を
+    // 読まれる隙ができる。create_new (O_EXCL) にすることで、上の exists 判定
+    // 後に別プロセスが作った config.yml を truncate してしまう競合も防ぐ。
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&yml)
+        {
+            Ok(mut file) => {
+                // mode() は umask で更に絞られるだけだが、異常な umask で所有者
+                // ビットが落ちる事態に備え、開いた fd に対して明示的にも設定する。
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                file.write_all(CONFIG_TEMPLATE.as_bytes())?;
+                file.sync_all()?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // exists 判定後に別プロセスが作成した。上書きせず権限だけ是正する。
+                tighten_config_permissions(&yml)?;
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    #[cfg(not(unix))]
     std::fs::write(&yml, CONFIG_TEMPLATE)?;
     Ok(Some(yml.display().to_string()))
+}
+
+/// 既存の設定ファイルに group / other の許可ビットが立っていたら、
+/// 所有者のみ (600) へ絞る。存在しなければ何もしない。macOS では staff
+/// グループが全ローカルユーザーで共有されるため、640 でも他ユーザーへ
+/// 漏れる。owner-only まで絞るのが安全。
+#[cfg(unix)]
+fn tighten_config_permissions(path: &std::path::Path) -> Result<(), AppError> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        // 無ければ何もしない (別拡張子や、判定と stat の間に消えた場合)。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // それ以外の I/O エラーは握り潰さず伝播する。黙って return すると
+        // 是正できていないのに成功したように見えてしまうため。
+        Err(e) => return Err(e.into()),
+    };
+    // 通常ファイルにのみ適用する。config.yml がディレクトリ (やその symlink)
+    // だと 600 にした瞬間に owner の検索ビット (x) が落ちてアクセス不能になり、
+    // その後の設定読み込みが失敗する。ファイル以外は触らない。
+    if !meta.is_file() {
+        return Ok(());
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 /// SSH トンネル設定。sql-agent-mcp-server の config.yaml と互換。
@@ -367,6 +438,12 @@ impl AppConfig {
                 path.display()
             )));
         }
+        // 読み込む前に、緩い権限で置かれた設定ファイルを所有者のみへ是正する。
+        // build_menu からの load はフロントの ensure_config_file より先に走る
+        // ため、ここを是正の主経路にする (config は平文の接続パスワードや SSH
+        // 鍵パスフレーズを含み得る)。
+        #[cfg(unix)]
+        tighten_config_permissions(&path)?;
         let text = std::fs::read_to_string(&path)?;
         let doc = parse_mapping(&text, &path.display().to_string())?;
         Ok(Self {
@@ -594,15 +671,12 @@ fn write_config_file_in(dir: &std::path::Path, content: &str) -> Result<String, 
     std::fs::create_dir_all(dir)?;
     let path = config_path_in(dir);
 
-    // 既存ファイルのパーミッションを引き継ぐ。新規なら 600
-    // (接続パスワードを含み得るため他ユーザーに読ませない)
+    // config は接続パスワードや SSH 鍵パスフレーズを平文で含み得るため、
+    // 常に所有者のみ (600) で書く。既存が 644/640 等でも 600 へ絞り、
+    // ensure_config_file_in / AppConfig::load の是正方針と揃える (既存権限を
+    // 引き継ぐと macOS の共有 staff グループ経由で他ユーザーへ漏れ得る)。
     #[cfg(unix)]
-    let mode = {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(&path)
-            .map(|m| m.permissions().mode() & 0o777)
-            .unwrap_or(0o600)
-    };
+    let mode = 0o600;
 
     let temp = path.with_extension("yml.tmp");
     // 作成時からパーミッションを指定する。書いてから set_permissions すると、
@@ -1320,8 +1394,75 @@ sql_servers:
         assert!(created.is_some());
         assert!(dir.join("config.yml").exists());
 
+        // 新規作成は 600 (umask 依存の 644 で作らない)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("config.yml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
         // 既に存在すれば None (上書きしない)
         assert!(ensure_config_file_in(&dir).unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 既存の config.yml が緩い権限 (644) で置かれていたら、起動時の
+    /// ensure_config_file_in が 600 へ是正する (中身は変えない)。
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_config_file_in_tightens_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "queryfolio-ensure-perm-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 他ユーザーから読める 644 で手動作成された既存ファイルを模す
+        let path = dir.join("config.yml");
+        std::fs::write(&path, "sql_servers: []\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // 既存なので None を返しつつ、権限は 600 へ是正される
+        assert!(ensure_config_file_in(&dir).unwrap().is_none());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // 中身は書き換えない
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "sql_servers: []\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// config.yml がディレクトリの場合、tighten はパーミッションを変えない
+    /// (600 にすると検索ビットが落ちてアクセス不能になるため触らない)。
+    #[cfg(unix)]
+    #[test]
+    fn test_tighten_config_permissions_skips_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "queryfolio-tighten-dir-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        // config.yml という名前のディレクトリ (異常状態) を作る
+        let as_dir = dir.join("config.yml");
+        std::fs::create_dir_all(&as_dir).unwrap();
+        std::fs::set_permissions(&as_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        tighten_config_permissions(&as_dir).unwrap();
+
+        // ディレクトリの権限は変えない (600 にしない)
+        let mode = std::fs::metadata(&as_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1372,7 +1513,7 @@ sql_servers:
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 保存時に既存ファイルのパーミッションを引き継ぐ (新規は 600)。
+    /// 保存時は常に 600 で書く (新規も、緩い既存権限の是正も)。
     #[cfg(unix)]
     #[test]
     fn test_write_config_file_in_permissions() {
@@ -1390,11 +1531,11 @@ sql_servers:
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
 
-        // 既存のパーミッションは維持する
+        // 既存が緩い権限 (640) でも、保存時に 600 へ絞る
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
         write_config_file_in(&dir, "sql_servers: []\n# edited\n").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o640);
+        assert_eq!(mode, 0o600);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
