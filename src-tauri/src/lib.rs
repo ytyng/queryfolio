@@ -4,6 +4,7 @@ mod db;
 mod history;
 mod meta_commands;
 mod error;
+mod folder_meta;
 mod query_files;
 mod schema_info;
 mod tunnel;
@@ -84,6 +85,17 @@ impl AppState {
     /// (接続 name はフォルダ名には使わない)。
     async fn resolve_sqlfiles_folder(&self, connection: &str) -> Result<String, AppError> {
         Ok(self.find_server(connection).await?.sqlfiles_folder_name())
+    }
+
+    /// 接続のクエリファイルフォルダに、接続を説明するメタファイルを書き出す。
+    /// フォルダが未作成なら何もしない (メタだけのために空フォルダを作らない)。
+    /// クエリファイルの作成・保存・一覧時のリフレッシュに使う。
+    async fn refresh_folder_meta(&self, server: &ServerConfig) -> Result<(), AppError> {
+        let dir = query_files::connection_dir(
+            &self.resolve_sqlfiles_dir().await?,
+            &server.sqlfiles_folder_name(),
+        )?;
+        folder_meta::write_folder_meta(&dir, server)
     }
 
     /// スキーマキャッシュのキーになるアクティブスキーマ名を返す
@@ -412,8 +424,15 @@ async fn list_query_files(
     state: tauri::State<'_, AppState>,
     connection: String,
 ) -> Result<Vec<String>, AppError> {
-    let folder = state.resolve_sqlfiles_folder(&connection).await?;
-    query_files::list_query_files(&state.resolve_sqlfiles_dir().await?, &folder)
+    let server = state.find_server(&connection).await?;
+    let files = query_files::list_query_files(
+        &state.resolve_sqlfiles_dir().await?,
+        &server.sqlfiles_folder_name(),
+    )?;
+    // フォルダを開いた時に接続の説明メタファイルを最新化する (ベストエフォート:
+    // メタ書き込みの失敗で一覧取得を壊さない)。フォルダ未作成時は何もしない。
+    let _ = state.refresh_folder_meta(&server).await;
+    Ok(files)
 }
 
 /// 接続のクエリファイルをファイル名・中身で検索する (大文字小文字を区別しない部分一致)。
@@ -452,13 +471,17 @@ async fn write_query_file(
     file_name: String,
     content: String,
 ) -> Result<(), AppError> {
-    let folder = state.resolve_sqlfiles_folder(&connection).await?;
+    let server = state.find_server(&connection).await?;
     query_files::write_query_file(
         &state.resolve_sqlfiles_dir().await?,
-        &folder,
+        &server.sqlfiles_folder_name(),
         &file_name,
         &content,
-    )
+    )?;
+    // 保存でフォルダが確実に存在するタイミングで説明メタファイルを最新化する
+    // (ベストエフォート: メタ書き込みの失敗で保存を壊さない)。
+    let _ = state.refresh_folder_meta(&server).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -467,12 +490,16 @@ async fn create_query_file(
     connection: String,
     file_name: String,
 ) -> Result<String, AppError> {
-    let folder = state.resolve_sqlfiles_folder(&connection).await?;
-    query_files::create_query_file(
+    let server = state.find_server(&connection).await?;
+    let normalized = query_files::create_query_file(
         &state.resolve_sqlfiles_dir().await?,
-        &folder,
+        &server.sqlfiles_folder_name(),
         &file_name,
-    )
+    )?;
+    // フォルダ新規作成のタイミングで接続の説明メタファイルを書き出す
+    // (ベストエフォート: メタ書き込みの失敗で作成を壊さない)。
+    let _ = state.refresh_folder_meta(&server).await;
+    Ok(normalized)
 }
 
 #[tauri::command]

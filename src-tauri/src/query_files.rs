@@ -35,7 +35,10 @@ fn normalize_file_name(name: &str) -> Result<String, AppError> {
 }
 
 /// 接続名に対応するクエリファイル保存ディレクトリを返す。
-fn connection_dir(sqlfiles_dir: &Path, connection: &str) -> Result<PathBuf, AppError> {
+pub(crate) fn connection_dir(
+    sqlfiles_dir: &Path,
+    connection: &str,
+) -> Result<PathBuf, AppError> {
     let connection = validate_component(connection)?;
     Ok(sqlfiles_dir.join(connection))
 }
