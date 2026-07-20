@@ -170,14 +170,21 @@ fn ensure_config_file_in(dir: &std::path::Path) -> Result<Option<String>, AppErr
 #[cfg(unix)]
 fn tighten_config_permissions(path: &std::path::Path) -> Result<(), AppError> {
     use std::os::unix::fs::PermissionsExt;
-    let mode = match std::fs::metadata(path) {
-        Ok(meta) => meta.permissions().mode() & 0o777,
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
         // 無ければ何もしない (別拡張子や、判定と stat の間に消えた場合)。
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         // それ以外の I/O エラーは握り潰さず伝播する。黙って return すると
         // 是正できていないのに成功したように見えてしまうため。
         Err(e) => return Err(e.into()),
     };
+    // 通常ファイルにのみ適用する。config.yml がディレクトリ (やその symlink)
+    // だと 600 にした瞬間に owner の検索ビット (x) が落ちてアクセス不能になり、
+    // その後の設定読み込みが失敗する。ファイル以外は触らない。
+    if !meta.is_file() {
+        return Ok(());
+    }
+    let mode = meta.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
@@ -1430,6 +1437,32 @@ sql_servers:
         assert_eq!(mode, 0o600);
         // 中身は書き換えない
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "sql_servers: []\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// config.yml がディレクトリの場合、tighten はパーミッションを変えない
+    /// (600 にすると検索ビットが落ちてアクセス不能になるため触らない)。
+    #[cfg(unix)]
+    #[test]
+    fn test_tighten_config_permissions_skips_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "queryfolio-tighten-dir-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        // config.yml という名前のディレクトリ (異常状態) を作る
+        let as_dir = dir.join("config.yml");
+        std::fs::create_dir_all(&as_dir).unwrap();
+        std::fs::set_permissions(&as_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        tighten_config_permissions(&as_dir).unwrap();
+
+        // ディレクトリの権限は変えない (600 にしない)
+        let mode = std::fs::metadata(&as_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
