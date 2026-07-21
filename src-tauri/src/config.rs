@@ -715,7 +715,7 @@ pub fn sql_servers_source_is_command() -> bool {
 }
 
 /// sql_servers のソース宣言 `command:` を実行して、取得した生の YAML を返す。
-/// 読み取り専用ビュー用。command 以外のソースではエラーにする。
+/// コピー用ビュー用 (表示先では編集できるが保存はしない)。command 以外のソースではエラーにする。
 pub async fn fetch_sql_servers_source_yaml() -> Result<String, AppError> {
     let config = AppConfig::load()?;
     match config.servers_source()? {

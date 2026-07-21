@@ -242,6 +242,6 @@ export const writeConfigFile = (content: string) =>
   invoke<string>("write_config_file", { content });
 
 /// sql_servers のソース宣言 command を実行して取得した生の YAML を返す
-/// (読み取り専用ビュー用)。
+/// (コピー用ビュー用。表示先では編集できるが保存はしない)。
 export const readSqlServersSourceYaml = () =>
   invoke<string>("read_sql_servers_source_yaml");

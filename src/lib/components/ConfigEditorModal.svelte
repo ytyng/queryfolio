@@ -14,6 +14,8 @@
   import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
   import { tags as t } from "@lezer/highlight";
   import { yaml } from "@codemirror/lang-yaml";
+  import { linter, lintGutter, type Diagnostic } from "@codemirror/lint";
+  import { parseDocument } from "yaml";
   import { oneDark } from "@codemirror/theme-one-dark";
   import {
     readConfigFile,
@@ -24,7 +26,8 @@
 
   interface Props {
     /// "config" = config.yml を編集・保存する。
-    /// "source" = sql_servers のソース宣言 command が返す YAML を読み取り専用で表示する。
+    /// "source" = sql_servers のソース宣言 command が返す YAML を表示する。
+    ///            編集はできるがメモリ上だけで、保存はできない (コピーして使う想定)。
     mode: "config" | "source";
     onClose: () => void;
     /// 未保存の変更の有無を親に知らせる (別のモードへ切り替える時の巻き添え破棄を防ぐ)
@@ -33,9 +36,10 @@
 
   let { mode, onClose, onDirtyChange }: Props = $props();
 
-  const readOnly = $derived(mode === "source");
+  /// source モードは取得元が外部コマンドなので書き戻せない。編集自体は許可する。
+  const canSave = $derived(mode === "config");
   const title = $derived(
-    mode === "config" ? "Edit config.yml" : "sql_servers config yaml (Read only)",
+    mode === "config" ? "Edit config.yml" : "sql_servers config yaml (Copy only)",
   );
 
   let editorElement = $state<HTMLDivElement | null>(null);
@@ -68,6 +72,40 @@
     { tag: [t.typeName, t.className], color: "#ffeab0" },
   ]);
 
+  /// YAML のパースエラー・警告をエディタ上に表示する。
+  /// 保存できない source モードでも崩れに気付けるよう、両モードで有効にする。
+  /// パースは常に doc 全体をやり直すが、対象は設定ファイル規模なので十分速い。
+  const yamlLinter = linter((view): Diagnostic[] => {
+    const docLength = view.state.doc.length;
+    /// yaml が返す位置は基本 doc 内だが、範囲外でも CodeMirror が例外を投げないよう丸める
+    const toDiagnostic = (
+      err: { pos?: [number, number]; message: string },
+      severity: "error" | "warning",
+    ): Diagnostic => {
+      const [rawFrom, rawTo] = err.pos ?? [0, 0];
+      const from = Math.max(0, Math.min(rawFrom, docLength));
+      const to = Math.max(from, Math.min(rawTo, docLength));
+      return { from, to, severity, message: err.message };
+    };
+    try {
+      const parsed = parseDocument(view.state.doc.toString(), { prettyErrors: false });
+      return [
+        ...parsed.errors.map((e) => toDiagnostic(e, "error")),
+        ...parsed.warnings.map((w) => toDiagnostic(w, "warning")),
+      ];
+    } catch (e) {
+      // parseDocument は基本 errors に積むが、想定外の例外でも lint を落とさない
+      return [
+        {
+          from: 0,
+          to: Math.min(1, docLength),
+          severity: "error",
+          message: String(e),
+        },
+      ];
+    }
+  });
+
   const createEditor = (doc: string) => {
     if (!editorElement) {
       return;
@@ -82,11 +120,11 @@
           history(),
           keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
           yaml(),
+          yamlLinter,
+          lintGutter(),
           oneDark,
           syntaxHighlighting(brightHighlightStyle),
           editorTheme,
-          EditorState.readOnly.of(readOnly),
-          EditorView.editable.of(!readOnly),
           EditorView.updateListener.of((update) => {
             if (update.docChanged) {
               dirty = true;
@@ -179,7 +217,7 @@
       return;
     }
     // Cmd+S / Ctrl+S で保存
-    if (!readOnly && (e.metaKey || e.ctrlKey) && e.key === "s") {
+    if (canSave && (e.metaKey || e.ctrlKey) && e.key === "s") {
       e.preventDefault();
       void save();
     }
@@ -205,10 +243,11 @@
       {title}
     </h2>
 
-    {#if readOnly}
+    {#if !canSave}
       <p class="text-xs text-zinc-400">
-        This YAML comes from the sql_servers command source declaration and cannot be saved
-        here. Copy it and edit it where it is stored.
+        This YAML comes from the sql_servers command source declaration. You can edit it
+        here, but the changes stay in memory and are never saved. Copy the result and store
+        it where it is managed.
       </p>
     {/if}
 
@@ -235,7 +274,9 @@
 
     {#if confirmDiscard}
       <div class="flex items-center justify-end gap-2">
-        <span class="mr-auto text-xs text-amber-400">Discard unsaved changes?</span>
+        <span class="mr-auto text-xs text-amber-400">
+          {canSave ? "Discard unsaved changes?" : "Discard your edits? They are never saved."}
+        </span>
         <button
           class="rounded border border-zinc-600 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-800"
           data-annotate="button-config-editor-keep-editing"
@@ -254,7 +295,9 @@
     {:else}
       <div class="flex items-center justify-end gap-2">
         {#if dirty}
-          <span class="mr-auto text-xs text-zinc-500">Unsaved changes</span>
+          <span class="mr-auto text-xs text-zinc-500">
+            {canSave ? "Unsaved changes" : "Edited (in memory only)"}
+          </span>
         {/if}
         <button
           class="rounded border border-zinc-600 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-800"
@@ -270,7 +313,7 @@
         >
           Close
         </button>
-        {#if !readOnly}
+        {#if canSave}
           <button
             class="rounded bg-blue-600 px-3 py-1 text-xs text-white hover:bg-blue-500 disabled:opacity-50"
             data-annotate="button-config-editor-save"
