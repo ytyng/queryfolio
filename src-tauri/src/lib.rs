@@ -882,6 +882,22 @@ async fn read_override_config_yaml() -> Result<String, AppError> {
     config::fetch_override_config_yaml().await
 }
 
+/// 結果テーブルの Export で、ネイティブ保存ダイアログ (フロントの
+/// plugin-dialog save) でユーザーが選んだパスへテキストを書き出す。
+/// パスは実行時にダイアログでユーザーが選んだものが渡ってくる。
+///
+/// バックエンドではパスを検証しない (任意パスへ書ける) 点に注意。これは
+/// このアプリの信頼モデルに沿う: フロントエンドは自前の同梱コードのみで
+/// リモートコンテンツを読み込まず、`run_query` で任意 SQL 実行・
+/// `write_config_file` で設定書き込みが既に可能なため、フロントが侵害された
+/// 場合の被害範囲は元々広い。ここで新たにファイル書き込みが増えることの
+/// 追加リスクは限定的と判断している。
+#[tauri::command]
+async fn write_export_file(path: String, contents: String) -> Result<(), AppError> {
+    std::fs::write(&path, contents)?;
+    Ok(())
+}
+
 /// アプリのメニューバーを組み立てる。
 ///
 /// macOS のアプリメニュー (QueryFolio) は NSApplication がメインメニュー設置時の
@@ -1047,6 +1063,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        // 結果テーブルの Export でネイティブ保存ダイアログを開くのに使う
+        .plugin(tauri_plugin_dialog::init())
         // 終了時のウインドウサイズ・位置を保存し、起動時に復元する
         .plugin(tauri_plugin_window_state::Builder::default().build())
         // setup で set_menu すると、それより前に設置される tauri のデフォルト
@@ -1111,6 +1129,7 @@ pub fn run() {
             read_config_file,
             write_config_file,
             read_override_config_yaml,
+            write_export_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

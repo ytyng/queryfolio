@@ -245,3 +245,8 @@ export const writeConfigFile = (content: string) =>
 /// (コピー用ビュー用。表示先では編集できるが保存はしない)。
 export const readOverrideConfigYaml = () =>
   invoke<string>("read_override_config_yaml");
+
+/// 結果テーブルの Export で、ネイティブ保存ダイアログで選んだパスへ
+/// テキスト (CSV/TSV/JSON) を書き出す。パスはユーザーが明示的に選択したもの。
+export const writeExportFile = (path: string, contents: string) =>
+  invoke<void>("write_export_file", { path, contents });

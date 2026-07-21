@@ -58,7 +58,8 @@ macOS 版のリリースは `.github/workflows/build-macos.yml` (workflow_dispat
 - メニューバー — macOS のアプリメニュー (QueryFolio) は NSApplication がメインメニュー設置時の内容で確定するため、tauri のデフォルトメニューに後から insert しても反映されない。そのため `Menu::default` を使わず `build_menu` でアプリメニューを含めて丸ごと組み、`Builder::menu` で最初の設置時から渡す。設定リロード時 (reset_connections) は `rebuild_menu` で組み直し、コピー用ビュー (保存不可) の項目を出し入れする
 - Writable スイッチ — ツールバーの `data-annotate="toggle-writable"` トグル。OFF (既定、セッションごとに OFF から始め永続化しない) の間は SELECT/SHOW 等の副作用の無い文しか実行できない。app.svelte.ts の `writable` state が run_query に `writable` として渡り、バックエンド (lib.rs) が readonly ガードの由来を `db.rs` の `ReadonlyGuard` (Off / Config / Switch) で決めて強制する。実効 readonly = `config readonly || !writable`。config で `readonly: true` の接続はスイッチより優先 (ロック表示 = `writable-locked`) で解除できない。ブロック時のメッセージは由来で出し分ける (Config / Switch)
 - ペインのサイズ変更 — `+page.svelte` が接続一覧幅 / サイドバー幅 / エディタ縦割合を `$state` で管理し、`PaneDivider` (Pointer Events + setPointerCapture) のドラッグで変更する。ドラッグ終了時に localStorage (`queryfolio.layout.*`) へ保存し起動時に復元。各ペインコンポーネントの root は `w-full` で、幅は `+page.svelte` のラッパー div が inline style で与える
-- `lib/export.ts` — CSV/TSV/JSON 変換 (formula injection 対策込み)
+- `lib/export.ts` — CSV/TSV/JSON 変換 (formula injection 対策込み)。テーブル全体用 (`toCsv` / `toTsv` / `toJson`) と選択範囲用 (`toCsvRange` / `toTsvRange` / `toJsonRange`、Cmd+C コピー用) の両系統がある
+- 結果ツールバーの出力 UI (ResultsPane) — フォーマット選択プルダウン (TSV / CSV / JSON、既定 TSV、localStorage `queryfolio.results.copyFormat` に永続化) + `Copy` ボタン (テーブル全体をクリップボードへ) + `Export` ボタン (ネイティブ保存ダイアログ `@tauri-apps/plugin-dialog` の `save` で選んだパスへ Rust の `write_export_file` コマンドで書き出す)。Cmd+C の選択範囲コピーも同じ選択フォーマットに従う。`Copy with headers` チェックボックスは Cmd+C 選択コピーのヘッダ有無 (CSV/TSV のみ) に効く
 - `lib/sqlFormat.ts` — SQL 整形器 (自前トークナイザ。SELECT / UNION 系のみ整形し、INSERT / UPDATE / WITH 等やパース不能な文は原文維持。整形結果を再トークナイズして入力とトークン列が一致しなければ原文に戻す安全ネット付き)
 
 ## 設定 (config.yml)

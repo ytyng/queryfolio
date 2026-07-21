@@ -1,10 +1,19 @@
 <script lang="ts">
   import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+  import { save } from "@tauri-apps/plugin-dialog";
   import { toast } from "svelte-sonner";
   import * as api from "$lib/api";
   import appStore, { isExplainSql } from "$lib/stores/app.svelte";
   import type { ResultTab } from "$lib/stores/app.svelte";
-  import { toCsv, toCsvRange, toJson, toTsv, type CellRange } from "$lib/export";
+  import {
+    toCsv,
+    toCsvRange,
+    toJson,
+    toJsonRange,
+    toTsv,
+    toTsvRange,
+    type CellRange,
+  } from "$lib/export";
   import {
     singleTableSelectTable,
     buildUpdateStatements,
@@ -16,7 +25,34 @@
   import CellInspector from "./CellInspector.svelte";
   import AiAnalysisModal from "./AiAnalysisModal.svelte";
 
-  let copiedFormat = $state<string | null>(null);
+  // Copy / Export / Cmd+C コピーで共有する出力フォーマット。
+  type CopyFormat = "csv" | "tsv" | "json";
+  const COPY_FORMAT_KEY = "queryfolio.results.copyFormat";
+  const isCopyFormat = (v: string): v is CopyFormat =>
+    v === "csv" || v === "tsv" || v === "json";
+  function loadCopyFormat(): CopyFormat {
+    try {
+      const v = localStorage.getItem(COPY_FORMAT_KEY);
+      if (v && isCopyFormat(v)) {
+        return v;
+      }
+    } catch {
+      // localStorage が使えなくても既定値で継続する
+    }
+    return "tsv";
+  }
+  let copyFormat = $state<CopyFormat>(loadCopyFormat());
+  $effect(() => {
+    try {
+      localStorage.setItem(COPY_FORMAT_KEY, copyFormat);
+    } catch {
+      // localStorage が使えなくても動作は継続する
+    }
+  });
+
+  // Copy / Export ボタンの一時的なフィードバック表示
+  let copiedWhole = $state(false);
+  let exported = $state(false);
 
   const activeTab = $derived(appStore.activeResultTab);
 
@@ -220,7 +256,12 @@
     if (!range || !result) {
       return;
     }
-    const text = toCsvRange(result, range, copyWithHeaders);
+    const text =
+      copyFormat === "csv"
+        ? toCsvRange(result, range, copyWithHeaders)
+        : copyFormat === "tsv"
+          ? toTsvRange(result, range, copyWithHeaders)
+          : toJsonRange(result, range, copyWithHeaders);
     await writeText(text);
     selectionCopied = true;
     setTimeout(() => {
@@ -382,24 +423,69 @@
     return "";
   };
 
-  const copyAs = async (format: "csv" | "tsv" | "json") => {
+  // 結果テーブル全体を選択中フォーマットで文字列化する (Copy / Export 共通)。
+  const serializeResult = (format: CopyFormat): string | null => {
     const result = activeTab?.result;
     if (!result) {
+      return null;
+    }
+    return format === "csv"
+      ? toCsv(result)
+      : format === "tsv"
+        ? toTsv(result)
+        : toJson(result);
+  };
+
+  // Copy ボタン: 結果テーブル全体を選択中フォーマットでクリップボードへ。
+  const copyResult = async () => {
+    const text = serializeResult(copyFormat);
+    if (text === null) {
       return;
     }
-    const text =
-      format === "csv"
-        ? toCsv(result)
-        : format === "tsv"
-          ? toTsv(result)
-          : toJson(result);
     // navigator.clipboard は Tauri 2 で OS のパーミッションプロンプトが
     // 出ることがあるため、公式プラグイン経由で書き込む
     await writeText(text);
-    copiedFormat = format;
+    copiedWhole = true;
     setTimeout(() => {
-      copiedFormat = null;
+      copiedWhole = false;
     }, 1500);
+  };
+
+  // Export ボタン: 結果テーブル全体を選択中フォーマットでファイルへ保存する。
+  // ネイティブ保存ダイアログで選ばせたパスへ Rust 側で書き込む。
+  const exportResult = async () => {
+    if (!activeTab?.result) {
+      return;
+    }
+    const ext = copyFormat;
+    let path: string | null;
+    try {
+      path = await save({
+        defaultPath: `result.${ext}`,
+        filters: [{ name: ext.toUpperCase(), extensions: [ext] }],
+      });
+    } catch (e) {
+      toast.error(`Export failed: ${e}`);
+      return;
+    }
+    if (!path) {
+      // ユーザーがダイアログをキャンセルした
+      return;
+    }
+    // シリアライズはパス確定後に行う (キャンセル時の無駄な処理を避ける)
+    const text = serializeResult(copyFormat);
+    if (text === null) {
+      return;
+    }
+    try {
+      await api.writeExportFile(path, text);
+      exported = true;
+      setTimeout(() => {
+        exported = false;
+      }, 1500);
+    } catch (e) {
+      toast.error(`Export failed: ${e}`);
+    }
   };
 
   const cellText = (value: unknown): string => {
@@ -937,15 +1023,33 @@
             />
             Copy with headers
           </label>
-          {#each ["csv", "tsv", "json"] as const as format (format)}
-            <button
-              class="rounded border border-zinc-700 px-1.5 py-0.5 uppercase hover:bg-zinc-700 hover:text-zinc-200"
-              data-annotate="button-copy-{format}"
-              onclick={() => copyAs(format)}
-            >
-              {copiedFormat === format ? "copied!" : format}
-            </button>
-          {/each}
+          <!-- 出力フォーマット。Copy / Export / Cmd+C コピーで共通に使う -->
+          <select
+            class="cursor-pointer rounded border border-zinc-700 bg-zinc-800 px-1 py-0.5 uppercase hover:bg-zinc-700 hover:text-zinc-200"
+            title="Output format for Copy / Export and Cmd+C (Ctrl+C)"
+            data-annotate="select-copy-format"
+            bind:value={copyFormat}
+          >
+            {#each ["tsv", "csv", "json"] as const as format (format)}
+              <option value={format}>{format.toUpperCase()}</option>
+            {/each}
+          </select>
+          <button
+            class="rounded border border-zinc-700 px-1.5 py-0.5 hover:bg-zinc-700 hover:text-zinc-200"
+            title="Copy the whole result to the clipboard in the selected format"
+            data-annotate="button-copy-result"
+            onclick={copyResult}
+          >
+            {copiedWhole ? "Copied!" : "Copy"}
+          </button>
+          <button
+            class="rounded border border-zinc-700 px-1.5 py-0.5 hover:bg-zinc-700 hover:text-zinc-200"
+            title="Export the whole result to a file in the selected format"
+            data-annotate="button-export-result"
+            onclick={exportResult}
+          >
+            {exported ? "Exported!" : "Export"}
+          </button>
         {/if}
       </span>
     </div>
@@ -1090,24 +1194,32 @@
       {:else if activeTab?.result && activeTab.result.columns.length > 0}
         {@const result = activeTab.result}
         <table class="min-w-full border-collapse font-mono text-xs select-none">
-          <thead class="sticky top-0 bg-zinc-800">
+          <!-- WKWebView は border-collapse テーブルの thead / tr に付けた
+               背景・sticky を描画しないため (下の行が透けて見える)、各 th に
+               直接 sticky と不透明背景を付ける。選択時の色味は不透明な th の
+               上に重なるよう内側の button 側に載せる -->
+          <thead>
             <tr>
               <th
-                class="border-b border-r border-zinc-700 px-2 py-1 text-right font-normal text-zinc-500"
+                class="sticky top-0 z-10 border-b border-r border-zinc-700 bg-zinc-800 px-2 py-1 text-right font-normal text-zinc-500"
               >
                 #
               </th>
               {#each result.columns as column, colIndex (colIndex)}
                 <!-- ヘッダクリックでその列を選択。ドラッグで複数列に拡張 -->
                 <th
-                  class="border-b border-r border-zinc-700 p-0 text-left font-semibold {isColHeaderSelected(
+                  class="sticky top-0 z-10 border-b border-r border-zinc-700 bg-zinc-800 p-0 text-left font-semibold {isColHeaderSelected(
                     colIndex,
                   )
-                    ? 'bg-sky-800/50 text-zinc-100'
+                    ? 'text-zinc-100'
                     : 'text-zinc-300'}"
                 >
                   <button
-                    class="block w-full cursor-pointer px-2 py-1 text-left"
+                    class="block w-full cursor-pointer px-2 py-1 text-left {isColHeaderSelected(
+                      colIndex,
+                    )
+                      ? 'bg-sky-800/50'
+                      : ''}"
                     title="Click to select this column (drag to select more)"
                     data-annotate="button-result-col-header-{colIndex}"
                     onpointerdown={(e) => beginSelect("col", 0, colIndex, e)}

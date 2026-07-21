@@ -85,9 +85,42 @@ export const toCsvRange = (
   return lines.join("\n");
 };
 
+const sanitizeTsv = (field: string) =>
+  field.replace(/\t/g, " ").replace(/\r?\n/g, " ");
+
+// 選択範囲だけを TSV 化する (Cmd+C コピー用)。withHeaders でヘッダ行を含める。
+// 範囲は呼び出し側で結果サイズにクランプ済みである前提。
+export const toTsvRange = (
+  result: QueryResult,
+  range: CellRange,
+  withHeaders: boolean,
+): string => {
+  const { rowStart, rowEnd, colStart, colEnd } = range;
+  const lines: string[] = [];
+  if (withHeaders) {
+    const header: string[] = [];
+    for (let c = colStart; c <= colEnd; c++) {
+      header.push(sanitizeTsv(escapeHeaderFormula(result.columns[c])));
+    }
+    lines.push(header.join("\t"));
+  }
+  for (let r = rowStart; r <= rowEnd; r++) {
+    const row = result.rows[r];
+    if (!row) {
+      continue;
+    }
+    const fields: string[] = [];
+    for (let c = colStart; c <= colEnd; c++) {
+      const v = row[c];
+      fields.push(sanitizeTsv(escapeFormulaInjection(v, cellToString(v))));
+    }
+    lines.push(fields.join("\t"));
+  }
+  return lines.join("\n");
+};
+
 export const toTsv = (result: QueryResult): string => {
-  const sanitize = (field: string) =>
-    field.replace(/\t/g, " ").replace(/\r?\n/g, " ");
+  const sanitize = sanitizeTsv;
   const lines = [
     result.columns.map((c) => sanitize(escapeHeaderFormula(c))).join("\t"),
   ];
@@ -117,5 +150,29 @@ export const toJson = (result: QueryResult): string => {
   const records = result.rows.map((row) =>
     Object.fromEntries(keys.map((key, i) => [key, row[i]])),
   );
+  return JSON.stringify(records, null, 2);
+};
+
+// 選択範囲だけを JSON 化する (Cmd+C コピー用)。選択列だけをキーにしたオブジェクト配列。
+// withHeaders は JSON では常にキーを持つため無視する (呼び出し側の分岐を単純化するための引数)。
+// 範囲は呼び出し側で結果サイズにクランプ済みである前提。
+export const toJsonRange = (
+  result: QueryResult,
+  range: CellRange,
+  _withHeaders: boolean,
+): string => {
+  const { rowStart, rowEnd, colStart, colEnd } = range;
+  const cols = result.columns.slice(colStart, colEnd + 1);
+  const keys = uniqueColumnKeys(cols);
+  const records: Record<string, unknown>[] = [];
+  for (let r = rowStart; r <= rowEnd; r++) {
+    const row = result.rows[r];
+    if (!row) {
+      continue;
+    }
+    records.push(
+      Object.fromEntries(keys.map((key, i) => [key, row[colStart + i]])),
+    );
+  }
   return JSON.stringify(records, null, 2);
 };
