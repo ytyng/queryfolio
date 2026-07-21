@@ -1,4 +1,5 @@
 import { toast } from "svelte-sonner";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import * as api from "$lib/api";
 import type { AiInfo, ConnectionInfo, QueryResult } from "$lib/api";
 
@@ -583,6 +584,24 @@ const renameFile = async (
   } catch (e) {
     errorMessage = toErrorMessage(e);
     return null;
+  }
+};
+
+// クエリファイルの絶対パスをクリップボードへコピーする。成功したら true。
+// 失敗時は errorMessage を設定して false を返す。
+const copyFilePath = async (fileName: string): Promise<boolean> => {
+  const connection = selectedConnection;
+  if (!connection) {
+    return false;
+  }
+  try {
+    const path = await api.queryFilePath(connection, fileName);
+    await writeText(path);
+    errorMessage = null;
+    return true;
+  } catch (e) {
+    errorMessage = toErrorMessage(e);
+    return false;
   }
 };
 
@@ -1360,6 +1379,7 @@ export default {
   createFile,
   deleteFile,
   renameFile,
+  copyFilePath,
   saveCurrentFile,
   updateEditorContent,
   insertSqlSnippet,

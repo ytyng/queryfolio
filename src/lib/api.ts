@@ -143,6 +143,10 @@ export const searchQueryFiles = (connection: string, query: string) =>
 export const readQueryFile = (connection: string, fileName: string) =>
   invoke<string>("read_query_file", { connection, fileName });
 
+/// クエリファイルの絶対パスを返す (FilesPane の「Copy full path」用)。
+export const queryFilePath = (connection: string, fileName: string) =>
+  invoke<string>("query_file_path", { connection, fileName });
+
 export const writeQueryFile = (
   connection: string,
   fileName: string,

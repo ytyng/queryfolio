@@ -129,6 +129,18 @@
     closeMenu();
     await appStore.deleteFile(fileName);
   };
+
+  const doCopyFullPath = async (fileName: string) => {
+    closeMenu();
+    const ok = await appStore.copyFilePath(fileName);
+    if (ok) {
+      toast.success("Copied the file path to the clipboard");
+    } else {
+      toast.error("Failed to copy the file path", {
+        description: appStore.errorMessage ?? undefined,
+      });
+    }
+  };
 </script>
 
 <div class="flex h-full w-full flex-col border-r border-zinc-700 bg-zinc-900">
@@ -301,6 +313,15 @@
                 >
                   <i class="bi bi-pencil" aria-hidden="true"></i>
                   Rename
+                </button>
+                <button
+                  class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-zinc-200 hover:bg-zinc-700"
+                  role="menuitem"
+                  data-annotate="menu-copy-fullpath-{fileName}"
+                  onclick={() => void doCopyFullPath(fileName)}
+                >
+                  <i class="bi bi-clipboard" aria-hidden="true"></i>
+                  Copy full path
                 </button>
                 <button
                   class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-red-400 hover:bg-zinc-700"

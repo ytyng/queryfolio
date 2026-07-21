@@ -461,6 +461,21 @@ async fn read_query_file(
     )
 }
 
+/// クエリファイルの絶対パスを返す (FilesPane の「Copy full path」用)。
+#[tauri::command]
+async fn query_file_path(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    file_name: String,
+) -> Result<String, AppError> {
+    let folder = state.resolve_sqlfiles_folder(&connection).await?;
+    query_files::query_file_path(
+        &state.resolve_sqlfiles_dir().await?,
+        &folder,
+        &file_name,
+    )
+}
+
 #[tauri::command]
 async fn write_query_file(
     state: tauri::State<'_, AppState>,
@@ -1087,6 +1102,7 @@ pub fn run() {
             list_query_files,
             search_query_files,
             read_query_file,
+            query_file_path,
             write_query_file,
             create_query_file,
             delete_query_file,
