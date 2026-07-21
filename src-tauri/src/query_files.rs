@@ -153,6 +153,23 @@ pub fn search_query_files(
     Ok(hits)
 }
 
+/// クエリファイルの絶対パスを文字列で返す (「Copy full path」用)。
+/// パストラバーサル対策のため名前を検証・正規化してから組み立てる。
+/// 一覧に出ているファイルからのみ呼ばれるため存在チェックはしない。
+/// sqlfiles_dir が相対パスで設定されている場合、組み立てた path も相対になる。
+/// 「Copy full path」の名の通り常に絶対パスを返すため、相対のときは
+/// カレントディレクトリ基準で絶対化する (std::path::absolute は存在チェック
+/// もシンボリックリンク解決も伴わない字句的な絶対化)。
+pub fn query_file_path(
+    sqlfiles_dir: &Path,
+    connection: &str,
+    file_name: &str,
+) -> Result<String, AppError> {
+    let path = file_path(sqlfiles_dir, connection, file_name)?;
+    let path = std::path::absolute(&path)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 pub fn read_query_file(
     sqlfiles_dir: &Path,
     connection: &str,
@@ -327,6 +344,29 @@ mod tests {
 
         // 後始末
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_query_file_path() {
+        let dir = test_dir().join("fullpath");
+        let connection = "test-conn";
+
+        // .sql 補完・接続フォルダ・ディレクトリが連結された絶対パスが返る
+        let path = query_file_path(&dir, connection, "report").unwrap();
+        let expected = dir
+            .join(connection)
+            .join("report.sql")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(path, expected);
+
+        // 既に .sql 付きの名前は二重付与しない
+        let path = query_file_path(&dir, connection, "report.sql").unwrap();
+        assert_eq!(path, expected);
+
+        // パストラバーサルは拒否
+        assert!(query_file_path(&dir, connection, "../evil").is_err());
+        assert!(query_file_path(&dir, connection, "a/b").is_err());
     }
 
     #[test]
