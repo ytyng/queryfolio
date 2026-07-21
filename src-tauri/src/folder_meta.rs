@@ -6,8 +6,9 @@
 //! 情報を Markdown で書き出す。
 //!
 //! 機密 (パスワード・SSH 鍵・パスフレーズ) は絶対に含めない。含めるのは
-//! ConnectionInfo でフロントに既に渡している範囲の情報 (name / engine /
-//! host / port / schema / user / readonly / group / SSH トンネルの有無) に留める。
+//! ConnectionInfo でフロントに既に渡している範囲の情報 (name / description /
+//! engine / host / port / schema / user / readonly / group / SSH トンネルの
+//! 有無) に留める。
 
 use std::fs;
 use std::path::Path;
