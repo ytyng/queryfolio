@@ -17,8 +17,8 @@ const AI_REQUEST_TIMEOUT_SECS: u64 = 60;
 /// エラーメッセージに含める API レスポンス本文の最大長。
 const ERROR_BODY_MAX_CHARS: usize = 500;
 
-/// config.yml のトップレベル、またはソース宣言で取得した接続 YAML の
-/// トップレベルに書ける `ai:` セクション。
+/// config.yml のトップレベル (config_override_command で取得した YAML を
+/// マージした後の値) に書ける `ai:` セクション。
 /// api_key を含むためフロントエンドには渡さない (フロントには
 /// get_ai_info で AiInfo のみを返す)。
 #[derive(Debug, Clone, Deserialize)]
@@ -72,15 +72,11 @@ impl AiConfig {
     }
 }
 
-/// ローカル config.yml と接続 YAML (ソース宣言で取得) それぞれの
-/// トップレベル `ai:` セクションから AI 設定を解決する。
-/// 両方ある場合は接続 YAML 側を優先する (API キーを 1Password 等の
-/// 接続 YAML 側に置けるようにするため)。どちらにも無ければ None。
-pub fn resolve_ai_config(
-    local: Option<&serde_yaml::Value>,
-    fetched: Option<&serde_yaml::Value>,
-) -> Result<Option<AiConfig>, AppError> {
-    match fetched.or(local) {
+/// マージ済み設定のトップレベル `ai:` セクションから AI 設定を解決する。
+/// ローカルと取得 YAML の優先順位は設定マージ (AppConfig::load_merged) が
+/// 決めるため、ここでは渡された値を検証するだけ。未設定なら None。
+pub fn resolve_ai_config(ai: Option<&serde_yaml::Value>) -> Result<Option<AiConfig>, AppError> {
+    match ai {
         Some(value) => Ok(Some(AiConfig::from_value(value)?)),
         None => Ok(None),
     }
@@ -392,43 +388,25 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_ai_config_prefers_fetched() {
-        // ローカル config.yml と接続 YAML の両方にあれば接続 YAML 側を使う
-        let local = yaml("api_key: sk-local\nmodel: local-model");
-        let fetched = yaml("api_key: sk-fetched\nmodel: fetched-model");
-        let config = resolve_ai_config(Some(&local), Some(&fetched))
-            .unwrap()
-            .unwrap();
-        assert_eq!(config.api_key, "sk-fetched");
-        assert_eq!(config.model(), "fetched-model");
-    }
-
-    #[test]
-    fn test_resolve_ai_config_local_only() {
-        let local = yaml("api_key: sk-local");
-        let config = resolve_ai_config(Some(&local), None).unwrap().unwrap();
-        assert_eq!(config.api_key, "sk-local");
-    }
-
-    #[test]
-    fn test_resolve_ai_config_fetched_only() {
-        let fetched = yaml("api_key: sk-fetched");
-        let config = resolve_ai_config(None, Some(&fetched)).unwrap().unwrap();
-        assert_eq!(config.api_key, "sk-fetched");
+    fn test_resolve_ai_config_some() {
+        // 優先順位 (ローカル config.yml vs 取得 YAML) は設定マージ側の責務に
+        // なったため、ここは渡された ai セクションを解釈できるかだけを見る
+        let ai = yaml("api_key: sk-test\nmodel: test-model");
+        let config = resolve_ai_config(Some(&ai)).unwrap().unwrap();
+        assert_eq!(config.api_key, "sk-test");
+        assert_eq!(config.model(), "test-model");
     }
 
     #[test]
     fn test_resolve_ai_config_none() {
-        assert!(resolve_ai_config(None, None).unwrap().is_none());
+        assert!(resolve_ai_config(None).unwrap().is_none());
     }
 
     #[test]
-    fn test_resolve_ai_config_invalid_fetched_is_error() {
-        // 接続 YAML 側が優先されるため、そちらが不正ならローカルに
-        // フォールバックせずエラーにする (誤ったキーで動き続けない)
-        let local = yaml("api_key: sk-local");
-        let fetched = yaml("provider: unknown\napi_key: sk-fetched");
-        assert!(resolve_ai_config(Some(&local), Some(&fetched)).is_err());
+    fn test_resolve_ai_config_invalid_is_error() {
+        // 不正な provider は黙って無視せずエラーにする (誤設定で動き続けない)
+        let ai = yaml("provider: unknown\napi_key: sk-test");
+        assert!(resolve_ai_config(Some(&ai)).is_err());
     }
 
     #[test]

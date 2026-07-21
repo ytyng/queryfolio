@@ -36,7 +36,7 @@ pnpm tauri dev
 
 ## Configuration
 
-Everything lives in one file: `~/.config/queryfolio/config.yml` (see `config.example.yaml`). The `sql_servers` key accepts either the server list itself, or a source declaration pointing to where the list comes from:
+Everything lives in one file: `~/.config/queryfolio/config.yml` (see `config.example.yaml`). Connections are written under `sql_servers`, and any key can be overridden from an external source with `config_override_command`:
 
 ```yaml
 # Inline (sql-agent-mcp-server compatible)
@@ -57,15 +57,10 @@ sql_servers:
 #   - name: ungrouped-db
 #     ...
 
-# Or fetch from 1Password (exactly one of command / env / file)
-# sql_servers:
-#   command: op read "op://development/queryfolio/config-yaml"
-
-# Or from a file / an environment variable
-# sql_servers:
-#   file: ~/secrets/sql-servers.yaml
-# sql_servers:
-#   env: QUERYFOLIO_CONNECTIONS_YAML
+# Optional: run a command whose stdout is YAML, and merge it over this file.
+# Mappings are merged recursively; scalars and lists (including sql_servers)
+# are replaced wholesale. Any key can be overridden this way.
+# config_override_command: op read "op://development/queryfolio/config-yaml"
 
 # Optional
 sqlfiles_dir: ~/queries
@@ -79,7 +74,7 @@ ai:
   base_url: https://api.openai.com/v1  # optional (for OpenAI-compatible APIs)
 ```
 
-The `ai:` section can live at the top level of the local config file, or at the top level of the connection YAML fetched via a source declaration. When both exist, the fetched YAML wins — so the API key can stay in 1Password together with the connection secrets.
+The `ai:` section can live at the top level of the local config file, or at the top level of the YAML fetched by `config_override_command`. The fetched YAML wins (that is just the merge result) — so the API key can stay in 1Password together with the connection secrets.
 
 The `QUERYFOLIO_CONFIG_YAML` environment variable overrides the whole config file (for development; GUI apps launched from Finder do not inherit shell env vars).
 

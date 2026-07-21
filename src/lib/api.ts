@@ -241,7 +241,7 @@ export const readConfigFile = () => invoke<string>("read_config_file");
 export const writeConfigFile = (content: string) =>
   invoke<string>("write_config_file", { content });
 
-/// sql_servers のソース宣言 command を実行して取得した生の YAML を返す
+/// config_override_command を実行して取得した生の YAML を返す
 /// (コピー用ビュー用。表示先では編集できるが保存はしない)。
-export const readSqlServersSourceYaml = () =>
-  invoke<string>("read_sql_servers_source_yaml");
+export const readOverrideConfigYaml = () =>
+  invoke<string>("read_override_config_yaml");
