@@ -226,7 +226,7 @@ async fn reset_connections(
     state.db.reset().await;
     state.schema_cache.clear().await;
     // 設定を編集して sql_servers のソース宣言が変わることがあるため、
-    // 読み取り専用ビューのメニュー項目の要否を再判定する
+    // コピー用ビュー (保存不可) のメニュー項目の要否を再判定する
     rebuild_menu(&app);
     Ok(())
 }
@@ -871,7 +871,7 @@ fn write_config_file(content: String) -> Result<String, AppError> {
 }
 
 /// sql_servers のソース宣言 command を実行して取得した生の YAML を返す
-/// (読み取り専用ビュー用)。
+/// (コピー用ビュー用。表示先では編集できるが保存はしない)。
 #[tauri::command]
 async fn read_sql_servers_source_yaml() -> Result<String, AppError> {
     config::fetch_sql_servers_source_yaml().await
@@ -884,7 +884,7 @@ async fn read_sql_servers_source_yaml() -> Result<String, AppError> {
 /// tauri のデフォルトメニューを流用せず、アプリメニューを含めて丸ごと自前で組み、
 /// Builder::menu で最初の設置時から渡す。設定変更時はこの関数で組み直す。
 ///
-/// 「Edit sql_servers config yaml (Read only)」は sql_servers がソース宣言の
+/// 「Edit sql_servers config yaml (Copy only)」は sql_servers がソース宣言の
 /// `command:` の時だけ出す。
 ///
 /// 構成は tauri の `Menu::default` を踏襲する (アプリメニュー / View は macOS のみ、
@@ -910,7 +910,7 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
         MenuItemBuilder::with_id("edit_config_file", "Edit config.yml").build(app)?;
     let edit_source_item = MenuItemBuilder::with_id(
         "edit_sql_servers_source",
-        "Edit sql_servers config yaml (Read only)",
+        "Edit sql_servers config yaml (Copy only)",
     )
     .build(app)?;
     let show_source_item = config::sql_servers_source_is_command();
@@ -1017,7 +1017,7 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
 }
 
 /// 設定を読み直した後にメニューを組み直す。
-/// sql_servers のソース宣言が変わると読み取り専用ビューの項目の要否も変わるため。
+/// sql_servers のソース宣言が変わるとコピー用ビューの項目の要否も変わるため。
 fn rebuild_menu(app: &tauri::AppHandle) {
     match build_menu(app).and_then(|menu| app.set_menu(menu)) {
         Ok(_) => {}

@@ -32,7 +32,12 @@
   /// 別のモードへ切り替えると #key による作り直しで編集が消えるため、それを断る。
   function openConfigEditor(mode: "config" | "source") {
     if (configEditorMode !== null && configEditorMode !== mode && configEditorDirty) {
-      toast.warning("Save or discard your changes first");
+      // source モードには Save が無いため、できない操作を案内しないよう文言を分ける
+      toast.warning(
+        configEditorMode === "config"
+          ? "Save or discard your changes first"
+          : "Discard your edits first (they cannot be saved)",
+      );
       return;
     }
     configEditorMode = mode;
@@ -392,9 +397,10 @@
   />
 {/if}
 
-<!-- 設定ファイルのエディタ (メニューから開く)。mode で編集用と読み取り専用を切り替える。
+<!-- 設定ファイルのエディタ (メニューから開く)。mode で保存できる config と、
+     編集はできるが保存できない source を切り替える。
      モーダル表示中でもネイティブメニューは操作できるため、mode が切り替わったら
-     #key で作り直す (読み込み直しと read-only 設定はマウント時に確定するため) -->
+     #key で作り直す (読み込み直しがマウント時に確定するため) -->
 {#if configEditorMode !== null}
   {#key configEditorMode}
     <ConfigEditorModal
