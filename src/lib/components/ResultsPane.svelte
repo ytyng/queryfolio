@@ -56,7 +56,7 @@
   // ドラッグ後にセルインスペクタを誤って開閉しないようにする
   let dragMoved = false;
 
-  // キーボード操作 (Cmd+C) を結果グリッドに限定するためのフォーカス先
+  // キーボード操作 (Cmd+C / Cmd+A) を結果グリッドに限定するためのフォーカス先
   let gridEl = $state<HTMLDivElement | null>(null);
 
   // Cmd+C コピーにヘッダ行を含めるか。localStorage に保存する
@@ -228,21 +228,65 @@
     }, 1500);
   };
 
-  // Cmd+C (Ctrl+C) で選択範囲を CSV コピー。結果グリッドにフォーカスが
-  // ある時だけ処理し、SQL エディタ等からのコピーは横取りしない
-  const handleWindowKeydown = (e: KeyboardEvent) => {
-    if (!(e.metaKey || e.ctrlKey) || (e.key !== "c" && e.key !== "C")) {
-      return;
-    }
-    // セル入力 (編集 input / 読み取り専用ビューの textarea) にフォーカスがある間は、
-    // 入力内のテキスト選択を通常の Cmd+C でコピーできるよう横取りしない
+  // 結果グリッドにフォーカスがあるか。SQL エディタ等からのキー操作を
+  // 横取りしないための共通ガード。セル入力 (編集 input / 読み取り専用ビューの
+  // textarea) にフォーカスがある間も、入力内の通常のキー操作を優先して false
+  const isGridKeyTarget = (): boolean => {
     if (
       document.activeElement instanceof HTMLInputElement ||
       document.activeElement instanceof HTMLTextAreaElement
     ) {
+      return false;
+    }
+    return gridEl !== null && gridEl.contains(document.activeElement);
+  };
+
+  // テーブル全体を選択する。選択できる結果が無ければ false (既定動作に任せる)。
+  // mode は "cell" のままでよい: 行/列ヘッダのハイライトは
+  // isRowHeaderSelected / isColHeaderSelected が mode ではなく確定後の範囲が
+  // 全行・全列に及ぶかで判定するため、全体を覆う矩形なら両方点灯する
+  const selectAll = (): boolean => {
+    const tab = activeTab;
+    const result = tab?.result;
+    if (
+      !tab ||
+      !result ||
+      result.rows.length === 0 ||
+      result.columns.length === 0
+    ) {
+      return false;
+    }
+    selection = {
+      tabId: tab.id,
+      mode: "cell",
+      anchorRow: 0,
+      anchorCol: 0,
+      focusRow: result.rows.length - 1,
+      focusCol: result.columns.length - 1,
+    };
+    return true;
+  };
+
+  // Cmd+C (Ctrl+C) で選択範囲を CSV コピー、Cmd+A (Ctrl+A) でテーブル全体を選択。
+  // どちらも結果グリッドにフォーカスがある時だけ処理する
+  const handleWindowKeydown = (e: KeyboardEvent) => {
+    if (!(e.metaKey || e.ctrlKey)) {
       return;
     }
-    if (!selectedRange || !gridEl || !gridEl.contains(document.activeElement)) {
+    const key = e.key.toLowerCase();
+    if (key !== "c" && key !== "a") {
+      return;
+    }
+    if (!isGridKeyTarget()) {
+      return;
+    }
+    if (key === "a") {
+      if (selectAll()) {
+        e.preventDefault();
+      }
+      return;
+    }
+    if (!selectedRange) {
       return;
     }
     e.preventDefault();
@@ -955,8 +999,8 @@
   {/if}
 
   <div class="flex min-h-0 flex-1">
-    <!-- tabindex/bind: セル選択後の Cmd+C コピーを結果グリッドに限定する
-         (window の keydown で gridEl 内にフォーカスがある時だけ処理) -->
+    <!-- tabindex/bind: セル選択後の Cmd+C コピー・Cmd+A 全選択を結果グリッドに
+         限定する (window の keydown で gridEl 内にフォーカスがある時だけ処理) -->
     <div
       class="min-h-0 flex-1 overflow-auto focus:outline-none"
       tabindex="-1"
