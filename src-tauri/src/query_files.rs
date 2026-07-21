@@ -156,12 +156,17 @@ pub fn search_query_files(
 /// クエリファイルの絶対パスを文字列で返す (「Copy full path」用)。
 /// パストラバーサル対策のため名前を検証・正規化してから組み立てる。
 /// 一覧に出ているファイルからのみ呼ばれるため存在チェックはしない。
+/// sqlfiles_dir が相対パスで設定されている場合、組み立てた path も相対になる。
+/// 「Copy full path」の名の通り常に絶対パスを返すため、相対のときは
+/// カレントディレクトリ基準で絶対化する (std::path::absolute は存在チェック
+/// もシンボリックリンク解決も伴わない字句的な絶対化)。
 pub fn query_file_path(
     sqlfiles_dir: &Path,
     connection: &str,
     file_name: &str,
 ) -> Result<String, AppError> {
     let path = file_path(sqlfiles_dir, connection, file_name)?;
+    let path = std::path::absolute(&path)?;
     Ok(path.to_string_lossy().into_owned())
 }
 
