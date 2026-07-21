@@ -48,7 +48,7 @@
       : appStore.aiError
         ? `AI is unavailable: ${appStore.aiError}`
         : "AI is not configured. Add an 'ai:' section (provider: openai, " +
-          "api_key: ...) to config.yml or the connection YAML.",
+          "api_key: ...) to config.yml or the override YAML.",
   );
 
   /// Explain SQL ボタンの title (未設定・エラー時は設定方法を案内する)
@@ -60,7 +60,7 @@
       : appStore.aiError
         ? `AI is unavailable: ${appStore.aiError}`
         : "AI is not configured. Add an 'ai:' section (provider: openai, " +
-          "api_key: ...) to config.yml or the connection YAML.",
+          "api_key: ...) to config.yml or the override YAML.",
   );
 
   // 入力欄を開いたらフォーカスする

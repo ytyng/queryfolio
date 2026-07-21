@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 
-/// ソース宣言コマンドの実行タイムアウト (秒)。
+/// config_override_command の実行タイムアウト (秒)。
 /// 1Password 等の認証待ちで無限ハングするとコマンド呼び出しが固まるため必須。
 const SOURCE_COMMAND_TIMEOUT_SECS: u64 = 60;
 
@@ -37,11 +37,8 @@ const CONFIG_TEMPLATE: &str = r#"# QueryFolio config file
 # See config.example.yaml in the repository for the full format.
 # https://github.com/ytyng/queryfolio
 
-# Connection definitions. Either write servers inline, or use a source
-# declaration (exactly one of command / env / file) to fetch the YAML
-# from elsewhere.
+# Connection definitions.
 #
-# Inline example:
 # sql_servers:
 #   - name: local-sqlite
 #     description: "Local SQLite file"
@@ -54,12 +51,17 @@ const CONFIG_TEMPLATE: &str = r#"# QueryFolio config file
 #     schema: development_db
 #     user: dev_user
 #     password: your_password
-#
-# Fetch from 1Password:
-# sql_servers:
-#   command: op read "op://development/queryfolio/config-yaml"
 
 sql_servers: []
+
+# Keep secrets out of this file by fetching them from elsewhere.
+#
+# config_override_command runs a command whose stdout must be YAML, and merges
+# that YAML over this file. The merge is recursive for mappings; scalars and
+# lists (including sql_servers) are replaced wholesale. Any key can be
+# overridden this way, not just sql_servers.
+#
+# config_override_command: op read "op://development/queryfolio/config-yaml"
 
 # Where query files are stored (default: ~/.config/queryfolio/sqlfiles)
 # sqlfiles_dir: ~/queries
@@ -370,30 +372,9 @@ impl From<&ServerConfig> for ConnectionInfo {
     }
 }
 
-/// sql_servers のソース宣言 (マッピング形式)。
-/// command / env / file のうち、ちょうど 1 つだけを指定する。
-#[derive(Debug, Clone)]
-enum ServersSource {
-    /// サーバー定義がそのまま書かれている (リスト形式)
-    Inline,
-    /// コマンドを実行して stdout を YAML として使う
-    Command(String),
-    /// 環境変数の中身を YAML として使う
-    Env(String),
-    /// ファイルを読んで YAML として使う
-    File(String),
-}
-
-/// resolve_servers の結果。サーバー一覧に加えて、ソース宣言で取得した
-/// YAML のトップレベル `ai:` セクション (未検証の生値) も返す。
-/// AI 設定の検証・解決は ai::resolve_ai_config が行う
-/// (ローカル config.yml 側の ai は AppConfig::local_ai で取る)。
-#[derive(Debug)]
-pub struct ResolvedServers {
-    pub servers: Vec<ServerConfig>,
-    /// 取得 YAML のトップレベル ai セクション。インライン定義の場合は None
-    pub fetched_ai: Option<serde_yaml::Value>,
-}
+/// 設定を外部コマンドの YAML で上書きするためのトップレベルキー。
+/// 値はコマンド文字列で、その stdout (YAML) を設定全体へ再帰マージする。
+pub const CONFIG_OVERRIDE_COMMAND_KEY: &str = "config_override_command";
 
 /// フロントエンドの情報表示用。設定の解決結果 (機密を含まない)。
 #[derive(Debug, Serialize)]
@@ -407,13 +388,22 @@ pub struct ConfigInfo {
 /// ~/.config/queryfolio/config.yml (無ければ config.yaml) のパース結果。
 ///
 /// トップレベルキー:
-/// - sql_servers: サーバー定義リスト、またはソース宣言マッピング
-/// - sql_server_templates: 接続情報の雛形 (リスト形式の時のみ有効)
+/// - sql_servers: サーバー定義リスト
+/// - sql_server_templates: 接続情報の雛形
 /// - sqlfiles_dir: クエリファイル保存ディレクトリ (任意)
+/// - config_override_command: 設定を上書きする YAML を取得するコマンド (任意)
+///
+/// `load` はローカルのファイルだけを読む (同期)。`load_merged` は加えて
+/// config_override_command を実行し、取得 YAML を再帰マージした設定を返す。
+/// コマンド実行は 1Password 等で数秒かかり Touch ID を要求することもあるため、
+/// 呼び出し側 (AppState) でセッションキャッシュすること。
 pub struct AppConfig {
     doc: serde_yaml::Mapping,
     /// 読み込んだファイルのパス。QUERYFOLIO_CONFIG_YAML 環境変数由来なら None
     source_path: Option<PathBuf>,
+    /// load_merged で実際に適用した config_override_command。
+    /// マージ後の doc からはキーを落とすため、表示用にここへ退避する。
+    applied_override: Option<String>,
 }
 
 impl AppConfig {
@@ -427,6 +417,7 @@ impl AppConfig {
                 return Ok(Self {
                     doc,
                     source_path: None,
+                    applied_override: None,
                 });
             }
         }
@@ -449,7 +440,30 @@ impl AppConfig {
         Ok(Self {
             doc,
             source_path: Some(path),
+            applied_override: None,
         })
+    }
+
+    /// ローカル設定を読み、`config_override_command` があればそれを実行して
+    /// 取得 YAML を再帰マージした設定を返す。
+    ///
+    /// マージは取得 YAML 側が優先。マッピング同士は再帰的に混ぜ、
+    /// スカラー・シーケンス (sql_servers を含む) は丸ごと置き換える
+    /// (リストの要素単位マージは、どれが「同じ項目」かを決められないため行わない)。
+    pub async fn load_merged() -> Result<Self, AppError> {
+        let mut config = Self::load()?;
+        let Some(command) = config.override_command()? else {
+            return Ok(config);
+        };
+        let yaml = run_source_command(&command).await?;
+        let overrides = parse_mapping(&yaml, &format!("{CONFIG_OVERRIDE_COMMAND_KEY}: {command}"))?;
+        merge_mapping(&mut config.doc, &overrides);
+        // 取得 YAML 側が config_override_command を持っていても再帰取得はしない。
+        // 適用済みであることを表すためキー自体を落とす (info の表示はローカル
+        // 側の値を使うため、ここで消しても表示には影響しない)。
+        config.doc.remove(CONFIG_OVERRIDE_COMMAND_KEY);
+        config.applied_override = Some(command);
+        Ok(config)
     }
 
     /// config.yml を優先し、無ければ config.yaml、どちらも無ければ
@@ -475,106 +489,59 @@ impl AppConfig {
         }
     }
 
-    fn servers_source(&self) -> Result<ServersSource, AppError> {
-        let value = self.doc.get("sql_servers").ok_or_else(|| {
-            AppError::Config("The config has no sql_servers key".into())
+    /// 設定を上書きする YAML を取得するコマンド (未設定なら None)。
+    ///
+    /// キーが存在するのに文字列でない・空文字の場合はエラーにする。
+    /// 黙って「未設定」に倒すと、オーバーライド側の接続情報や readonly が
+    /// 適用されないままローカル設定で動いてしまい、事故に気付けないため。
+    pub fn override_command(&self) -> Result<Option<String>, AppError> {
+        let Some(value) = self.doc.get(CONFIG_OVERRIDE_COMMAND_KEY) else {
+            return Ok(None);
+        };
+        let command = value.as_str().map(str::trim).ok_or_else(|| {
+            AppError::Config(format!("{CONFIG_OVERRIDE_COMMAND_KEY} must be a string"))
         })?;
-
-        if value.is_sequence() {
-            return Ok(ServersSource::Inline);
+        if command.is_empty() {
+            return Err(AppError::Config(format!(
+                "{CONFIG_OVERRIDE_COMMAND_KEY} is empty"
+            )));
         }
-
-        let mapping = value.as_mapping().ok_or_else(|| {
-            AppError::Config(
-                "sql_servers must be a list of server definitions, or a source declaration \
-                 mapping (command / env / file)"
-                    .into(),
-            )
-        })?;
-
-        let mut sources = vec![];
-        for (key, val) in mapping {
-            let key = key.as_str().unwrap_or_default();
-            let text = val.as_str().map(|s| s.to_string()).ok_or_else(|| {
-                AppError::Config(format!("sql_servers.{key} must be a string"))
-            })?;
-            match key {
-                "command" => sources.push(ServersSource::Command(text)),
-                "env" => sources.push(ServersSource::Env(text)),
-                "file" => sources.push(ServersSource::File(text)),
-                other => {
-                    return Err(AppError::Config(format!(
-                        "Unknown key '{other}' in sql_servers (only command / env / file are allowed)"
-                    )));
-                }
-            }
-        }
-
-        match sources.len() {
-            1 => Ok(sources.into_iter().next().unwrap()),
-            0 => Err(AppError::Config(
-                "A sql_servers source declaration requires exactly one of command / env / file"
-                    .into(),
-            )),
-            _ => Err(AppError::Config(
-                "A sql_servers source declaration cannot have more than one of command / env / file"
-                    .into(),
-            )),
-        }
+        Ok(Some(command.to_string()))
     }
 
-    /// ローカル config.yml トップレベルの `ai:` セクション (未検証の生値)。
-    pub fn local_ai(&self) -> Option<serde_yaml::Value> {
+    /// トップレベルの `ai:` セクション (未検証の生値)。
+    /// load_merged 済みなら取得 YAML 側の ai が反映されている。
+    pub fn ai(&self) -> Option<serde_yaml::Value> {
         self.doc.get("ai").cloned()
     }
 
-    /// 接続サーバー一覧を解決する。ソース宣言の場合は取得を伴う。
-    /// 取得した YAML のトップレベル ai セクションもあわせて返す。
-    pub async fn resolve_servers(&self) -> Result<ResolvedServers, AppError> {
-        match self.servers_source()? {
-            ServersSource::Inline => {
-                let servers = self
-                    .doc
-                    .get("sql_servers")
-                    .and_then(|v| v.as_sequence())
-                    .cloned()
-                    .unwrap_or_default();
-                let templates = self
-                    .doc
-                    .get("sql_server_templates")
-                    .and_then(|v| v.as_sequence())
-                    .cloned()
-                    .unwrap_or_default();
-                Ok(ResolvedServers {
-                    servers: parse_server_entries(&servers, &templates, "config (inline)")?,
-                    fetched_ai: None,
-                })
-            }
-            ServersSource::Command(command) => {
-                let yaml = run_source_command(&command).await?;
-                parse_fetched_servers(&yaml, &format!("command: {command}"))
-            }
-            ServersSource::Env(env_name) => {
-                let yaml = std::env::var(&env_name).map_err(|_| {
-                    AppError::Config(format!(
-                        "Environment variable {env_name} is not set \
-                         (GUI apps launched from Finder / Dock do not inherit shell env vars)"
-                    ))
-                })?;
-                parse_fetched_servers(&yaml, &format!("env: {env_name}"))
-            }
-            ServersSource::File(path) => {
-                let file_path = expand_tilde(&path);
-                if !file_path.exists() {
-                    return Err(AppError::Config(format!(
-                        "sql_servers file not found: {}",
-                        file_path.display()
-                    )));
-                }
-                let yaml = std::fs::read_to_string(&file_path)?;
-                parse_fetched_servers(&yaml, &file_path.display().to_string())
-            }
-        }
+    /// 接続サーバー一覧を解決する。
+    /// 取得を伴わない (config_override_command の適用は load_merged で済んでいる)。
+    pub fn resolve_servers(&self) -> Result<Vec<ServerConfig>, AppError> {
+        let servers = self
+            .doc
+            .get("sql_servers")
+            .ok_or_else(|| AppError::Config("The config has no sql_servers key".into()))?
+            .as_sequence()
+            .cloned()
+            .ok_or_else(|| {
+                // 旧方式 (sql_servers: {command|env|file: ...}) からの移行案内。
+                // 単に「リストであるべき」とだけ言われても、どう直すか分からない
+                AppError::Config(format!(
+                    "sql_servers must be a list of server definitions. \
+                     Source declarations (command / env / file) under sql_servers were \
+                     removed; use the top-level {CONFIG_OVERRIDE_COMMAND_KEY} instead \
+                     (note: it runs without a shell, so use an absolute path, e.g. \
+                     `{CONFIG_OVERRIDE_COMMAND_KEY}: /bin/cat /Users/you/secrets/servers.yaml`)"
+                ))
+            })?;
+        let templates = self
+            .doc
+            .get("sql_server_templates")
+            .and_then(|v| v.as_sequence())
+            .cloned()
+            .unwrap_or_default();
+        parse_server_entries(&servers, &templates, "config")
     }
 
     /// 情報表示用のサマリを返す (機密を含まない)。
@@ -583,12 +550,15 @@ impl AppConfig {
             Some(path) => path.display().to_string(),
             None => "(env QUERYFOLIO_CONFIG_YAML)".to_string(),
         };
-        let source = match self.servers_source() {
-            Ok(ServersSource::Inline) => "inline".to_string(),
-            Ok(ServersSource::Command(command)) => format!("command: {command}"),
-            Ok(ServersSource::Env(env_name)) => format!("env: {env_name}"),
-            Ok(ServersSource::File(path)) => format!("file: {path}"),
-            Err(e) => format!("(error: {e})"),
+        // マージ後は doc からキーを落としているため applied_override を先に見る。
+        // load (マージ前) の設定でも表示できるよう doc 側もフォールバックで見る。
+        let source = match self
+            .applied_override
+            .clone()
+            .or_else(|| self.override_command().ok().flatten())
+        {
+            Some(command) => format!("{CONFIG_OVERRIDE_COMMAND_KEY}: {command}"),
+            None => "inline".to_string(),
         };
         Ok(ConfigInfo {
             config_path,
@@ -599,29 +569,21 @@ impl AppConfig {
     }
 }
 
-/// 設定ファイルが読めない場合も含めて情報表示用サマリを作る。
-pub fn config_info() -> ConfigInfo {
-    match AppConfig::load() {
-        Ok(config) => config.info().unwrap_or_else(|e| ConfigInfo {
-            config_path: String::new(),
-            config_exists: true,
-            source: format!("(error: {e})"),
-            sqlfiles_dir: String::new(),
-        }),
-        Err(e) => {
-            // load 失敗には「ファイルが無い」以外に「存在するが YAML が壊れている」
-            // 場合があるため、存在判定はパースの成否と独立に行う
-            let (config_path, config_exists) = match AppConfig::find_config_path() {
-                Ok(path) => (path.display().to_string(), path.exists()),
-                Err(_) => (String::new(), false),
-            };
-            ConfigInfo {
-                config_path,
-                config_exists,
-                source: format!("(error: {e})"),
-                sqlfiles_dir: String::new(),
-            }
-        }
+/// 設定の解決に失敗した時の情報表示用サマリ (ファイルが無い / YAML が壊れて
+/// いる / 取得コマンドが失敗した場合)。フロントが常に何かを表示できるよう、
+/// エラー文言を source に載せて返す。
+pub fn config_info_error(error: &AppError) -> ConfigInfo {
+    // 失敗には「ファイルが無い」以外に「存在するが YAML が壊れている」場合が
+    // あるため、存在判定はパースの成否と独立に行う
+    let (config_path, config_exists) = match AppConfig::find_config_path() {
+        Ok(path) => (path.display().to_string(), path.exists()),
+        Err(_) => (String::new(), false),
+    };
+    ConfigInfo {
+        config_path,
+        config_exists,
+        source: format!("(error: {error})"),
+        sqlfiles_dir: String::new(),
     }
 }
 
@@ -705,24 +667,46 @@ fn write_config_file_in(dir: &std::path::Path, content: &str) -> Result<String, 
     Ok(path.display().to_string())
 }
 
-/// sql_servers がソース宣言の `command:` かどうか。
+/// config_override_command が設定されているか。
 /// メニュー項目の出し分けに使う。設定が読めない場合は false。
-pub fn sql_servers_source_is_command() -> bool {
-    matches!(
-        AppConfig::load().and_then(|c| c.servers_source()),
-        Ok(ServersSource::Command(_))
-    )
+pub fn has_config_override_command() -> bool {
+    AppConfig::load()
+        .map(|c| c.override_command().unwrap_or(None).is_some())
+        .unwrap_or(false)
 }
 
-/// sql_servers のソース宣言 `command:` を実行して、取得した生の YAML を返す。
-/// コピー用ビュー用 (表示先では編集できるが保存はしない)。command 以外のソースではエラーにする。
-pub async fn fetch_sql_servers_source_yaml() -> Result<String, AppError> {
+/// config_override_command を実行して、取得した生の YAML を返す。
+/// コピー用ビュー用 (表示先では編集できるが保存はしない)。未設定ならエラーにする。
+///
+/// AppState のマージ済み設定キャッシュは**意図的に経由しない**。このビューは
+/// 保管場所 (1Password 等) の現在値を確認・整形してコピーする用途なので、
+/// 起動時に取得したキャッシュではなく毎回最新を取りに行く。開くたびに
+/// コマンドが 1 回走る (1Password なら都度認証が要る場合がある)。
+pub async fn fetch_override_config_yaml() -> Result<String, AppError> {
     let config = AppConfig::load()?;
-    match config.servers_source()? {
-        ServersSource::Command(command) => run_source_command(&command).await,
-        _ => Err(AppError::Config(
-            "sql_servers does not use a command source declaration".into(),
-        )),
+    match config.override_command()? {
+        Some(command) => run_source_command(&command).await,
+        None => Err(AppError::Config(format!(
+            "The config has no {CONFIG_OVERRIDE_COMMAND_KEY}"
+        ))),
+    }
+}
+
+/// 取得 YAML (over) をローカル設定 (base) へ再帰的にマージする。over 側が優先。
+/// 値がどちらもマッピングの時だけ中へ入って混ぜ、それ以外 (スカラー・
+/// シーケンス) は over で丸ごと置き換える。sql_servers のようなリストを
+/// 要素単位でマージしないのは、どの要素が「同じ項目」かを決める安定した
+/// 同一性が無いため (name 一致で混ぜると意図しない部分適用が起きる)。
+fn merge_mapping(base: &mut serde_yaml::Mapping, over: &serde_yaml::Mapping) {
+    for (key, over_value) in over {
+        match (base.get_mut(key), over_value) {
+            (Some(serde_yaml::Value::Mapping(base_map)), serde_yaml::Value::Mapping(over_map)) => {
+                merge_mapping(base_map, over_map);
+            }
+            _ => {
+                base.insert(key.clone(), over_value.clone());
+            }
+        }
     }
 }
 
@@ -731,35 +715,6 @@ fn parse_mapping(yaml_text: &str, source: &str) -> Result<serde_yaml::Mapping, A
         .map_err(|e| AppError::Config(format!("Failed to parse YAML from {source}: {e}")))?;
     doc.as_mapping().cloned().ok_or_else(|| {
         AppError::Config(format!("{source} is not a YAML mapping"))
-    })
-}
-
-/// ソース宣言で取得した YAML をパースする。
-/// sql-agent-mcp-server 互換フォーマット (sql_servers リスト + sql_server_templates)。
-/// トップレベルに `ai:` セクションがあればあわせて返す (queryfolio 独自拡張)。
-/// 取得先でさらにソース宣言を使う再帰は禁止 (ループ防止のため深さ 1 まで)。
-fn parse_fetched_servers(
-    yaml_text: &str,
-    source: &str,
-) -> Result<ResolvedServers, AppError> {
-    let mapping = parse_mapping(yaml_text, source)?;
-    let servers_value = mapping.get("sql_servers").ok_or_else(|| {
-        AppError::Config(format!("{source} has no sql_servers key"))
-    })?;
-    let servers = servers_value.as_sequence().ok_or_else(|| {
-        AppError::Config(format!(
-            "sql_servers in {source} is not a list \
-             (recursive source declarations are not allowed)"
-        ))
-    })?;
-    let templates = mapping
-        .get("sql_server_templates")
-        .and_then(|v| v.as_sequence())
-        .cloned()
-        .unwrap_or_default();
-    Ok(ResolvedServers {
-        servers: parse_server_entries(servers, &templates, source)?,
-        fetched_ai: mapping.get("ai").cloned(),
     })
 }
 
@@ -841,7 +796,7 @@ fn parse_server_entry(
     })
 }
 
-/// ソース宣言の command を実行して stdout を返す。
+/// config_override_command を実行して stdout を返す。
 ///
 /// shlex で argv に分解し、シェルを介さず実行する。シェルメタ文字が混入しても
 /// 解釈されないためコマンドインジェクションの余地が無い。その代わり
@@ -849,11 +804,11 @@ fn parse_server_entry(
 async fn run_source_command(command: &str) -> Result<String, AppError> {
     let argv = shlex::split(command).ok_or_else(|| {
         AppError::Config(format!(
-            "Failed to parse sql_servers command (unbalanced quotes?): {command}"
+            "Failed to parse config_override_command (unbalanced quotes?): {command}"
         ))
     })?;
     if argv.is_empty() {
-        return Err(AppError::Config("sql_servers command is empty".into()));
+        return Err(AppError::Config("config_override_command is empty".into()));
     }
 
     let output = tokio::time::timeout(
@@ -871,18 +826,18 @@ async fn run_source_command(command: &str) -> Result<String, AppError> {
     .await
     .map_err(|_| {
         AppError::Config(format!(
-            "sql_servers command timed out ({SOURCE_COMMAND_TIMEOUT_SECS}s): {command} \
+            "config_override_command timed out ({SOURCE_COMMAND_TIMEOUT_SECS}s): {command} \
              (it may be hanging on 1Password or another auth prompt)"
         ))
     })?
     .map_err(|e| {
-        AppError::Config(format!("Failed to run sql_servers command: {command}: {e}"))
+        AppError::Config(format!("Failed to run config_override_command: {command}: {e}"))
     })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(AppError::Config(format!(
-            "sql_servers command exited with an error (code={:?}): {command}\nstderr: {}",
+            "config_override_command exited with an error (code={:?}): {command}\nstderr: {}",
             output.status.code(),
             stderr.trim()
         )));
@@ -891,7 +846,7 @@ async fn run_source_command(command: &str) -> Result<String, AppError> {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     if stdout.trim().is_empty() {
         return Err(AppError::Config(format!(
-            "sql_servers command produced no output: {command}"
+            "config_override_command produced no output: {command}"
         )));
     }
     Ok(stdout)
@@ -964,6 +919,7 @@ mod tests {
         AppConfig {
             doc: parse_mapping(yaml, "test").unwrap(),
             source_path: None,
+            applied_override: None,
         }
     }
 
@@ -982,7 +938,7 @@ sql_servers:
     password: secret
 "#,
         );
-        let servers = config.resolve_servers().await.unwrap().servers;
+        let servers = config.resolve_servers().unwrap();
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "dev-postgres");
         assert_eq!(servers[0].port, Some(5432));
@@ -1015,7 +971,7 @@ sql_servers:
         host: localhost
 "#,
         );
-        let servers = config.resolve_servers().await.unwrap().servers;
+        let servers = config.resolve_servers().unwrap();
         let summary: Vec<(&str, Option<&str>)> = servers
             .iter()
             .map(|s| (s.name.as_str(), s.group_name.as_deref()))
@@ -1047,7 +1003,7 @@ sql_servers:
     group_name: bypassed
 "#,
         );
-        let servers = config.resolve_servers().await.unwrap().servers;
+        let servers = config.resolve_servers().unwrap();
         assert!(servers[0].group_name.is_none());
     }
 
@@ -1063,7 +1019,7 @@ sql_servers:
         schema: /tmp/a.db
 "#,
         );
-        let err = config.resolve_servers().await.unwrap_err().to_string();
+        let err = config.resolve_servers().unwrap_err().to_string();
         assert!(err.contains("group_name"), "unexpected error: {err}");
     }
 
@@ -1081,7 +1037,7 @@ sql_servers:
             schema: /tmp/a.db
 "#,
         );
-        let err = config.resolve_servers().await.unwrap_err().to_string();
+        let err = config.resolve_servers().unwrap_err().to_string();
         assert!(err.contains("Nested groups"), "unexpected error: {err}");
     }
 
@@ -1096,7 +1052,7 @@ sql_servers:
     description: typo-extra-key
 "#,
         );
-        let err = config.resolve_servers().await.unwrap_err().to_string();
+        let err = config.resolve_servers().unwrap_err().to_string();
         assert!(err.contains("Unknown key 'description'"), "unexpected error: {err}");
     }
 
@@ -1119,7 +1075,7 @@ sql_server_templates:
     user: shared_user
 "#,
         );
-        let servers = config.resolve_servers().await.unwrap().servers;
+        let servers = config.resolve_servers().unwrap();
         assert_eq!(servers[0].name, "db-a");
         assert_eq!(servers[0].engine, "mysql");
         assert_eq!(servers[0].host.as_deref(), Some("db.example.com"));
@@ -1142,7 +1098,7 @@ sql_servers:
     readonly: true
 "#,
         );
-        let servers = config.resolve_servers().await.unwrap().servers;
+        let servers = config.resolve_servers().unwrap();
         assert!(!servers[0].readonly);
         assert!(servers[1].readonly);
         assert!(!ConnectionInfo::from(&servers[0]).readonly);
@@ -1171,7 +1127,7 @@ sql_servers:
       private_key_path: /home/me/.ssh/id_ed25519
 "#,
         );
-        let servers = config.resolve_servers().await.unwrap().servers;
+        let servers = config.resolve_servers().unwrap();
         let info = ConnectionInfo::from(&servers[0]);
         assert_eq!(info.host.as_deref(), Some("10.0.0.5"));
         assert_eq!(info.port, Some(5432));
@@ -1209,7 +1165,7 @@ sql_server_templates:
     password: shared_password
 "#,
         );
-        let servers = config.resolve_servers().await.unwrap().servers;
+        let servers = config.resolve_servers().unwrap();
         assert_eq!(servers.len(), 2);
         assert_eq!(servers[0].engine, "mysql");
         assert_eq!(servers[0].host.as_deref(), Some("db.example.com"));
@@ -1218,146 +1174,182 @@ sql_server_templates:
         assert_eq!(servers[1].port, Some(3307));
     }
 
-    #[tokio::test]
-    async fn test_source_command() {
-        // /bin/echo で sql-agent 互換 YAML を出力させる
-        let config = config_from_yaml(
-            r#"
-sql_servers:
-  command: '/bin/echo "sql_servers: [{name: from-command, engine: sqlite, schema: /tmp/x.db}]"'
-"#,
-        );
-        let servers = config.resolve_servers().await.unwrap().servers;
-        assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0].name, "from-command");
+    /// 上書き YAML をコマンドで取得して設定へ再帰マージする経路のテスト用に、
+    /// ローカル設定 + 取得 YAML から load_merged 相当の処理を組み立てる。
+    /// (load_merged 自体は実ファイルを読むため、ここではマージ部分を検証する)
+    fn merged_from(local_yaml: &str, fetched_yaml: &str) -> AppConfig {
+        let mut config = config_from_yaml(local_yaml);
+        let overrides = parse_mapping(fetched_yaml, "test override").unwrap();
+        merge_mapping(&mut config.doc, &overrides);
+        config.doc.remove(CONFIG_OVERRIDE_COMMAND_KEY);
+        config.applied_override = Some("test-command".to_string());
+        config
     }
 
+    /// load_merged の実経路 (設定読み込み → コマンド実行 → マージ) を通す。
+    /// QUERYFOLIO_CONFIG_YAML を使うのでこのプロセスで env を触る唯一のテスト
+    /// (他のテストは config_from_yaml を使い env を読まない)。
     #[tokio::test]
-    async fn test_source_env() {
+    async fn test_load_merged_runs_command_and_merges_result() {
         std::env::set_var(
-            "QUERYFOLIO_TEST_SERVERS_YAML",
-            "sql_servers: [{name: from-env, engine: sqlite, schema: /tmp/x.db}]",
+            "QUERYFOLIO_CONFIG_YAML",
+            "sql_servers: []\ndefault_limit: 500\n\
+             config_override_command: /bin/echo default_limit:\\ 7\n",
         );
-        let config = config_from_yaml(
-            r#"
-sql_servers:
-  env: QUERYFOLIO_TEST_SERVERS_YAML
-"#,
-        );
-        let servers = config.resolve_servers().await.unwrap().servers;
-        assert_eq!(servers[0].name, "from-env");
+        let config = AppConfig::load_merged().await.unwrap();
+        std::env::remove_var("QUERYFOLIO_CONFIG_YAML");
+
+        // 取得 YAML の値が適用され、キー自体は落ちている
+        assert_eq!(config.default_limit(), 7);
+        assert!(config.override_command().unwrap().is_none());
+        assert!(config.info().unwrap().source.contains("/bin/echo"));
     }
 
     #[tokio::test]
-    async fn test_source_file() {
-        let path = std::env::temp_dir().join(format!(
-            "queryfolio-config-test-{}.yaml",
-            std::process::id()
-        ));
-        std::fs::write(
-            &path,
-            "sql_servers: [{name: from-file, engine: sqlite, schema: /tmp/x.db}]",
+    async fn test_override_command_is_executed_and_merged() {
+        // /bin/echo で上書き YAML を出力させ、load_merged と同じ経路を通す
+        let yaml = run_source_command(
+            "/bin/echo -n sql_servers:\\n  - name: fetched\\n    engine: sqlite\\n    schema: /tmp/x.db\\n",
         )
+        .await
         .unwrap();
-        let config = config_from_yaml(&format!(
-            "sql_servers:\n  file: {}",
-            path.display()
-        ));
-        let servers = config.resolve_servers().await.unwrap().servers;
-        assert_eq!(servers[0].name, "from-file");
-        let _ = std::fs::remove_file(&path);
+        assert!(yaml.contains("fetched"));
     }
 
-    #[tokio::test]
-    async fn test_inline_has_no_fetched_ai_and_local_ai_is_returned() {
-        // インライン定義では fetched_ai は無く、ローカルの ai は local_ai で取れる
-        let config = config_from_yaml(
+    #[test]
+    fn test_override_replaces_sql_servers_wholesale() {
+        // sql_servers はリストなので要素マージではなく丸ごと置き換わる
+        let config = merged_from(
             r#"
 sql_servers:
-  - name: x
+  - name: local-a
     engine: sqlite
-    schema: /tmp/x.db
-ai:
-  provider: openai
-  api_key: sk-local
+    schema: /tmp/a.db
+  - name: local-b
+    engine: sqlite
+    schema: /tmp/b.db
 "#,
-        );
-        let resolved = config.resolve_servers().await.unwrap();
-        assert!(resolved.fetched_ai.is_none());
-        let local = config.local_ai().unwrap();
-        assert_eq!(
-            local.get("api_key").and_then(|v| v.as_str()),
-            Some("sk-local")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_fetched_yaml_ai_is_extracted() {
-        // ソース宣言で取得した YAML のトップレベル ai が fetched_ai として返る
-        let config = config_from_yaml(
             r#"
 sql_servers:
-  command: '/bin/echo "{sql_servers: [{name: x, engine: sqlite, schema: /tmp/x.db}], ai: {provider: openai, api_key: sk-fetched}}"'
+  - name: fetched-only
+    engine: sqlite
+    schema: /tmp/c.db
 "#,
         );
-        let resolved = config.resolve_servers().await.unwrap();
-        assert_eq!(resolved.servers.len(), 1);
-        let fetched = resolved.fetched_ai.unwrap();
-        assert_eq!(
-            fetched.get("api_key").and_then(|v| v.as_str()),
-            Some("sk-fetched")
-        );
-        // ローカル側には ai が無い
-        assert!(config.local_ai().is_none());
+        let servers = config.resolve_servers().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "fetched-only");
     }
 
-    #[tokio::test]
-    async fn test_fetched_yaml_without_ai() {
-        // 取得 YAML に ai が無ければ fetched_ai は None
-        let config = config_from_yaml(
-            r#"
-sql_servers:
-  command: '/bin/echo "sql_servers: [{name: x, engine: sqlite, schema: /tmp/x.db}]"'
-"#,
+    #[test]
+    fn test_override_can_set_any_top_level_key() {
+        // sql_servers 以外のキーも上書きできる (旧方式との最大の違い)
+        let config = merged_from(
+            "sql_servers: []\ndefault_limit: 500\nsqlfiles_dir: ~/local\n",
+            "default_limit: 42\n",
         );
-        let resolved = config.resolve_servers().await.unwrap();
-        assert!(resolved.fetched_ai.is_none());
+        assert_eq!(config.default_limit(), 42);
+        // 上書き YAML に無いキーはローカルの値が残る
+        assert!(config
+            .resolve_sqlfiles_dir()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("local"));
     }
 
-    #[tokio::test]
-    async fn test_source_multiple_keys_is_error() {
-        let config = config_from_yaml(
-            r#"
-sql_servers:
-  command: /bin/echo x
-  file: /tmp/x.yaml
-"#,
+    #[test]
+    fn test_override_merges_mappings_recursively() {
+        // マッピング同士は再帰的に混ざる (ローカルの model は残り api_key だけ上書き)
+        let config = merged_from(
+            "sql_servers: []\nai:\n  provider: openai\n  model: local-model\n  api_key: sk-local\n",
+            "ai:\n  api_key: sk-fetched\n",
         );
-        let result = config.resolve_servers().await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("more than one"));
+        let ai = config.ai().unwrap();
+        assert_eq!(ai.get("api_key").and_then(serde_yaml::Value::as_str), Some("sk-fetched"));
+        assert_eq!(ai.get("model").and_then(serde_yaml::Value::as_str), Some("local-model"));
+        assert_eq!(ai.get("provider").and_then(serde_yaml::Value::as_str), Some("openai"));
     }
 
-    #[tokio::test]
-    async fn test_source_unknown_key_is_error() {
-        let config = config_from_yaml("sql_servers:\n  url: op://x/y/z\n");
-        let result = config.resolve_servers().await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unknown key"));
+    #[test]
+    fn test_override_ai_wins_over_local_ai() {
+        // API キーを 1Password 側に置く運用: 取得 YAML の ai が優先される
+        let config = merged_from(
+            "sql_servers: []\nai:\n  api_key: sk-local\n",
+            "ai:\n  api_key: sk-fetched\n",
+        );
+        let ai = config.ai().unwrap();
+        assert_eq!(ai.get("api_key").and_then(serde_yaml::Value::as_str), Some("sk-fetched"));
     }
 
-    #[tokio::test]
-    async fn test_fetched_yaml_cannot_recurse() {
-        // 取得先の YAML がさらにソース宣言を持つ場合はエラー
-        let config = config_from_yaml(
-            r#"
-sql_servers:
-  command: '/bin/echo "sql_servers: {command: /bin/echo deeper}"'
-"#,
+    #[test]
+    fn test_local_ai_survives_without_override_ai() {
+        let config = merged_from("sql_servers: []\nai:\n  api_key: sk-local\n", "default_limit: 10\n");
+        let ai = config.ai().unwrap();
+        assert_eq!(ai.get("api_key").and_then(serde_yaml::Value::as_str), Some("sk-local"));
+    }
+
+    #[test]
+    fn test_override_key_is_dropped_after_merge() {
+        // 取得 YAML 側が config_override_command を持っていても再帰取得はしない
+        let config = merged_from(
+            "sql_servers: []\nconfig_override_command: local-cmd\n",
+            "config_override_command: fetched-cmd\nsql_servers: []\n",
         );
-        let result = config.resolve_servers().await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("recursive"));
+        assert!(config.override_command().unwrap().is_none());
+        // 適用済みコマンドは info の表示用に残る
+        assert!(config.info().unwrap().source.contains("test-command"));
+    }
+
+    #[test]
+    fn test_no_override_command_reports_inline() {
+        let config = config_from_yaml("sql_servers: []\n");
+        assert!(config.override_command().unwrap().is_none());
+        assert_eq!(config.info().unwrap().source, "inline");
+    }
+
+    #[test]
+    fn test_override_command_is_read_from_config() {
+        let config = config_from_yaml("sql_servers: []\nconfig_override_command: op read x\n");
+        assert_eq!(config.override_command().unwrap().as_deref(), Some("op read x"));
+        assert!(config.info().unwrap().source.contains("op read x"));
+    }
+
+    #[test]
+    fn test_blank_override_command_is_error() {
+        // 空文字を黙って「未設定」に倒すと、オーバーライドが効かないまま
+        // ローカル設定で動いていることに気付けない
+        let config = config_from_yaml("sql_servers: []\nconfig_override_command: \"   \"\n");
+        let err = config.override_command().unwrap_err().to_string();
+        assert!(err.contains("is empty"));
+    }
+
+    #[test]
+    fn test_non_string_override_command_is_error() {
+        // 旧方式のマッピング形式を書いてしまった場合も含め、型誤りは黙認しない
+        for yaml in [
+            "sql_servers: []\nconfig_override_command: 123\n",
+            "sql_servers: []\nconfig_override_command:\n  command: op read x\n",
+        ] {
+            let config = config_from_yaml(yaml);
+            let err = config.override_command().unwrap_err().to_string();
+            assert!(err.contains("must be a string"), "unexpected error: {err}");
+        }
+    }
+
+    #[test]
+    fn test_old_sql_servers_source_declaration_explains_migration() {
+        // 旧方式の設定のまま上げたユーザーに移行先を伝える
+        let config = config_from_yaml("sql_servers:\n  file: ~/secrets/servers.yaml\n");
+        let err = config.resolve_servers().unwrap_err().to_string();
+        assert!(err.contains("config_override_command"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_sql_servers_mapping_is_rejected() {
+        // 旧方式 (sql_servers: {command: ...}) はサポートしない
+        let config = config_from_yaml("sql_servers:\n  command: op read x\n");
+        let err = config.resolve_servers().unwrap_err().to_string();
+        assert!(err.contains("must be a list"));
     }
 
     #[test]
@@ -1567,7 +1559,7 @@ sql_servers:
     async fn test_config_template_is_valid() {
         // テンプレートはそのままで有効な設定 (接続 0 件) としてパースできること
         let config = config_from_yaml(CONFIG_TEMPLATE);
-        let servers = config.resolve_servers().await.unwrap().servers;
+        let servers = config.resolve_servers().unwrap();
         assert!(servers.is_empty());
         config.resolve_sqlfiles_dir().unwrap();
     }

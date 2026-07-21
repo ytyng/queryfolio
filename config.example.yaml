@@ -4,7 +4,7 @@
 # 開発・テスト用に QUERYFOLIO_CONFIG_YAML 環境変数でこのファイル全体の内容を
 # 上書きできる (GUI を Finder / Dock から起動した場合、shell の環境変数は渡らない)。
 
-# --- sql_servers: 形式 A (サーバー直書き。sql-agent-mcp-server 互換) ---
+# --- sql_servers (接続定義。sql-agent-mcp-server 互換) ---
 
 sql_servers:
   - name: dev-postgres
@@ -109,23 +109,22 @@ sql_servers:
 #     engine: sqlite
 #     schema: ~/data/example.sqlite3
 
-# --- sql_servers: 形式 B (ソース宣言。command / env / file のどれか 1 つだけ) ---
-# 取得した YAML は sql-agent-mcp-server 互換フォーマット
-# (sql_servers リスト + sql_server_templates) としてパースされる。
+# --- 設定を外部から上書きする (任意) ---
+# config_override_command に書いたコマンドを実行し、その stdout (YAML) を
+# この設定へ再帰的にマージする。取得した YAML 側が優先。
 #
-# 1Password から取得 (シェル非経由で実行。パイプ等は使えない):
-# sql_servers:
-#   command: op read "op://development/queryfolio/config-yaml"
+# マージ規則:
+#   - マッピング同士は再帰的に混ざる (例: ai の api_key だけ差し替え)
+#   - スカラーとリスト (sql_servers を含む) は丸ごと置き換わる
+#   - sql_servers に限らずどのキーでも上書きできる
 #
-# 環境変数から取得 (GUI 起動では環境変数が渡らないため実質 dev 専用):
-# sql_servers:
-#   env: QUERYFOLIO_CONNECTIONS_YAML
+# 取得した YAML の中に config_override_command があっても再帰取得はしない。
+# コマンドはシェル非経由で実行される (パイプやリダイレクトは使えない)。
 #
-# 別ファイルから取得:
-# sql_servers:
-#   file: ~/secrets/sql-servers.yaml
+# 1Password から取得する例:
+# config_override_command: op read "op://development/queryfolio/config-yaml"
 
-# --- 接続情報の雛形 (形式 A の時のみ有効) ---
+# --- 接続情報の雛形 ---
 # sql_servers 側で template: <名前> を指定して継承できる。
 # サーバー側で指定したキーはテンプレートの同名キーを上書きする (シャローマージ)。
 sql_server_templates:
@@ -137,8 +136,8 @@ sql_server_templates:
     password: shared_password
 
 # --- AI (自然言語 → SQL 生成) の設定 (任意) ---
-# ここ (ローカル config.yml のトップレベル)、またはソース宣言で取得する
-# 接続 YAML のトップレベルに書ける。両方にある場合は接続 YAML 側を優先する
+# ここ (ローカル config.yml のトップレベル)、または config_override_command で
+# 取得する YAML のトップレベルに書ける。マージの結果、取得 YAML 側が優先される
 # (API キーを 1Password 内の YAML に置けば、ローカルに平文で残らない)。
 # ai:
 #   provider: openai   # 現状 openai のみ対応

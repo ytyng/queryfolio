@@ -442,7 +442,7 @@
       : appStore.aiError
         ? `AI is unavailable: ${appStore.aiError}`
         : "AI is not configured. Add an 'ai:' section (provider: openai, " +
-          "api_key: ...) to config.yml or the connection YAML.",
+          "api_key: ...) to config.yml or the override YAML.",
   );
 
   // ------- 結果セルの編集 (ダブルクリック → 保留 → Preview/Edit/Submit/Cancel) -------

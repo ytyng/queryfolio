@@ -70,7 +70,7 @@
           </dd>
         </div>
         <div class="flex flex-col gap-0.5">
-          <dt class="text-zinc-500">Connection source (sql_servers)</dt>
+          <dt class="text-zinc-500">Config source</dt>
           <dd class="font-mono text-zinc-200" data-annotate="text-config-source">
             {info.source}
           </dd>

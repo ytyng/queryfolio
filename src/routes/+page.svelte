@@ -178,11 +178,11 @@
       }
     });
 
-    // メニューの Edit config.yml / Edit sql_servers config yaml からの通知
+    // メニューの Edit config.yml / View override config yaml からの通知
     const unlistenEditPromise = listen("menu-edit-config", () => {
       openConfigEditor("config");
     });
-    const unlistenEditSourcePromise = listen("menu-edit-sql-servers-source", () => {
+    const unlistenEditSourcePromise = listen("menu-view-override-config", () => {
       openConfigEditor("source");
     });
 

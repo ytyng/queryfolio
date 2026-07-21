@@ -10,6 +10,7 @@ mod schema_info;
 mod tunnel;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use config::{AppConfig, ConfigInfo, ConnectionInfo, ServerConfig};
 use db::{CancelRegistry, DbManager, DbPool, QueryResult, DEFAULT_MAX_ROWS};
@@ -18,17 +19,13 @@ use error::AppError;
 /// アプリ全体の共有状態。
 #[derive(Default)]
 struct AppState {
+    /// マージ済み設定 (config_override_command 適用後) のセッションキャッシュ。
+    /// 取得コマンドは外部プロセス実行を伴うため、毎回走らせない
+    /// (reset_connections でクリアして再取得する)。
+    config: tokio::sync::Mutex<Option<Arc<AppConfig>>>,
     /// 接続設定のキャッシュ。get_connections で更新される。
     /// パスワード等の機密を含むためフロントエンドには渡さない。
     servers: tokio::sync::Mutex<Option<Vec<ServerConfig>>>,
-    /// default_limit のセッションキャッシュ (Reload config でクリア)。
-    default_limit: tokio::sync::Mutex<Option<u64>>,
-    /// クエリファイル保存ディレクトリのセッションキャッシュ。
-    /// config.yml は手編集されるため、開いているファイルの保存中に
-    /// sqlfiles_dir が変わると未保存内容が新ディレクトリへ書かれてしまう。
-    /// 再読込 (reset_connections) まで最初に解決した値を使い続けることで、
-    /// dirty ファイルの保存先を読み込み時のディレクトリに固定する。
-    sqlfiles_dir: tokio::sync::Mutex<Option<PathBuf>>,
     db: DbManager,
     /// 実行中クエリのキャンセルレジストリ (接続名単位)。
     query_cancels: CancelRegistry,
@@ -44,30 +41,37 @@ struct AppState {
 }
 
 impl AppState {
-    async fn resolve_default_limit(&self) -> Result<u64, AppError> {
-        let mut cached = self.default_limit.lock().await;
-        if let Some(limit) = *cached {
-            return Ok(limit);
+    /// マージ済み設定を解決する (セッションキャッシュあり)。
+    /// config_override_command は 1Password 等の外部コマンドで数秒かかり
+    /// Touch ID を要求することもあるため、クエリ実行のたびに走らせない。
+    /// reset_connections でクリアされる。
+    async fn resolve_config(&self) -> Result<Arc<AppConfig>, AppError> {
+        let mut cached = self.config.lock().await;
+        if let Some(config) = cached.as_ref() {
+            return Ok(config.clone());
         }
-        let limit = AppConfig::load()?.default_limit();
-        *cached = Some(limit);
-        Ok(limit)
+        let config = Arc::new(AppConfig::load_merged().await?);
+        *cached = Some(config.clone());
+        Ok(config)
     }
 
+    async fn resolve_default_limit(&self) -> Result<u64, AppError> {
+        Ok(self.resolve_config().await?.default_limit())
+    }
+
+    /// クエリファイル保存ディレクトリを解決する。
+    /// config.yml は手編集されるため、開いているファイルの保存中に
+    /// sqlfiles_dir が変わると未保存内容が新ディレクトリへ書かれてしまう。
+    /// マージ済み設定のキャッシュが再読込 (reset_connections) まで固定される
+    /// ため、dirty ファイルの保存先も読み込み時のディレクトリに固定される。
     async fn resolve_sqlfiles_dir(&self) -> Result<PathBuf, AppError> {
-        let mut cached = self.sqlfiles_dir.lock().await;
-        if let Some(dir) = cached.as_ref() {
-            return Ok(dir.clone());
-        }
-        let dir = AppConfig::load()?.resolve_sqlfiles_dir()?;
-        *cached = Some(dir.clone());
-        Ok(dir)
+        self.resolve_config().await?.resolve_sqlfiles_dir()
     }
 
     async fn find_server(&self, connection: &str) -> Result<ServerConfig, AppError> {
         let mut servers = self.servers.lock().await;
         if servers.is_none() {
-            *servers = Some(AppConfig::load()?.resolve_servers().await?.servers);
+            *servers = Some(self.resolve_config().await?.resolve_servers()?);
         }
         servers
             .as_ref()
@@ -108,8 +112,8 @@ impl AppState {
     }
 
     /// AI 設定を解決する (キャッシュあり)。未設定なら Ok(None)。
-    /// ローカル config.yml と接続 YAML (ソース宣言で取得) の両方の
-    /// トップレベル `ai:` を見て、接続 YAML 側を優先する。
+    /// マージ済み設定のトップレベル `ai:` を見る (config_override_command で
+    /// 取得した YAML 側の ai がローカルより優先されるのはマージの結果)。
     /// 解決エラー (不明 provider 等) はキャッシュせず毎回返す
     /// (設定修正 + リロードで直せるように)。
     async fn resolve_ai_config(&self) -> Result<Option<ai::AiConfig>, AppError> {
@@ -117,12 +121,7 @@ impl AppState {
         if let Some(ai_config) = cached.as_ref() {
             return Ok(ai_config.clone());
         }
-        let config = AppConfig::load()?;
-        let resolved = config.resolve_servers().await?;
-        let ai_config =
-            ai::resolve_ai_config(config.local_ai().as_ref(), resolved.fetched_ai.as_ref())?;
-        // 同じ取得結果からサーバー一覧も得られるのでキャッシュしておく
-        *self.servers.lock().await = Some(resolved.servers);
+        let ai_config = ai::resolve_ai_config(self.resolve_config().await?.ai().as_ref())?;
         *cached = Some(ai_config.clone());
         Ok(ai_config)
     }
@@ -176,7 +175,7 @@ impl AppState {
         let ai_config = self.resolve_ai_config().await?.ok_or_else(|| {
             AppError::Ai(
                 "AI is not configured. Add an 'ai:' section (provider / api_key) \
-                 to config.yml or the connection YAML"
+                 to config.yml or the YAML fetched by config_override_command"
                     .into(),
             )
         })?;
@@ -198,17 +197,16 @@ impl AppState {
 async fn get_connections(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<ConnectionInfo>, AppError> {
-    let config = AppConfig::load()?;
-    let resolved = config.resolve_servers().await?;
-    let infos = resolved.servers.iter().map(ConnectionInfo::from).collect();
-    // 同じ取得結果から AI 設定も解決してキャッシュする (取得コマンドの
-    // 再実行を避けるため)。解決エラーはここでは接続一覧を壊さず、
-    // get_ai_info / ai_generate_sql 側の再解決で返す。
-    match ai::resolve_ai_config(config.local_ai().as_ref(), resolved.fetched_ai.as_ref()) {
+    let config = state.resolve_config().await?;
+    let servers = config.resolve_servers()?;
+    let infos = servers.iter().map(ConnectionInfo::from).collect();
+    // 同じマージ済み設定から AI 設定も解決してキャッシュする。解決エラーは
+    // ここでは接続一覧を壊さず、get_ai_info / ai_generate_sql 側の再解決で返す。
+    match ai::resolve_ai_config(config.ai().as_ref()) {
         Ok(ai_config) => *state.ai.lock().await = Some(ai_config),
         Err(_) => *state.ai.lock().await = None,
     }
-    *state.servers.lock().await = Some(resolved.servers);
+    *state.servers.lock().await = Some(servers);
     Ok(infos)
 }
 
@@ -219,13 +217,12 @@ async fn reset_connections(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), AppError> {
+    *state.config.lock().await = None;
     *state.servers.lock().await = None;
-    *state.sqlfiles_dir.lock().await = None;
-    *state.default_limit.lock().await = None;
     *state.ai.lock().await = None;
     state.db.reset().await;
     state.schema_cache.clear().await;
-    // 設定を編集して sql_servers のソース宣言が変わることがあるため、
+    // 設定を編集して config_override_command の有無が変わることがあるため、
     // コピー用ビュー (保存不可) のメニュー項目の要否を再判定する
     rebuild_menu(&app);
     Ok(())
@@ -800,7 +797,7 @@ async fn ai_explain_plan(
     let ai_config = state.resolve_ai_config().await?.ok_or_else(|| {
         AppError::Ai(
             "AI is not configured. Add an 'ai:' section (provider / api_key) \
-             to config.yml or the connection YAML"
+             to config.yml or the YAML fetched by config_override_command"
                 .into(),
         )
     })?;
@@ -847,9 +844,17 @@ async fn ai_explain_sql(
 }
 
 /// 設定の解決結果を返す (情報表示用。機密を含まない)。
+/// マージ済み設定 (キャッシュ) から作るので、config_override_command で
+/// 上書きされた sqlfiles_dir 等も実際に使われている値が表示される。
+/// キャッシュ経由なので取得コマンドがモーダルを開くたびに走ることはない。
 #[tauri::command]
-fn get_config_info() -> ConfigInfo {
-    config::config_info()
+async fn get_config_info(state: tauri::State<'_, AppState>) -> Result<ConfigInfo, AppError> {
+    Ok(match state.resolve_config().await {
+        Ok(config) => config
+            .info()
+            .unwrap_or_else(|e| config::config_info_error(&e)),
+        Err(e) => config::config_info_error(&e),
+    })
 }
 
 /// config.yml が無ければテンプレートを作成する。作成した場合はそのパスを返す。
@@ -870,11 +875,11 @@ fn write_config_file(content: String) -> Result<String, AppError> {
     config::write_config_file(&content)
 }
 
-/// sql_servers のソース宣言 command を実行して取得した生の YAML を返す
+/// config_override_command を実行して取得した生の YAML を返す
 /// (コピー用ビュー用。表示先では編集できるが保存はしない)。
 #[tauri::command]
-async fn read_sql_servers_source_yaml() -> Result<String, AppError> {
-    config::fetch_sql_servers_source_yaml().await
+async fn read_override_config_yaml() -> Result<String, AppError> {
+    config::fetch_override_config_yaml().await
 }
 
 /// アプリのメニューバーを組み立てる。
@@ -884,8 +889,8 @@ async fn read_sql_servers_source_yaml() -> Result<String, AppError> {
 /// tauri のデフォルトメニューを流用せず、アプリメニューを含めて丸ごと自前で組み、
 /// Builder::menu で最初の設置時から渡す。設定変更時はこの関数で組み直す。
 ///
-/// 「Edit sql_servers config yaml (Copy only)」は sql_servers がソース宣言の
-/// `command:` の時だけ出す。
+/// 「View override config yaml (Copy only)」は config_override_command が
+/// 設定されている時だけ出す。
 ///
 /// 構成は tauri の `Menu::default` を踏襲する (アプリメニュー / View は macOS のみ、
 /// File の quit は macOS 以外のみ)。アプリメニューを持たないプラットフォームでは
@@ -909,11 +914,11 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
     let edit_config_item =
         MenuItemBuilder::with_id("edit_config_file", "Edit config.yml").build(app)?;
     let edit_source_item = MenuItemBuilder::with_id(
-        "edit_sql_servers_source",
-        "Edit sql_servers config yaml (Copy only)",
+        "view_override_config",
+        "View override config yaml (Copy only)",
     )
     .build(app)?;
-    let show_source_item = config::sql_servers_source_is_command();
+    let show_source_item = config::has_config_override_command();
 
     #[cfg(target_os = "macos")]
     let app_menu = {
@@ -1017,7 +1022,7 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
 }
 
 /// 設定を読み直した後にメニューを組み直す。
-/// sql_servers のソース宣言が変わるとコピー用ビューの項目の要否も変わるため。
+/// config_override_command の有無が変わるとコピー用ビューの項目の要否も変わるため。
 fn rebuild_menu(app: &tauri::AppHandle) {
     match build_menu(app).and_then(|menu| app.set_menu(menu)) {
         Ok(_) => {}
@@ -1065,9 +1070,9 @@ pub fn run() {
                     eprintln!("[menu] failed to emit edit config event: {e}");
                 }
             }
-            "edit_sql_servers_source" => {
-                if let Err(e) = app.emit("menu-edit-sql-servers-source", ()) {
-                    eprintln!("[menu] failed to emit edit sql_servers source event: {e}");
+            "view_override_config" => {
+                if let Err(e) = app.emit("menu-view-override-config", ()) {
+                    eprintln!("[menu] failed to emit view override config event: {e}");
                 }
             }
             _ => {}
@@ -1105,7 +1110,7 @@ pub fn run() {
             ensure_config_file,
             read_config_file,
             write_config_file,
-            read_sql_servers_source_yaml,
+            read_override_config_yaml,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

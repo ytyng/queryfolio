@@ -19,14 +19,14 @@
   import { oneDark } from "@codemirror/theme-one-dark";
   import {
     readConfigFile,
-    readSqlServersSourceYaml,
+    readOverrideConfigYaml,
     writeConfigFile,
   } from "$lib/api";
   import appStore from "$lib/stores/app.svelte";
 
   interface Props {
     /// "config" = config.yml を編集・保存する。
-    /// "source" = sql_servers のソース宣言 command が返す YAML を表示する。
+    /// "source" = config_override_command が返す YAML を表示する。
     ///            編集はできるがメモリ上だけで、保存はできない (コピーして使う想定)。
     mode: "config" | "source";
     onClose: () => void;
@@ -39,7 +39,7 @@
   /// source モードは取得元が外部コマンドなので書き戻せない。編集自体は許可する。
   const canSave = $derived(mode === "config");
   const title = $derived(
-    mode === "config" ? "Edit config.yml" : "sql_servers config yaml (Copy only)",
+    mode === "config" ? "Edit config.yml" : "Override config yaml (Copy only)",
   );
 
   let editorElement = $state<HTMLDivElement | null>(null);
@@ -142,7 +142,7 @@
   const load = async () => {
     try {
       const text =
-        mode === "config" ? await readConfigFile() : await readSqlServersSourceYaml();
+        mode === "config" ? await readConfigFile() : await readOverrideConfigYaml();
       createEditor(text);
     } catch (e) {
       loadError = String(e);
@@ -245,9 +245,9 @@
 
     {#if !canSave}
       <p class="text-xs text-zinc-400">
-        This YAML comes from the sql_servers command source declaration. You can edit it
-        here, but the changes stay in memory and are never saved. Copy the result and store
-        it where it is managed.
+        This YAML comes from config_override_command. You can edit it here, but the
+        changes stay in memory and are never saved. Copy the result and store it where it
+        is managed.
       </p>
     {/if}
 
