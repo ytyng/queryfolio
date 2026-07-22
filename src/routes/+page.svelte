@@ -230,9 +230,16 @@
       // 知らせ、起動時指定 + 起動中に溜まった開く対象をまとめて受け取って開く。
       // 以降の指定は open-query-file イベントで直接届く (取りこぼさない)。
       try {
-        const targets = await frontendReady();
+        const { targets, errors } = await frontendReady();
         for (const target of targets) {
           await appStore.openFileByTarget(target.connection, target.fileName);
+        }
+        // 起動時指定の解決に失敗した分はトーストで知らせる (GUI 起動では
+        // stderr が見えず、握り潰すとユーザーの明示的な指定が無反応になる)。
+        for (const message of errors) {
+          toast.error("Failed to open the requested file", {
+            description: message,
+          });
         }
       } catch (e) {
         toast.error("Failed to open the requested file", {

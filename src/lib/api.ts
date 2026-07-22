@@ -241,11 +241,19 @@ export interface OpenTarget {
   fileName: string;
 }
 
+/// frontend_ready の戻り値 (バックエンドの LaunchResult に対応)。
+export interface LaunchResult {
+  /// 開く対象 (起動時指定 + 起動中に届いた分)
+  targets: OpenTarget[];
+  /// 起動時指定の解決に失敗した理由 (トーストで表示する)
+  errors: string[];
+}
+
 /// フロントの listener 登録完了を知らせ、それまでに溜まった開く対象
-/// (起動時の deep link / CLI 指定 + 起動中に届いた分) をまとめて受け取る。
-/// 呼び出し後は以降の指定が open-query-file イベントで直接届く。onMount で
-/// listener を登録した直後に 1 度だけ呼ぶ。
-export const frontendReady = () => invoke<OpenTarget[]>("frontend_ready");
+/// (起動時の deep link / CLI 指定 + 起動中に届いた分) と、起動時指定の解決に
+/// 失敗した理由をまとめて受け取る。呼び出し後は以降の指定が open-query-file
+/// イベントで直接届く。onMount で listener を登録した直後に 1 度だけ呼ぶ。
+export const frontendReady = () => invoke<LaunchResult>("frontend_ready");
 
 export const getConfigInfo = () => invoke<ConfigInfo>("get_config_info");
 

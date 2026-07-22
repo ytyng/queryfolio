@@ -993,9 +993,21 @@ async fn write_export_file(path: String, contents: String) -> Result<(), AppErro
     Ok(())
 }
 
+/// frontend_ready の戻り値。開く対象と、起動時指定の解決に失敗したエラーメッセージ。
+/// GUI 起動では stderr が見えないため、失敗はフロントへ返してトーストで知らせる。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LaunchResult {
+    /// 開く対象 (起動時指定 + 起動中にキューされた分)。
+    targets: Vec<router::OpenTarget>,
+    /// 起動時指定 (launch route) の解決に失敗した理由 (無ければ空)。
+    errors: Vec<String>,
+}
+
 /// フロントの listener 登録が済んだことを知らせ、それまでに溜まった「開く対象」を
 /// まとめて受け取る。フロントは onMount で listener を登録した直後にこれを呼び、
-/// 返った各対象について接続を選択してファイルを開く。内訳は次の 2 つ:
+/// 返った各対象について接続を選択してファイルを開き、errors はトーストで知らせる。
+/// targets の内訳は次の 2 つ:
 /// (1) 起動時に deep link / CLI で指定された launch route (解決してから返す)、
 /// (2) 起動中 (ready 前) に届いてキューされた実行中ルートの解決済み対象。
 /// 呼び出し後は ready = true になり、以降の実行中ルートは `open-query-file` イベントで
@@ -1003,16 +1015,18 @@ async fn write_export_file(path: String, contents: String) -> Result<(), AppErro
 #[tauri::command]
 async fn frontend_ready(
     state: tauri::State<'_, AppState>,
-) -> Result<Vec<router::OpenTarget>, AppError> {
+) -> Result<LaunchResult, AppError> {
     let mut targets = Vec::new();
+    let mut errors = Vec::new();
     // (1) 起動時指定 (launch route)。このプロセスの cwd 基準で解決する (None)。
     //     std Mutex は await をまたいで保持しない (take だけして即解放)。
     let launch = state.launch_route.lock().unwrap().take();
     if let Some(route) = launch {
         match state.resolve_route_target(&route, None).await {
             Ok(target) => targets.push(target),
-            // 起動時指定が解決できなくても他の対象・起動は止めない (ログのみ)
-            Err(e) => eprintln!("[router] launch route failed: {e}"),
+            // 起動時指定が失敗したら、GUI 起動では stderr が見えないためフロントへ
+            // 返してトーストで知らせる (握り潰さない)。他の対象・起動は止めない。
+            Err(e) => errors.push(e.to_string()),
         }
     }
     // (2) ready にして、それまでにキューされた対象を drain する。
@@ -1024,7 +1038,7 @@ async fn frontend_ready(
         std::mem::take(&mut live.pending)
     };
     targets.append(&mut queued);
-    Ok(targets)
+    Ok(LaunchResult { targets, errors })
 }
 
 /// `file` をシンボリックリンク解決込みで canonicalize し、`base` (これも
