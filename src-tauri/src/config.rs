@@ -196,10 +196,24 @@ fn tighten_config_permissions(path: &std::path::Path) -> Result<(), AppError> {
 /// SSH トンネル設定。sql-agent-mcp-server の config.yaml と互換。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SshTunnelConfig {
+    /// SSH host. Not required when `ssh_config` is set (the host is then taken
+    /// from the ~/.ssh/config alias by the system ssh client).
+    #[serde(default)]
     pub host: String,
     #[serde(default = "default_ssh_port")]
     pub port: u16,
+    /// SSH user. Not required when `ssh_config` is set (resolved from
+    /// ~/.ssh/config).
+    #[serde(default)]
     pub user: String,
+    /// queryfolio extension: when set, delegate the tunnel to the system `ssh`
+    /// client using this ~/.ssh/config Host alias (`ssh -N -L`). This enables
+    /// ProxyJump / multi-hop tunnels and full ssh_config resolution
+    /// (HostName / User / Port / ProxyJump). When set, the libssh2 fields
+    /// (host / user / password / private_key_* / identity_agent) are ignored;
+    /// authentication and host-key checking are handled entirely by OpenSSH.
+    #[serde(default)]
+    pub ssh_config: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
     #[serde(default)]
@@ -315,6 +329,10 @@ pub struct SshTunnelInfo {
     pub host: String,
     pub port: u16,
     pub user: String,
+    /// queryfolio extension: the ~/.ssh/config Host alias when the tunnel is
+    /// delegated to the system ssh client. null in the libssh2 mode (host /
+    /// port / user are used instead).
+    pub ssh_config: Option<String>,
 }
 
 impl From<&SshTunnelConfig> for SshTunnelInfo {
@@ -323,6 +341,11 @@ impl From<&SshTunnelConfig> for SshTunnelInfo {
             host: tunnel.host.clone(),
             port: tunnel.port,
             user: tunnel.user.clone(),
+            ssh_config: tunnel
+                .ssh_config
+                .as_ref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
         }
     }
 }
@@ -857,7 +880,7 @@ fn supplemented_path() -> String {
     supplement_path(&std::env::var("PATH").unwrap_or_default())
 }
 
-fn supplement_path(base: &str) -> String {
+pub(crate) fn supplement_path(base: &str) -> String {
     let mut path = base.to_string();
     for extra in ["/opt/homebrew/bin", "/usr/local/bin"] {
         let already = base.split(':').any(|p| p == extra);

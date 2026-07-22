@@ -70,7 +70,12 @@ overwritten. No secrets (passwords, SSH keys) are included.\n\n",
     ));
 
     let ssh = match server.ssh_tunnel.as_ref() {
-        Some(t) => format!("via {}@{}:{}", t.user, t.host, t.port),
+        Some(t) => match t.ssh_config.as_deref() {
+            Some(alias) if !alias.trim().is_empty() => {
+                format!("via ssh_config host '{}'", alias.trim())
+            }
+            _ => format!("via {}@{}:{}", t.user, t.host, t.port),
+        },
         None => "no".to_string(),
     };
     out.push_str(&format!("- **SSH tunnel:** {ssh}\n"));
@@ -162,6 +167,7 @@ mod tests {
             host: "bastion.example.com".to_string(),
             port: 22,
             user: "tunnel".to_string(),
+            ssh_config: None,
             password: Some("tunnelpass".to_string()),
             private_key_path: Some("/home/me/.ssh/id_ed25519".to_string()),
             private_key_passphrase: Some("keypass".to_string()),

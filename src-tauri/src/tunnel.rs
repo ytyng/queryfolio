@@ -1,9 +1,10 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ssh2::Session;
 
@@ -27,11 +28,18 @@ const PUMP_IDLE_SLEEP: Duration = Duration::from_millis(5);
 pub struct SshTunnel {
     pub local_port: u16,
     shutdown: Arc<AtomicBool>,
+    /// Some when the tunnel is delegated to the system `ssh` client
+    /// (ssh_tunnel.ssh_config mode). Killed on drop to tear the tunnel down.
+    child: Option<Child>,
 }
 
 impl Drop for SshTunnel {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -49,6 +57,26 @@ impl SshTunnel {
         target_host: &str,
         target_port: u16,
     ) -> Result<Self, AppError> {
+        // ssh_tunnel.ssh_config が設定されていれば system ssh に委譲する
+        // (ProxyJump / 多段トンネル / ~/.ssh/config 解決のため)。
+        if let Some(alias) = ssh_config.ssh_config.as_deref() {
+            let alias = alias.trim();
+            if alias.is_empty() {
+                return Err(AppError::Config(
+                    "ssh_tunnel.ssh_config must not be empty".into(),
+                ));
+            }
+            return start_system_ssh(alias, target_host, target_port);
+        }
+
+        // libssh2 経路: host は必須。
+        if ssh_config.host.trim().is_empty() {
+            return Err(AppError::Config(
+                "ssh_tunnel requires 'host' (or set 'ssh_config' to delegate to system ssh)"
+                    .into(),
+            ));
+        }
+
         // 認証情報の検証を兼ねた接続テスト
         establish_session(ssh_config)?;
 
@@ -71,8 +99,126 @@ impl SshTunnel {
         Ok(Self {
             local_port,
             shutdown,
+            child: None,
         })
     }
+}
+
+/// system の `ssh` クライアントで `-N -L` ローカルフォワードトンネルを張る。
+///
+/// `ssh_tunnel.ssh_config` (=~/.ssh/config の Host エイリアス) 指定時に使う。
+/// HostName / User / Port / ProxyJump / 多段トンネルの解決は OpenSSH と
+/// ~/.ssh/config に委譲する (libssh2 経路は使わない)。認証・ホスト鍵検証も
+/// OpenSSH 任せ。BatchMode=yes でパスワード/パスフレーズ/ホスト鍵確認の
+/// 対話プロンプトを禁じ (GUI 起動で TTY が無く固まるのを防ぐ)、agent 認証
+/// (1Password 等) は agent 側で処理されるため影響しない。
+fn start_system_ssh(
+    alias: &str,
+    target_host: &str,
+    target_port: u16,
+) -> Result<SshTunnel, AppError> {
+    // ローカルの空きポートを自分で確保してから ssh に渡す。
+    // (ssh -L の port 0 動的割当は割当ポートの読み取りが面倒なため)
+    let local_port = {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        // listener を閉じてから ssh に bind させる (わずかな race はあるが許容)
+        drop(listener);
+        port
+    };
+
+    let forward = format!("127.0.0.1:{local_port}:{target_host}:{target_port}");
+    let connect_timeout_secs = (SSH_TIMEOUT_MS / 1000).max(1);
+    let path = crate::config::supplement_path(&std::env::var("PATH").unwrap_or_default());
+    let mut child = Command::new("ssh")
+        .arg("-N")
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg(format!("ConnectTimeout={connect_timeout_secs}"))
+        .arg("-L")
+        .arg(&forward)
+        .arg(alias)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .env("PATH", path)
+        .spawn()
+        .map_err(|e| AppError::SshTunnel(format!("Failed to launch ssh: {e}")))?;
+
+    // stderr は別スレッドで吸い出す (パイプ詰まりで ssh が止まるのを防ぎ、
+    // 失敗時の診断メッセージも拾えるようにする)。
+    let stderr_buf = Arc::new(Mutex::new(String::new()));
+    let mut drain = child.stderr.take().map(|mut err| {
+        let buf = Arc::clone(&stderr_buf);
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = err.read_to_string(&mut s);
+            if let Ok(mut guard) = buf.lock() {
+                guard.push_str(&s);
+            }
+        })
+    });
+
+    // 失敗時の診断メッセージを組む前に drain スレッドの完了を待つ。
+    // ssh が即終了すると try_wait() が drain スレッドの書き込みより先に exit を
+    // 観測し得るため、join せずに読むとメッセージが空になる (診断が最も要る場面で)。
+    // 呼び出し時点で child は既に終了 (= stderr が EOF) しているので join は即返る。
+    let collect_stderr = |drain: &mut Option<std::thread::JoinHandle<()>>| {
+        if let Some(handle) = drain.take() {
+            let _ = handle.join();
+        }
+        stderr_buf
+            .lock()
+            .ok()
+            .map(|g| g.trim().to_string())
+            .unwrap_or_default()
+    };
+
+    // ローカルのフォワードポートが接続を受け付けるまで待つ。
+    // OpenSSH は接続先への認証・フォワード確立に成功して初めてローカルの
+    // listen ソケットを開く (ExitOnForwardFailure=yes で失敗時は即終了する)
+    // ため、接続できた時点で認証成功とみなせる (libssh2 経路の
+    // establish_session による事前検証と同じ役割)。
+    let start = Instant::now();
+    let timeout = Duration::from_millis(SSH_TIMEOUT_MS as u64);
+    let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], local_port));
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(AppError::SshTunnel(format!(
+                    "ssh tunnel via '{alias}' exited ({status}): {}",
+                    collect_stderr(&mut drain)
+                )));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(AppError::SshTunnel(format!("Failed to poll ssh: {e}")));
+            }
+        }
+        if TcpStream::connect_timeout(&loopback, Duration::from_millis(500)).is_ok() {
+            break;
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(AppError::SshTunnel(format!(
+                "Timed out establishing ssh tunnel via '{alias}': {}",
+                collect_stderr(&mut drain)
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    Ok(SshTunnel {
+        local_port,
+        shutdown: Arc::new(AtomicBool::new(false)),
+        child: Some(child),
+    })
 }
 
 fn accept_loop(
@@ -1060,6 +1206,7 @@ mod tests {
             host: "db.example.com".into(),
             port: 22,
             user: "u".into(),
+            ssh_config: None,
             password: None,
             private_key_path: None,
             private_key_passphrase: None,
@@ -1072,5 +1219,53 @@ mod tests {
             ..cfg
         };
         assert!(matches!(resolve_agent_socket(&cfg), AgentSocket::Path(_)));
+    }
+
+    /// ssh_config だけ書いた設定が host / user 無しでデシリアライズできること。
+    #[test]
+    fn ssh_config_only_deserializes_without_host_user() {
+        let cfg: SshTunnelConfig =
+            serde_yaml::from_str("ssh_config: pop-three-ec2-staging\n").unwrap();
+        assert_eq!(cfg.ssh_config.as_deref(), Some("pop-three-ec2-staging"));
+        assert!(cfg.host.is_empty());
+        assert!(cfg.user.is_empty());
+    }
+
+    /// ssh_config が空文字なら spawn せずにエラーを返すこと。
+    #[test]
+    fn start_rejects_empty_ssh_config() {
+        let cfg = SshTunnelConfig {
+            host: String::new(),
+            port: 22,
+            user: String::new(),
+            ssh_config: Some("   ".into()),
+            password: None,
+            private_key_path: None,
+            private_key_passphrase: None,
+            identity_agent: None,
+        };
+        assert!(matches!(
+            SshTunnel::start(&cfg, "localhost", 5432),
+            Err(AppError::Config(_))
+        ));
+    }
+
+    /// ssh_config も host も無ければ (libssh2 経路で host 必須) エラーを返すこと。
+    #[test]
+    fn start_requires_host_without_ssh_config() {
+        let cfg = SshTunnelConfig {
+            host: String::new(),
+            port: 22,
+            user: "u".into(),
+            ssh_config: None,
+            password: None,
+            private_key_path: None,
+            private_key_passphrase: None,
+            identity_agent: None,
+        };
+        assert!(matches!(
+            SshTunnel::start(&cfg, "localhost", 5432),
+            Err(AppError::Config(_))
+        ));
     }
 }

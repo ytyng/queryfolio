@@ -45,7 +45,10 @@
     }
     if (c.ssh_tunnel) {
       const t = c.ssh_tunnel;
-      rows.push({ label: "SSH", value: `${t.user}@${t.host}:${t.port}` });
+      const value = t.ssh_config
+        ? `ssh_config: ${t.ssh_config}`
+        : `${t.user}@${t.host}:${t.port}`;
+      rows.push({ label: "SSH", value });
     }
     if (c.group_name) rows.push({ label: "Group", value: c.group_name });
     if (c.description) rows.push({ label: "Description", value: c.description });
