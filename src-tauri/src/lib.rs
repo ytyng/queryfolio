@@ -97,16 +97,24 @@ impl AppState {
     ) -> Result<router::OpenTarget, AppError> {
         match route {
             router::Route::OpenFile { path } => {
+                // sqlfiles_dir は「アプリプロセスのカレントディレクトリ」で絶対化する。
+                // 設定が相対 sqlfiles_dir の場合、実際のファイル I/O (query_files) と
+                // verify_within_dir はアプリプロセスの cwd 基準で解決されるため、
+                // パス検証の base もそこに揃える (実行中インスタンスへ渡る起動元 cwd と
+                // 混同しない)。std::path::absolute は FS に触れない字句的絶対化。
                 let sqlfiles_dir = self.resolve_sqlfiles_dir().await?;
+                let sqlfiles_dir =
+                    std::path::absolute(&sqlfiles_dir).unwrap_or(sqlfiles_dir);
                 let folders = self.folder_connection_map().await?;
                 let home = dirs::home_dir();
-                let cwd = cwd.or_else(|| std::env::current_dir().ok());
+                // 生の入力パスの相対解決だけは cwd (実行中インスタンスなら起動元) 基準。
+                let raw_cwd = cwd.or_else(|| std::env::current_dir().ok());
                 let target = router::resolve_open_target(
                     &sqlfiles_dir,
                     &folders,
                     path,
                     home.as_deref(),
-                    cwd.as_deref(),
+                    raw_cwd.as_deref(),
                 )
                 .map_err(|e| AppError::QueryFile(e.to_string()))?;
                 // 多重防御: 字句検証 (router) を通っても、接続フォルダやファイルが
