@@ -670,6 +670,19 @@ async fn get_active_schema(
     Ok(server.schema)
 }
 
+/// 指定接続のプールと SSH トンネルを破棄する。
+/// この接続のエディタタブが全て閉じられた時にフロントから呼ぶ。
+/// 接続設定・アクティブスキーマの選択は残るため、次に必要になった時
+/// (ファイルを開く / スキーマブラウザを開く / クエリ実行) に自動で張り直される。
+#[tauri::command]
+async fn disconnect(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+) -> Result<(), AppError> {
+    state.db.disconnect(&connection).await;
+    Ok(())
+}
+
 /// 接続先のテーブル / ビューの一覧を返す (キャッシュあり)。
 /// refresh = true でキャッシュを破棄して再取得する (リロードボタン用)。
 #[tauri::command]
@@ -1391,6 +1404,7 @@ pub fn run() {
             list_schemas,
             set_active_schema,
             get_active_schema,
+            disconnect,
             list_tables,
             list_columns,
             get_schema_map,

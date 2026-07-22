@@ -58,6 +58,10 @@
       }
       tables = result;
       loadError = null;
+      // スキーマブラウザを開いた = 接続を使う契機。listTables で既にトンネルは
+      // 開いているので、この機会にスキーマ一覧・補完マップも取り込んでおく
+      // (接続選択だけでは張らない方針のため、選択時点では未取得)。
+      void appStore.ensureConnectionResources(connection);
     } catch (e) {
       if (generation !== loadGeneration) {
         return;
