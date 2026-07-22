@@ -387,7 +387,18 @@ const ensureConnectionResources = async (connection: string) => {
   // 成功前に登録すると、失敗接続を「確立済み」と誤認して再試行を取りこぼすため、
   // listSchemas (これが接続を張る) が成功してから登録する。
   if (await loadConnectionSchemaResources(connection)) {
-    resourcesLoaded.add(connection);
+    // 取得を待つ間にこの接続が切断されている場合がある: 最後のエディタタブを閉じた
+    // (removeEditorTab) か、スキーマブラウザだけ開いた接続から別接続へ切り替えた
+    // (selectConnection) と、maybeDisconnectIfIdle がプール/トンネルを破棄する。
+    // 破棄済みの接続を resourcesLoaded に入れると「確立済み」と誤認され、次の選択で
+    // 即座にスキーマ取得 (= トンネルを張る) してしまい遅延ライフサイクルが崩れる。
+    // まだ選択中か、エディタタブが残っている (= まだ生きている) 時だけ登録する。
+    if (
+      selectedConnection === connection ||
+      editorTabs.some((t) => t.connection === connection)
+    ) {
+      resourcesLoaded.add(connection);
+    }
   }
 };
 
