@@ -514,10 +514,17 @@ const activateEditorTab = async (id: number) => {
   // (書込不可などで保存に失敗しても未保存 SQL を閲覧・コピーできるようにする。
   //  タブは残るので内容は失われない)
   await flushPendingSave();
+  const previous = selectedConnection;
   if (tab.connection !== selectedConnection) {
     // より新しい切替に追い越されたら、このタブをアクティブにしない
     if (!(await applyConnectionContext(tab.connection))) {
       return;
+    }
+    // タブのアクティブ化も接続を切り替える経路。切替元がスキーマブラウザだけで開いた
+    // (エディタタブの無い) 接続なら、selectConnection と同様にここでも閉じる。
+    // このパスを塞がないと、TABLES だけ開いた接続のトンネルが貼りっぱなしになる。
+    if (previous) {
+      maybeDisconnectIfIdle(previous);
     }
   }
   activeEditorTabId = id;
