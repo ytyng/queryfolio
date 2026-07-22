@@ -6,6 +6,7 @@ mod meta_commands;
 mod error;
 mod folder_meta;
 mod query_files;
+mod router;
 mod schema_info;
 mod tunnel;
 
@@ -38,6 +39,11 @@ struct AppState {
     /// 外側の None は未解決を表す。api_key を含むためフロントには渡さず、
     /// get_ai_info で configured / model のみを返す。
     ai: tokio::sync::Mutex<Option<Option<ai::AiConfig>>>,
+    /// 起動時に `queryfolio://` deep link / CLI サブコマンドで指定された
+    /// 開くべきルート (無ければ None)。フロントが起動後に take_launch_target で
+    /// 1 度だけ取り出す (取り出すと消える)。実行中に開かれたルートはイベントで
+    /// 直接フロントへ届けるため、ここには積まない。
+    launch_route: std::sync::Mutex<Option<router::Route>>,
 }
 
 impl AppState {
@@ -66,6 +72,53 @@ impl AppState {
     /// ため、dirty ファイルの保存先も読み込み時のディレクトリに固定される。
     async fn resolve_sqlfiles_dir(&self) -> Result<PathBuf, AppError> {
         self.resolve_config().await?.resolve_sqlfiles_dir()
+    }
+
+    /// クエリファイルの保存フォルダ名 → 接続名の対応表を作る (設定順)。
+    /// `queryfolio://open/<path>` / CLI で指定されたパスから、そのファイルが
+    /// どの接続のものかを解決するために使う (router::resolve_open_target)。
+    async fn folder_connection_map(&self) -> Result<Vec<(String, String)>, AppError> {
+        let servers = self.resolve_config().await?.resolve_servers()?;
+        Ok(servers
+            .iter()
+            .map(|s| (s.sqlfiles_folder_name(), s.name.clone()))
+            .collect())
+    }
+
+    /// ルート (deep link / CLI) を、開く対象のクエリファイル (接続 + ファイル名) へ
+    /// 解決する。保存ディレクトリ配下の接続フォルダにある `.sql` でなければエラー。
+    async fn resolve_route_target(
+        &self,
+        route: &router::Route,
+    ) -> Result<router::OpenTarget, AppError> {
+        match route {
+            router::Route::OpenFile { path } => {
+                let sqlfiles_dir = self.resolve_sqlfiles_dir().await?;
+                let folders = self.folder_connection_map().await?;
+                let home = dirs::home_dir();
+                let cwd = std::env::current_dir().ok();
+                let target = router::resolve_open_target(
+                    &sqlfiles_dir,
+                    &folders,
+                    path,
+                    home.as_deref(),
+                    cwd.as_deref(),
+                )
+                .map_err(|e| AppError::QueryFile(e.to_string()))?;
+                // 多重防御: 字句検証 (router) を通っても、接続フォルダやファイルが
+                // シンボリックリンクで保存領域外の実体を指していることがある。
+                // 実際に開くパス (sqlfiles_dir/<folder>/<file>) を canonicalize して、
+                // リンク解決後も保存ディレクトリ配下に留まることを確かめる
+                // (「queryfolio のデータ保存パスのみ対象」の要件を実体レベルで担保)。
+                let folder = self
+                    .find_server(&target.connection)
+                    .await?
+                    .sqlfiles_folder_name();
+                let concrete = sqlfiles_dir.join(&folder).join(&target.file_name);
+                verify_within_dir(&sqlfiles_dir, &concrete)?;
+                Ok(target)
+            }
+        }
     }
 
     async fn find_server(&self, connection: &str) -> Result<ServerConfig, AppError> {
@@ -913,6 +966,65 @@ async fn write_export_file(path: String, contents: String) -> Result<(), AppErro
     Ok(())
 }
 
+/// 起動時に `queryfolio://` deep link / CLI サブコマンドで指定された「開く対象」を
+/// 1 度だけ取り出して解決する。フロントは起動直後 (onMount) にこれを呼び、非 null
+/// なら接続を選択してそのファイルを開く。取り出すと消えるので二重に開かない。
+/// (実行中に開かれたルートは `open-query-file` イベントで届くため、こちらには来ない)
+#[tauri::command]
+async fn take_launch_target(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<router::OpenTarget>, AppError> {
+    // std Mutex は await をまたいで保持しない (take だけして即解放)
+    let route = state.launch_route.lock().unwrap().take();
+    match route {
+        Some(route) => Ok(Some(state.resolve_route_target(&route).await?)),
+        None => Ok(None),
+    }
+}
+
+/// `file` をシンボリックリンク解決込みで canonicalize し、`base` (これも
+/// canonicalize したもの) の配下に留まることを確かめる。保存領域外の実体を指す
+/// リンクを弾く多重防御。開く対象は既存ファイルのはずなので、canonicalize
+/// できない (存在しない等) 場合は拒否する。
+fn verify_within_dir(base: &std::path::Path, file: &std::path::Path) -> Result<(), AppError> {
+    let canonical_base = base.canonicalize().map_err(|e| {
+        AppError::QueryFile(format!("Cannot resolve the query files directory: {e}"))
+    })?;
+    let canonical_file = file
+        .canonicalize()
+        .map_err(|e| AppError::QueryFile(format!("Cannot open the file: {e}")))?;
+    if !canonical_file.starts_with(&canonical_base) {
+        return Err(AppError::QueryFile(
+            "The file resolves outside the query files directory".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// 実行中に受け取ったルート (deep link / CLI サブコマンド) を解決し、フロントへ
+/// イベントで届ける。解決は設定の読み取りを伴い async なので、別タスクで行う。
+/// 成功なら `open-query-file` に OpenTarget を、失敗なら `open-query-file-error` に
+/// エラーメッセージを載せる。
+fn dispatch_route(app: &tauri::AppHandle, route: router::Route) {
+    use tauri::{Emitter, Manager};
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        match state.resolve_route_target(&route).await {
+            Ok(target) => {
+                if let Err(e) = app.emit("open-query-file", target) {
+                    eprintln!("[router] failed to emit open-query-file: {e}");
+                }
+            }
+            Err(e) => {
+                if let Err(emit_err) = app.emit("open-query-file-error", e.to_string()) {
+                    eprintln!("[router] failed to emit open-query-file-error: {emit_err}");
+                }
+            }
+        }
+    });
+}
+
 /// アプリのメニューバーを組み立てる。
 ///
 /// macOS のアプリメニュー (QueryFolio) は NSApplication がメインメニュー設置時の
@@ -1076,6 +1188,23 @@ pub fn run() {
     use tauri::Emitter;
 
     tauri::Builder::default()
+        // single-instance は最初に登録する (プラグインは登録順に走る)。
+        // deep-link feature 有効: 2 個目の起動の argv に含まれる queryfolio:// URL は
+        // 実行中インスタンスの deep-link プラグインへ転送され on_open_url が発火する。
+        // ここでは追加で (1) ウインドウを前面化し (2) CLI サブコマンド
+        // (queryfolio open <path>) を処理する (URL 引数は上記で処理済みなので無視)。
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            use tauri::Manager;
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_focus();
+            }
+            if let Some(route) = router::route_from_cli_args(&argv) {
+                dispatch_route(app, route);
+            }
+        }))
+        // queryfolio:// スキームの deep link。macOS はネイティブに URL を受け取り、
+        // Linux/Windows は上の single-instance (deep-link feature) 経由で受け取る。
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         // 結果テーブルの Export でネイティブ保存ダイアログを開くのに使う
@@ -1111,6 +1240,44 @@ pub fn run() {
             _ => {}
         })
         .manage(AppState::default())
+        .setup(|app| {
+            use tauri::Manager;
+            use tauri_plugin_deep_link::DeepLinkExt;
+            // dev / Linux 実行向けにスキームを実行時登録する (macOS は bundle 時に
+            // Info.plist へ登録される)。ベストエフォート: 失敗しても起動は続ける。
+            if let Err(e) = app.deep_link().register_all() {
+                eprintln!("[router] failed to register deep link schemes: {e}");
+            }
+            // 実行中に URL を開かれた時のハンドラ (macOS ネイティブ / Linux 転送)。
+            let handle = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                for url in event.urls() {
+                    match router::parse_uri(url.as_str()) {
+                        Ok(route) => dispatch_route(&handle, route),
+                        Err(e) => eprintln!("[router] ignoring URL {url}: {e}"),
+                    }
+                }
+            });
+            // 起動時に指定されたルートを控える (フロントが take_launch_target で取り出す)。
+            // 優先度: deep link 起動 (macOS: get_current が URL を返す) → CLI サブコマンド。
+            let mut launch: Option<router::Route> = None;
+            if let Ok(Some(urls)) = app.deep_link().get_current() {
+                for url in urls {
+                    if let Ok(route) = router::parse_uri(url.as_str()) {
+                        launch = Some(route);
+                        break;
+                    }
+                }
+            }
+            if launch.is_none() {
+                let argv: Vec<String> = std::env::args().skip(1).collect();
+                launch = router::route_from_cli_args(&argv);
+            }
+            if launch.is_some() {
+                *app.state::<AppState>().launch_route.lock().unwrap() = launch;
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_connections,
             reset_connections,
@@ -1146,6 +1313,7 @@ pub fn run() {
             write_config_file,
             read_override_config_yaml,
             write_export_file,
+            take_launch_target,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

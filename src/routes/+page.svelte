@@ -2,7 +2,8 @@
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { toast } from "svelte-sonner";
-  import { ensureConfigFile } from "$lib/api";
+  import { ensureConfigFile, takeLaunchTarget } from "$lib/api";
+  import type { OpenTarget } from "$lib/api";
   import appStore from "$lib/stores/app.svelte";
   import Toolbar from "$lib/components/Toolbar.svelte";
   import EditorToolbar from "$lib/components/EditorToolbar.svelte";
@@ -186,6 +187,26 @@
       openConfigEditor("source");
     });
 
+    // 実行中に queryfolio:// deep link / CLI で開くよう要求された時の通知。
+    // バックエンドが保存領域配下かを検証済みの接続 / ファイル名を届ける。
+    const unlistenOpenFilePromise = listen<OpenTarget>(
+      "open-query-file",
+      (event) => {
+        void appStore.openFileByTarget(
+          event.payload.connection,
+          event.payload.fileName,
+        );
+      },
+    );
+    const unlistenOpenFileErrPromise = listen<string>(
+      "open-query-file-error",
+      (event) => {
+        toast.error("Failed to open the file", {
+          description: event.payload,
+        });
+      },
+    );
+
     void (async () => {
       try {
         const createdPath = await ensureConfigFile();
@@ -200,12 +221,25 @@
         });
       }
       await appStore.loadConnections();
+      // 起動時に deep link / CLI で開く指定があれば、接続読込後に 1 度だけ開く。
+      try {
+        const target = await takeLaunchTarget();
+        if (target) {
+          await appStore.openFileByTarget(target.connection, target.fileName);
+        }
+      } catch (e) {
+        toast.error("Failed to open the requested file", {
+          description: String(e),
+        });
+      }
     })();
 
     return () => {
       void unlistenPromise.then((unlisten) => unlisten());
       void unlistenEditPromise.then((unlisten) => unlisten());
       void unlistenEditSourcePromise.then((unlisten) => unlisten());
+      void unlistenOpenFilePromise.then((unlisten) => unlisten());
+      void unlistenOpenFileErrPromise.then((unlisten) => unlisten());
     };
   });
 </script>

@@ -232,6 +232,20 @@ export const aiExplainPlan = (
 export const aiExplainSql = (connection: string, sql: string) =>
   invoke<string>("ai_explain_sql", { connection, sql });
 
+/// `queryfolio://open/<path>` deep link / CLI で指定された「開く対象」
+/// (バックエンドの router::OpenTarget に対応)。
+export interface OpenTarget {
+  /// 対象ファイルが属する接続名
+  connection: string;
+  /// 開くファイル名 (.sql 付き)
+  fileName: string;
+}
+
+/// 起動時に deep link / CLI で指定された開く対象を 1 度だけ取り出す
+/// (無ければ null)。取り出すと消えるので二重に開かない。
+export const takeLaunchTarget = () =>
+  invoke<OpenTarget | null>("take_launch_target");
+
 export const getConfigInfo = () => invoke<ConfigInfo>("get_config_info");
 
 /// config.yml が無ければテンプレートを作成する。作成した場合はそのパスを返す。
