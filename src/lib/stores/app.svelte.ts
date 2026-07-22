@@ -183,6 +183,11 @@ const reloadConnections = async (): Promise<boolean> => {
   // 設定リロードでバックエンドは全プール/トンネルを破棄する (resetConnections)。
   // 確立済みフラグもクリアし、次の契機で張り直せるようにする。
   resourcesLoaded.clear();
+  // リロードは全接続のプールを破棄するため、in-flight のスキーマ取り込みが (どの接続の
+  // ものであれ) 破棄済みプールを「確立済み」として復活登録しないよう、全体リセット世代を
+  // 進める。接続個別の世代 (connectionLifecycleGen) では選択中でない接続の in-flight を
+  // 取りこぼすため、リセットは全接続共通のこの世代で見る。
+  connectionsResetGen++;
   // 設定が丸ごと入れ替わるため、ピン留め含め全タブを破棄する
   resultTabs = [];
   activeTabId = null;
@@ -347,32 +352,63 @@ const applyConnectionContext = async (name: string): Promise<boolean> => {
 /// (切断後もキャッシュは残るため、代用すると再オープンの契機を取りこぼす)。
 const resourcesLoaded = new Set<string>();
 
+/// 接続ごとの「切断 / リセットが起きた回数」。スキーマ取り込み (listSchemas は非同期で
+/// その間にトンネルが張られる) を待つ間に、その接続が切断されたかを検知するために使う。
+/// 取り込み開始時の値を控え、完了後に値が変わっていたら「待っている間に切断された」と分かる
+/// (状態 (selectedConnection / editorTabs) だけでは、選択中のまま最後のタブを閉じて切断された
+/// 接続と、スキーマブラウザだけで生きている選択中の接続を区別できないため、イベント回数で見る)。
+const connectionLifecycleGen = new Map<string, number>();
+const bumpConnectionLifecycle = (connection: string) => {
+  connectionLifecycleGen.set(
+    connection,
+    (connectionLifecycleGen.get(connection) ?? 0) + 1,
+  );
+};
+
+/// 設定リロード (reloadConnections → resetConnections) は全接続のプール/トンネルを一括
+/// 破棄する。個別接続の世代では「選択中でない接続の in-flight 取り込み」を取りこぼすため、
+/// リセットは全接続共通のこの世代で検知する。取り込み開始時に控え、完了後に進んでいれば
+/// 「待っている間に全体リセットされた」と分かる。
+let connectionsResetGen = 0;
+
 /// 接続のスキーマ一覧・補完マップを取り込んで UI (プルダウン / 補完) へ反映する。
-/// listSchemas がプールを取得する (= トンネルを張る) 契機。listSchemas が成功したかを
-/// 返す (呼び出し側の resourcesLoaded 管理に使う)。取得中に別接続へ切り替わっていたら
-/// 反映はスキップする (selectedConnection ガード)。resourcesLoaded 自体はここでは
-/// 触らない — 「確立済みか」の判定と「取り込み中か」を分離し、再取り込み中に切替が
-/// 走ってもライフサイクル管理 (maybeDisconnectIfIdle) と競合しないようにするため。
+/// listSchemas がプールを取得する (= トンネルを張る) 契機。listSchemas が成功し、かつ
+/// 取り込み中に切断が挟まらなかった場合に true を返す (呼び出し側の resourcesLoaded 管理に
+/// 使う)。取り込み中に別接続へ切り替わっていたら反映はスキップする (selectedConnection
+/// ガード)。resourcesLoaded 自体はここでは触らない — 「確立済みか」の判定と「取り込み中か」を
+/// 分離し、再取り込み中に切替が走ってもライフサイクル管理 (maybeDisconnectIfIdle) と
+/// 競合しないようにするため。
 const loadConnectionSchemaResources = async (
   connection: string,
 ): Promise<boolean> => {
-  let established = false;
+  const gen = connectionLifecycleGen.get(connection) ?? 0;
+  const resetGen = connectionsResetGen;
+  let loaded: string[];
   try {
-    const loaded = await api.listSchemas(connection);
-    established = true;
-    if (selectedConnection === connection) {
-      schemas = loaded;
-    }
+    loaded = await api.listSchemas(connection);
   } catch {
     // 接続失敗などは致命的でない。プルダウンは現在値のみのままにし、次の契機で再試行。
     return false;
   }
-  // 補完マップも取り込む (同じプールを使うので追加のトンネルは張らない。
-  // 失敗しても補完なしで続行)。
-  if (established && selectedConnection === connection) {
+  // 取り込みを待つ間に切断 (最後のエディタタブを閉じた / 別接続へ切替) や設定リロードが
+  // 挟まっていたら、この接続はもう生きていない。listSchemas がトンネルを開き直している
+  // 場合に備えて閉じ直し (アイドルなら)、UI 反映も確立済み登録もしない。これがないと
+  // アイドルな接続が「確立済み」として残り、遅延ライフサイクルが崩れる。切断は接続個別の
+  // 世代で、設定リロード (全接続破棄) は全体リセット世代で検知する。
+  if (
+    (connectionLifecycleGen.get(connection) ?? 0) !== gen ||
+    connectionsResetGen !== resetGen
+  ) {
+    maybeDisconnectIfIdle(connection);
+    return false;
+  }
+  if (selectedConnection === connection) {
+    schemas = loaded;
+    // 補完マップも取り込む (同じプールを使うので追加のトンネルは張らない。
+    // 失敗しても補完なしで続行)。
     void loadSchemaMap();
   }
-  return established;
+  return true;
 };
 
 /// トンネル / 接続を実際に開くべき契機 (エディタにファイルを読み込んだ時・
@@ -385,20 +421,11 @@ const ensureConnectionResources = async (connection: string) => {
     return;
   }
   // 成功前に登録すると、失敗接続を「確立済み」と誤認して再試行を取りこぼすため、
-  // listSchemas (これが接続を張る) が成功してから登録する。
+  // listSchemas (これが接続を張る) が成功してから登録する。取り込み中に切断が挟まった
+  // 場合は loadConnectionSchemaResources が false を返す (+ 開き直したトンネルを閉じ直す)
+  // ので、その時は登録しない — アイドルな接続を「確立済み」と誤認しない。
   if (await loadConnectionSchemaResources(connection)) {
-    // 取得を待つ間にこの接続が切断されている場合がある: 最後のエディタタブを閉じた
-    // (removeEditorTab) か、スキーマブラウザだけ開いた接続から別接続へ切り替えた
-    // (selectConnection) と、maybeDisconnectIfIdle がプール/トンネルを破棄する。
-    // 破棄済みの接続を resourcesLoaded に入れると「確立済み」と誤認され、次の選択で
-    // 即座にスキーマ取得 (= トンネルを張る) してしまい遅延ライフサイクルが崩れる。
-    // まだ選択中か、エディタタブが残っている (= まだ生きている) 時だけ登録する。
-    if (
-      selectedConnection === connection ||
-      editorTabs.some((t) => t.connection === connection)
-    ) {
-      resourcesLoaded.add(connection);
-    }
+    resourcesLoaded.add(connection);
   }
 };
 
@@ -416,6 +443,9 @@ const maybeDisconnectIfIdle = (connection: string) => {
     return;
   }
   resourcesLoaded.delete(connection);
+  // 切断イベントを記録する。この接続のスキーマ取り込みが in-flight なら、完了時に
+  // 「待っている間に切断された」と検知して確立済み登録を防ぐ (defeat lazy lifecycle の回避)。
+  bumpConnectionLifecycle(connection);
   // fire-and-forget。失敗しても致命的でない (次に接続を張り直す時に上書きされる) ため
   // 未処理 rejection にしないよう握り潰す。
   void api.disconnect(connection).catch(() => {});
