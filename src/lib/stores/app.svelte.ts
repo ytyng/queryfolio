@@ -180,6 +180,9 @@ const reloadConnections = async (): Promise<boolean> => {
   editorTabs = [];
   activeEditorTabId = null;
   lastActiveTabByConnection.clear();
+  // 設定リロードでバックエンドは全プール/トンネルを破棄する (resetConnections)。
+  // 確立済みフラグもクリアし、次の契機で張り直せるようにする。
+  resourcesLoaded.clear();
   // 設定が丸ごと入れ替わるため、ピン留め含め全タブを破棄する
   resultTabs = [];
   activeTabId = null;
@@ -295,15 +298,14 @@ const applyConnectionContext = async (name: string): Promise<boolean> => {
   if (generation !== connectionContextGeneration) {
     return false;
   }
-  // スキーマ一覧の取得は接続確立を伴うため、失敗しても選択自体は成立させる
-  // (エラーは結果ペインに出さず、プルダウンを現在値のみにする)
+  // アクティブスキーマの取得は接続を張らない (schema_override か設定値を返すだけ)
+  // ため選択時に行ってよい。スキーマ一覧 (listSchemas) は接続を張るので、
+  // ここでは取得しない (「選択した瞬間にトンネルが開く」のを避ける)。
   let schema = defaultSchema;
-  let loadedSchemas: string[] = [];
   try {
     schema = (await api.getActiveSchema(name)) ?? schema;
-    loadedSchemas = await api.listSchemas(name);
   } catch {
-    loadedSchemas = schema ? [schema] : [];
+    // getActiveSchema は接続を張らないが、念のため失敗時は既定スキーマのままにする
   }
   if (generation !== connectionContextGeneration) {
     return false;
@@ -319,13 +321,71 @@ const applyConnectionContext = async (name: string): Promise<boolean> => {
   errorMessage = filesError;
   files = filesError ? [] : loadedFiles;
   activeSchema = schema;
-  schemas = loadedSchemas;
-  // 補完候補は新接続のものを取り直す (世代も進め、古い取得の後追い書き込みを防ぐ)
+  // スキーマ一覧・補完マップは接続を張るため、選択時点では取得しない
+  // (「選択した瞬間にトンネルが開く」のを避ける)。プルダウンは現在のスキーマのみを
+  // 出しておき、ファイルをエディタに読み込んだ時 / スキーマブラウザを開いた時に
+  // ensureConnectionResources で全一覧・補完マップを取り込む。
+  schemas = schema ? [schema] : [];
+  // 補完候補は新接続向けに一旦クリアする (世代も進め、古い取得の後追い書き込みを防ぐ)
   schemaMapGeneration++;
   schemaMap = null;
-  // SQL 補完用のスキーママップをバックグラウンドで取得する (待たない)
-  void loadSchemaMap();
   return true;
+};
+
+/// 接続を確立済み (トンネル/プールを開き、スキーマ一覧・補完マップを取り込み済み)
+/// の接続名。ensureConnectionResources で登録し、disconnect / reset で外す。
+/// これを接続状態の真実として使い、キャッシュ (schemas 等) の有無で代用しない
+/// (切断後もキャッシュは残るため、代用すると再オープンの契機を取りこぼす)。
+const resourcesLoaded = new Set<string>();
+
+/// トンネル / 接続を実際に開くべき契機 (エディタにファイルを読み込んだ時・
+/// スキーマブラウザを開いた時) で呼ぶ。接続を確立してスキーマ一覧と補完マップを
+/// 取り込む。接続選択だけでは呼ばない (選択した瞬間にトンネルが開くのを避ける)。
+/// 既に確立済み (resourcesLoaded) なら何もしない。切断されると外れるため、
+/// 全エディタを閉じて切断した後に再度開けば、ここで確実に張り直す。
+const ensureConnectionResources = async (connection: string) => {
+  if (connection !== selectedConnection || resourcesLoaded.has(connection)) {
+    return;
+  }
+  // 成功前に登録すると、失敗接続を「確立済み」と誤認して再試行を取りこぼすため、
+  // listSchemas (これが接続を張る) が成功してから登録する。
+  let established = false;
+  try {
+    const loaded = await api.listSchemas(connection);
+    established = true;
+    if (selectedConnection === connection) {
+      schemas = loaded;
+    }
+  } catch {
+    // 接続失敗などは致命的でない。プルダウンは現在値のみのままにし、次の契機で再試行。
+  }
+  if (established) {
+    resourcesLoaded.add(connection);
+    // 補完マップも取り込む (同じプールを使うので追加のトンネルは張らない。
+    // 失敗しても補完なしで続行)。
+    if (selectedConnection === connection) {
+      void loadSchemaMap();
+    }
+  }
+};
+
+/// この接続がもう不要 (エディタタブが 1 つも無く、実行中のクエリ / セル編集も無い)
+/// なら、SSH トンネル / プールを破棄する。エディタタブを閉じた時とクエリ完了時に
+/// 呼ぶ。実行中のクエリがある間は破棄しない (トンネルを途中で切ると実行中クエリの
+/// コネクションが壊れるため)。schema_override はバックエンドに残るので、張り直し後も
+/// 同じアクティブスキーマで繋がる。次にファイルを開く / スキーマブラウザを開く /
+/// クエリを実行した時に自動で張り直される。
+const maybeDisconnectIfIdle = (connection: string) => {
+  if (editorTabs.some((t) => t.connection === connection)) {
+    return;
+  }
+  if (isConnectionRunning(connection)) {
+    return;
+  }
+  resourcesLoaded.delete(connection);
+  // fire-and-forget。失敗しても致命的でない (次に接続を張り直す時に上書きされる) ため
+  // 未処理 rejection にしないよう握り潰す。
+  void api.disconnect(connection).catch(() => {});
 };
 
 /// 接続に紐づくエディタタブのうち、アクティブに復元すべきものを選ぶ。
@@ -431,6 +491,9 @@ const selectFile = async (fileName: string) => {
   );
   if (existing) {
     await activateEditorTab(existing.id);
+    // ファイルをエディタで開いた = 接続を使う契機。トンネル/接続を張り直す
+    // (全エディタを閉じて切断した後に再度開いた場合もここで復帰する)。
+    void ensureConnectionResources(connection);
     return;
   }
   // 未保存タブは best-effort で保存 (失敗してもファイルオープンは止めない)
@@ -453,6 +516,9 @@ const selectFile = async (fileName: string) => {
     activeEditorTabId = tab.id;
     lastActiveTabByConnection.set(connection, tab.id);
     errorMessage = null;
+    // ファイルをエディタに読み込んだ = 接続を使う契機。ここでトンネル/接続を張り、
+    // スキーマ一覧と補完マップを取り込む (接続選択時点では張っていない)。
+    void ensureConnectionResources(connection);
   } catch (e) {
     errorMessage = toErrorMessage(e);
   }
@@ -524,6 +590,8 @@ const removeEditorTab = async (id: number, save: boolean) => {
       await activateEditorTab(neighbor.id);
     }
   }
+  // この接続のエディタタブが全て閉じられたら、SSH トンネル / プールを閉じる。
+  maybeDisconnectIfIdle(tab.connection);
 };
 
 const closeEditorTab = (id: number) => {
@@ -918,6 +986,9 @@ const executeTab = async (tab: ResultTab) => {
     tab.schema = result.switched_schema;
     applySwitchedSchema(tab.connection, result.switched_schema);
   }
+  // 実行中クエリの間はトンネルを切れないため、エディタタブを全て閉じた後に
+  // クエリだけ走り続けていた場合は、完了したこのタイミングで切断を再判定する。
+  maybeDisconnectIfIdle(tab.connection);
 };
 
 /// `\c` によるスキーマ切替をフロントの状態へ反映する。
@@ -1393,6 +1464,7 @@ export default {
   loadAiInfo,
   generateSql,
   loadSchemaMap,
+  ensureConnectionResources,
   reloadConnections,
   selectConnection,
   changeActiveSchema,

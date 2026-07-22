@@ -176,6 +176,12 @@ export const setActiveSchema = (connection: string, schema: string) =>
 export const getActiveSchema = (connection: string) =>
   invoke<string | null>("get_active_schema", { connection });
 
+/// 指定接続のプール / SSH トンネルを破棄する (エディタタブを全て閉じた時に呼ぶ)。
+/// 接続設定は残り、次に必要になった時 (ファイルを開く / スキーマブラウザ / クエリ)
+/// に自動で張り直される。
+export const disconnect = (connection: string) =>
+  invoke<void>("disconnect", { connection });
+
 /// テーブル / ビューの一覧を返す。refresh = true でキャッシュを破棄して再取得。
 export const listTables = (connection: string, refresh?: boolean) =>
   invoke<TableInfo[]>("list_tables", { connection, refresh });

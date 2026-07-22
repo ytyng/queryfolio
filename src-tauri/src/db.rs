@@ -133,6 +133,19 @@ impl DbManager {
         inner.schema_overrides.clear();
     }
 
+    /// 指定接続のプールと SSH トンネルを破棄する。
+    /// 「この接続はもう不要」と判断された契機 (エディタタブを全て閉じた時など) に
+    /// 呼ぶ。トンネルとプールは必ず一緒に破棄する — プールがトンネルの死んだ
+    /// ローカルポート宛のコネクションを掴んだまま残ると、次にこの接続を使った時に
+    /// クエリが失敗するため。
+    /// アクティブスキーマの選択 (schema_overrides) は UI の状態なので保持し、
+    /// 次に接続を張り直した時に同じスキーマで繋がるようにする。
+    pub async fn disconnect(&self, connection: &str) {
+        let mut inner = self.inner.lock().await;
+        inner.pools.remove(connection);
+        inner.tunnels.remove(connection);
+    }
+
     /// 接続のアクティブスキーマ (database) を切り替える。
     /// プールを破棄し、次のクエリから新しい database で接続し直す
     /// (SQL の USE ではなくプール再構築で切り替えることで、プール内の
@@ -1644,6 +1657,22 @@ mod tests {
             manager.schema_override("conn").await,
             Some("chosen".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_keeps_schema_override() {
+        let manager = DbManager::default();
+        // アクティブスキーマを選択した状態で切断しても、選択は保持される
+        // (次に張り直した時に同じスキーマで繋がるため)。
+        manager.set_schema_override("conn", "chosen".to_string()).await;
+        manager.disconnect("conn").await;
+        assert_eq!(
+            manager.schema_override("conn").await,
+            Some("chosen".to_string())
+        );
+        // 存在しない接続を切断しても panic しない (何度呼んでも安全)。
+        manager.disconnect("no-such-conn").await;
+        manager.disconnect("conn").await;
     }
 
     #[tokio::test]
