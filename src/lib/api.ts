@@ -241,10 +241,11 @@ export interface OpenTarget {
   fileName: string;
 }
 
-/// 起動時に deep link / CLI で指定された開く対象を 1 度だけ取り出す
-/// (無ければ null)。取り出すと消えるので二重に開かない。
-export const takeLaunchTarget = () =>
-  invoke<OpenTarget | null>("take_launch_target");
+/// フロントの listener 登録完了を知らせ、それまでに溜まった開く対象
+/// (起動時の deep link / CLI 指定 + 起動中に届いた分) をまとめて受け取る。
+/// 呼び出し後は以降の指定が open-query-file イベントで直接届く。onMount で
+/// listener を登録した直後に 1 度だけ呼ぶ。
+export const frontendReady = () => invoke<OpenTarget[]>("frontend_ready");
 
 export const getConfigInfo = () => invoke<ConfigInfo>("get_config_info");
 

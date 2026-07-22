@@ -140,7 +140,10 @@ pub fn route_from_cli_args<S: AsRef<str>>(args: &[S]) -> Option<Route> {
 
 /// 生パスを、保存ディレクトリ配下の接続フォルダにあるクエリファイルとして解決する。
 ///
-/// - `sqlfiles_dir`: クエリファイル保存ディレクトリ (絶対パス想定)。
+/// - `sqlfiles_dir`: クエリファイル保存ディレクトリ。**呼び出し側で絶対パスに
+///   しておくこと** (相対だと `cwd` の基準が生パスと食い違う: 生パスは deep link /
+///   CLI の起動元 cwd で解決するが、保存ディレクトリはアプリプロセスの cwd で
+///   I/O される。両者を混同しないよう base の絶対化は呼び出し側の責務とする)。
 /// - `folders`: `(フォルダ名, 接続名)` の対応表 (設定順)。フォルダ名は
 ///   `ServerConfig::sqlfiles_folder_name()` が返すもの。
 /// - `raw_path`: 開く対象の生パス (`~` / 相対パスは `home` / `cwd` で展開)。
@@ -159,12 +162,9 @@ pub fn resolve_open_target(
     cwd: Option<&Path>,
 ) -> Result<OpenTarget, RouteError> {
     let expanded = expand_path(raw_path, home, cwd);
-    // 入力パスは cwd で絶対化しているので、比較する base (sqlfiles_dir) も同じ基準で
-    // 絶対化する。設定で相対 sqlfiles_dir を使っていても、コピーした絶対パスと
-    // 突き合わせられるようにする (相対のままだと strip_prefix が常に外れる)。
-    let base_absolute = absolutize(sqlfiles_dir, cwd);
+    // base (sqlfiles_dir) は呼び出し側が絶対化済み。生パスだけ cwd で解決する。
     let normalized = lexical_normalize(&expanded);
-    let base = lexical_normalize(&base_absolute);
+    let base = lexical_normalize(sqlfiles_dir);
 
     let relative = normalized
         .strip_prefix(&base)
@@ -215,17 +215,6 @@ fn validate_sql_file_name(name: &str) -> Result<(), RouteError> {
         return Err(RouteError::InvalidFileName(name.to_string()));
     }
     Ok(())
-}
-
-/// 相対パスを `cwd` で絶対化する (絶対パス・`cwd` 無しはそのまま)。
-fn absolutize(path: &Path, cwd: Option<&Path>) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else if let Some(cwd) = cwd {
-        cwd.join(path)
-    } else {
-        path.to_path_buf()
-    }
 }
 
 /// `~` / 相対パスを展開する (ファイルシステムには触れない字句的展開)。
@@ -398,20 +387,10 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_open_target_relative_base_with_cwd() {
-        // 相対 sqlfiles_dir でも、cwd で絶対化した絶対パスと突き合わせられる
+    fn test_resolve_open_target_relative_raw_path_with_cwd() {
+        // base は絶対 (呼び出し側が絶対化する契約)。相対の入力パスは cwd 基準で解決。
         let cwd = Path::new("/work");
-        let base = Path::new("queries"); // 相対
-        let target = resolve_open_target(
-            base,
-            &folders(),
-            "/work/queries/reporting/a.sql",
-            None,
-            Some(cwd),
-        )
-        .unwrap();
-        assert_eq!(target.connection, "reporting-conn");
-        // 相対の入力パスも同じ cwd 基準で解決される
+        let base = Path::new("/work/queries");
         let target = resolve_open_target(
             base,
             &folders(),
@@ -420,6 +399,7 @@ mod tests {
             Some(cwd),
         )
         .unwrap();
+        assert_eq!(target.connection, "reporting-conn");
         assert_eq!(target.file_name, "a.sql");
     }
 

@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { toast } from "svelte-sonner";
-  import { ensureConfigFile, takeLaunchTarget } from "$lib/api";
+  import { ensureConfigFile, frontendReady } from "$lib/api";
   import type { OpenTarget } from "$lib/api";
   import appStore from "$lib/stores/app.svelte";
   import Toolbar from "$lib/components/Toolbar.svelte";
@@ -221,10 +221,12 @@
         });
       }
       await appStore.loadConnections();
-      // 起動時に deep link / CLI で開く指定があれば、接続読込後に 1 度だけ開く。
+      // listener 登録は上で済んでいる。ここで frontend_ready を呼んで「準備完了」を
+      // 知らせ、起動時指定 + 起動中に溜まった開く対象をまとめて受け取って開く。
+      // 以降の指定は open-query-file イベントで直接届く (取りこぼさない)。
       try {
-        const target = await takeLaunchTarget();
-        if (target) {
+        const targets = await frontendReady();
+        for (const target of targets) {
           await appStore.openFileByTarget(target.connection, target.fileName);
         }
       } catch (e) {

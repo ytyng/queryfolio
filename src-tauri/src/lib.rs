@@ -17,6 +17,19 @@ use config::{AppConfig, ConfigInfo, ConnectionInfo, ServerConfig};
 use db::{CancelRegistry, DbManager, DbPool, QueryResult, DEFAULT_MAX_ROWS};
 use error::AppError;
 
+/// 実行中に届いた「開く対象」のフロントへの受け渡し状態。
+/// フロントの listener は onMount (webview 準備後) に登録されるため、それより前に
+/// deep link / CLI が届くと `open-query-file` イベントを取りこぼす。ready になるまでは
+/// キューに積み、frontend_ready でまとめて渡す (単一 Mutex で ready 判定と push/drain を
+/// 直列化し、取りこぼし・二重配送を防ぐ)。
+#[derive(Default)]
+struct LiveDelivery {
+    /// フロントの listener が用意できたか (frontend_ready で true になる)。
+    ready: bool,
+    /// ready 前に届いた開く対象 (frontend_ready で drain して渡す)。
+    pending: Vec<router::OpenTarget>,
+}
+
 /// アプリ全体の共有状態。
 #[derive(Default)]
 struct AppState {
@@ -40,10 +53,12 @@ struct AppState {
     /// get_ai_info で configured / model のみを返す。
     ai: tokio::sync::Mutex<Option<Option<ai::AiConfig>>>,
     /// 起動時に `queryfolio://` deep link / CLI サブコマンドで指定された
-    /// 開くべきルート (無ければ None)。フロントが起動後に take_launch_target で
-    /// 1 度だけ取り出す (取り出すと消える)。実行中に開かれたルートはイベントで
-    /// 直接フロントへ届けるため、ここには積まない。
+    /// 開くべきルート (無ければ None)。フロントが起動後に frontend_ready で
+    /// 1 度だけ取り出す (取り出すと消える)。実行中に開かれたルートは live 経由
+    /// (イベント / キュー) でフロントへ届けるため、ここには積まない。
     launch_route: std::sync::Mutex<Option<router::Route>>,
+    /// 実行中に届いた開く対象の受け渡し (listener 準備前の取りこぼし対策)。
+    live: std::sync::Mutex<LiveDelivery>,
 }
 
 impl AppState {
@@ -978,21 +993,38 @@ async fn write_export_file(path: String, contents: String) -> Result<(), AppErro
     Ok(())
 }
 
-/// 起動時に `queryfolio://` deep link / CLI サブコマンドで指定された「開く対象」を
-/// 1 度だけ取り出して解決する。フロントは起動直後 (onMount) にこれを呼び、非 null
-/// なら接続を選択してそのファイルを開く。取り出すと消えるので二重に開かない。
-/// (実行中に開かれたルートは `open-query-file` イベントで届くため、こちらには来ない)
+/// フロントの listener 登録が済んだことを知らせ、それまでに溜まった「開く対象」を
+/// まとめて受け取る。フロントは onMount で listener を登録した直後にこれを呼び、
+/// 返った各対象について接続を選択してファイルを開く。内訳は次の 2 つ:
+/// (1) 起動時に deep link / CLI で指定された launch route (解決してから返す)、
+/// (2) 起動中 (ready 前) に届いてキューされた実行中ルートの解決済み対象。
+/// 呼び出し後は ready = true になり、以降の実行中ルートは `open-query-file` イベントで
+/// 直接届く (listener が既にあるため取りこぼさない)。
 #[tauri::command]
-async fn take_launch_target(
+async fn frontend_ready(
     state: tauri::State<'_, AppState>,
-) -> Result<Option<router::OpenTarget>, AppError> {
-    // std Mutex は await をまたいで保持しない (take だけして即解放)
-    let route = state.launch_route.lock().unwrap().take();
-    match route {
-        // 起動時指定はこのプロセスのカレントディレクトリ基準でよい (None)
-        Some(route) => Ok(Some(state.resolve_route_target(&route, None).await?)),
-        None => Ok(None),
+) -> Result<Vec<router::OpenTarget>, AppError> {
+    let mut targets = Vec::new();
+    // (1) 起動時指定 (launch route)。このプロセスの cwd 基準で解決する (None)。
+    //     std Mutex は await をまたいで保持しない (take だけして即解放)。
+    let launch = state.launch_route.lock().unwrap().take();
+    if let Some(route) = launch {
+        match state.resolve_route_target(&route, None).await {
+            Ok(target) => targets.push(target),
+            // 起動時指定が解決できなくても他の対象・起動は止めない (ログのみ)
+            Err(e) => eprintln!("[router] launch route failed: {e}"),
+        }
     }
+    // (2) ready にして、それまでにキューされた対象を drain する。
+    //     ready 設定と drain を 1 つのロックで行い、dispatch_route の
+    //     「ready 判定 → push/emit」と直列化する (取りこぼし・二重配送を防ぐ)。
+    let mut queued = {
+        let mut live = state.live.lock().unwrap();
+        live.ready = true;
+        std::mem::take(&mut live.pending)
+    };
+    targets.append(&mut queued);
+    Ok(targets)
 }
 
 /// `file` をシンボリックリンク解決込みで canonicalize し、`base` (これも
@@ -1025,8 +1057,22 @@ fn dispatch_route(app: &tauri::AppHandle, route: router::Route, cwd: Option<Path
         let state = app.state::<AppState>();
         match state.resolve_route_target(&route, cwd).await {
             Ok(target) => {
-                if let Err(e) = app.emit("open-query-file", target) {
-                    eprintln!("[router] failed to emit open-query-file: {e}");
+                // フロントの listener が未登録 (起動中) なら取りこぼすため、ready で
+                // なければキューに積む (frontend_ready が drain する)。ready 判定と
+                // push を 1 ロックで行い、frontend_ready の ready 設定 + drain と直列化。
+                let emit_now = {
+                    let mut live = state.live.lock().unwrap();
+                    if live.ready {
+                        true
+                    } else {
+                        live.pending.push(target.clone());
+                        false
+                    }
+                };
+                if emit_now {
+                    if let Err(e) = app.emit("open-query-file", target) {
+                        eprintln!("[router] failed to emit open-query-file: {e}");
+                    }
                 }
             }
             Err(e) => {
@@ -1273,7 +1319,7 @@ pub fn run() {
                     }
                 }
             });
-            // 起動時に指定されたルートを控える (フロントが take_launch_target で取り出す)。
+            // 起動時に指定されたルートを控える (フロントが frontend_ready で取り出す)。
             // 優先度: deep link 起動 (macOS: get_current が URL を返す) → CLI サブコマンド。
             let mut launch: Option<router::Route> = None;
             if let Ok(Some(urls)) = app.deep_link().get_current() {
@@ -1328,7 +1374,7 @@ pub fn run() {
             write_config_file,
             read_override_config_yaml,
             write_export_file,
-            take_launch_target,
+            frontend_ready,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
