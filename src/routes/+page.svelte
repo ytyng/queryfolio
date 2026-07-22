@@ -208,6 +208,11 @@
     );
 
     void (async () => {
+      // frontend_ready を呼ぶと backend が ready=true にしてイベント直送に切り替わる。
+      // その前に open-query-file / -error の listener が実際に installed される
+      // (listen の Promise が解決する) のを待たないと、間に届いた指定を取りこぼす。
+      await unlistenOpenFilePromise;
+      await unlistenOpenFileErrPromise;
       try {
         const createdPath = await ensureConfigFile();
         if (createdPath) {
@@ -221,7 +226,7 @@
         });
       }
       await appStore.loadConnections();
-      // listener 登録は上で済んでいる。ここで frontend_ready を呼んで「準備完了」を
+      // listener が installed 済みになったので frontend_ready を呼んで「準備完了」を
       // 知らせ、起動時指定 + 起動中に溜まった開く対象をまとめて受け取って開く。
       // 以降の指定は open-query-file イベントで直接届く (取りこぼさない)。
       try {

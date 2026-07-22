@@ -204,13 +204,18 @@ pub fn resolve_open_target(
 /// (query_files.rs の validate_component / normalize_file_name と同じ方針: 空・
 /// ドット始まり・区切り文字を拒否し、拡張子が `.sql` であることを要求する)。
 fn validate_sql_file_name(name: &str) -> Result<(), RouteError> {
-    let trimmed = name.trim();
-    let invalid = trimmed.is_empty()
-        || trimmed.starts_with('.')
-        || trimmed.contains('/')
-        || trimmed.contains('\\')
-        || trimmed.contains('\0')
-        || !trimmed.to_ascii_lowercase().ends_with(".sql");
+    // 前後に空白がある名前は拒否する。query_files.rs の normalize_file_name は
+    // 読み込み時に名前を trim するため、空白付きを許すと「検証したパス
+    // (verify_within_dir が canonicalize したパス)」と「実際に開くパス (trim 後)」が
+    // 食い違い、検証を通した別ファイル (symlink 等) を開けてしまう。ここで拒否して
+    // 検証対象と開く対象を必ず同一にする。
+    let invalid = name.is_empty()
+        || name != name.trim()
+        || name.starts_with('.')
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+        || !name.to_ascii_lowercase().ends_with(".sql");
     if invalid {
         return Err(RouteError::InvalidFileName(name.to_string()));
     }
@@ -507,6 +512,19 @@ mod tests {
             )
             .unwrap_err(),
             RouteError::InvalidFileName(".secret.sql".to_string())
+        );
+        // 前後に空白のある名前は拒否 (trim で別ファイルに化けるのを防ぐ)。
+        // expand_path がパス全体を trim するため末尾空白は落ち、先頭空白が残る。
+        assert_eq!(
+            resolve_open_target(
+                base,
+                &folders(),
+                "/data/sqlfiles/reporting/ report.sql",
+                None,
+                None,
+            )
+            .unwrap_err(),
+            RouteError::InvalidFileName(" report.sql".to_string())
         );
     }
 
