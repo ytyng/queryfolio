@@ -127,7 +127,15 @@ fn start_system_ssh(
         port
     };
 
-    let forward = format!("127.0.0.1:{local_port}:{target_host}:{target_port}");
+    // IPv6 リテラル (`::1` / `fd00::10` 等) の転送先は `-L` 仕様上ブラケットで
+    // 囲む必要がある (`[::1]`)。囲まないと `...:::1:...` となり OpenSSH が不正な
+    // local-forward として拒否する。ホスト名 / IPv4 は `:` を含まないので素通し。
+    let forward_host = if target_host.contains(':') && !target_host.starts_with('[') {
+        format!("[{target_host}]")
+    } else {
+        target_host.to_string()
+    };
+    let forward = format!("127.0.0.1:{local_port}:{forward_host}:{target_port}");
     let connect_timeout_secs = (SSH_TIMEOUT_MS / 1000).max(1);
     let path = crate::config::supplement_path(&std::env::var("PATH").unwrap_or_default());
     let mut child = Command::new("ssh")
