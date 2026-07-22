@@ -329,6 +329,15 @@ const applyConnectionContext = async (name: string): Promise<boolean> => {
   // 補完候補は新接続向けに一旦クリアする (世代も進め、古い取得の後追い書き込みを防ぐ)
   schemaMapGeneration++;
   schemaMap = null;
+  if (resourcesLoaded.has(name)) {
+    // 既に確立済みの接続を選び直した場合、トンネルは開いたままなので、上でリセットした
+    // スキーマ一覧・補完マップを取り直して UI (プルダウン / 補完) を復元する。新規に
+    // トンネルを開くわけではない (「選択した瞬間に開く」方針には反しない)。
+    // resourcesLoaded は外さない — 外して非同期で再登録すると、その隙に別接続へ
+    // 切り替えた時に切断判定 (maybeDisconnectIfIdle) や再登録と競合し、エディタタブの
+    // 無いトンネルが貼りっぱなしになりうるため。確立状態は保ったまま UI だけ取り直す。
+    void loadConnectionSchemaResources(name);
+  }
   return true;
 };
 
@@ -337,6 +346,34 @@ const applyConnectionContext = async (name: string): Promise<boolean> => {
 /// これを接続状態の真実として使い、キャッシュ (schemas 等) の有無で代用しない
 /// (切断後もキャッシュは残るため、代用すると再オープンの契機を取りこぼす)。
 const resourcesLoaded = new Set<string>();
+
+/// 接続のスキーマ一覧・補完マップを取り込んで UI (プルダウン / 補完) へ反映する。
+/// listSchemas がプールを取得する (= トンネルを張る) 契機。listSchemas が成功したかを
+/// 返す (呼び出し側の resourcesLoaded 管理に使う)。取得中に別接続へ切り替わっていたら
+/// 反映はスキップする (selectedConnection ガード)。resourcesLoaded 自体はここでは
+/// 触らない — 「確立済みか」の判定と「取り込み中か」を分離し、再取り込み中に切替が
+/// 走ってもライフサイクル管理 (maybeDisconnectIfIdle) と競合しないようにするため。
+const loadConnectionSchemaResources = async (
+  connection: string,
+): Promise<boolean> => {
+  let established = false;
+  try {
+    const loaded = await api.listSchemas(connection);
+    established = true;
+    if (selectedConnection === connection) {
+      schemas = loaded;
+    }
+  } catch {
+    // 接続失敗などは致命的でない。プルダウンは現在値のみのままにし、次の契機で再試行。
+    return false;
+  }
+  // 補完マップも取り込む (同じプールを使うので追加のトンネルは張らない。
+  // 失敗しても補完なしで続行)。
+  if (established && selectedConnection === connection) {
+    void loadSchemaMap();
+  }
+  return established;
+};
 
 /// トンネル / 接続を実際に開くべき契機 (エディタにファイルを読み込んだ時・
 /// スキーマブラウザを開いた時) で呼ぶ。接続を確立してスキーマ一覧と補完マップを
@@ -349,23 +386,8 @@ const ensureConnectionResources = async (connection: string) => {
   }
   // 成功前に登録すると、失敗接続を「確立済み」と誤認して再試行を取りこぼすため、
   // listSchemas (これが接続を張る) が成功してから登録する。
-  let established = false;
-  try {
-    const loaded = await api.listSchemas(connection);
-    established = true;
-    if (selectedConnection === connection) {
-      schemas = loaded;
-    }
-  } catch {
-    // 接続失敗などは致命的でない。プルダウンは現在値のみのままにし、次の契機で再試行。
-  }
-  if (established) {
+  if (await loadConnectionSchemaResources(connection)) {
     resourcesLoaded.add(connection);
-    // 補完マップも取り込む (同じプールを使うので追加のトンネルは張らない。
-    // 失敗しても補完なしで続行)。
-    if (selectedConnection === connection) {
-      void loadSchemaMap();
-    }
   }
 };
 
@@ -415,6 +437,7 @@ const selectConnection = async (name: string) => {
     connectionContextGeneration++;
     return;
   }
+  const previous = selectedConnection;
   // 未保存タブは best-effort で保存するが、保存失敗でも切替は止めない。
   // エディタタブは接続をまたいで残るため、切替で内容が失われることはない
   // (書込不可などで保存に失敗しても、dirty のままタブに保持される)。
@@ -426,6 +449,14 @@ const selectConnection = async (name: string) => {
   }
   // この接続で最後に開いていたタブを復元する (無ければエディタは空表示)
   activeEditorTabId = pickTabForConnection(name);
+  // 切替元の接続が「エディタタブを 1 つも持たない」なら、その接続はもう不要と判断して
+  // トンネル / プールを閉じる。スキーマブラウザ (TABLES) を開いただけの接続は
+  // エディタタブを持たず removeEditorTab / executeTab を通らないため、ここで閉じないと
+  // 張りっぱなしになる。エディタタブを持つ接続は maybeDisconnectIfIdle が no-op になり、
+  // 切替後も開いたまま残る (「作ったトンネルは貼りっぱなし」の方針どおり)。
+  if (previous) {
+    maybeDisconnectIfIdle(previous);
+  }
 };
 
 /// エディタタブをアクティブにする。タブの接続が現在の接続と違えば、その接続へ
