@@ -40,6 +40,7 @@ macOS 版のリリースは `.github/workflows/build-macos.yml` (workflow_dispat
 | db.rs | sqlx プール管理、クエリ実行・キャンセル (CancelRegistry)、型別 JSON 変換、readonly ガード / 危険な文ガード (dangerous_reason) |
 | tunnel.rs | SSH ローカルポートフォワード (known_hosts 検証付き)。ssh-agent 認証時は使う agent socket を `ssh_tunnel.identity_agent` → `~/.ssh/config` の IdentityAgent → SSH_AUTH_SOCK の順で解決し libssh2 の `set_identity_path` で指定する (GUI 起動でシェルの SSH_AUTH_SOCK を継承しなくても 1Password 等の agent に届く)。ssh_config パーサは Include の条件付き展開・glob・Host マッチ・エスケープ/コメント除去に対応 (best-effort) |
 | query_files.rs | クエリファイル CRUD (パストラバーサル対策) |
+| router.rs | `queryfolio://` deep link と CLI サブコマンドを共通の `Route` に落とす。`parse_uri` (URI パース) / `route_from_cli_args` (`open <path>` サブコマンド) / `resolve_open_target` (生パス → 接続 + ファイル名。保存ディレクトリ配下の接続フォルダにある `.sql` だけを許可し、`..` トラバーサル・領域外を字句正規化で拒否)。Tauri 非依存の純 std + 単体テストで境界を固める。lib.rs が `Route` を解決してフロントへ `open-query-file` イベント / `frontend_ready` で届ける |
 | folder_meta.rs | クエリファイル保存フォルダに接続を説明するメタファイル (`_queryfolio.md`) を生成する (エージェント/人間がフォルダを見て「どの DB 用のクエリか」を理解できるように)。非機密のみ (パスワード・SSH 鍵は含めない)。`create_query_file` / `write_query_file` / `list_query_files` の後に lib.rs (refresh_folder_meta) が書き出す。フォルダ未作成なら何もしない・内容が同じなら書かない (mtime churn 回避)。`.sql` でないため一覧・検索には出ない |
 | meta_commands.rs | psql 風メタコマンド (\l \dt \dv \dn \du \d) をエンジン別カタログ SQL に変換 (MetaCommand::Sql)。識別子バリデーションでインジェクション拒否。`\c <database>` だけは SQL にならずアクティブスキーマ切替 (MetaCommand::Connect) として lib.rs が処理する |
 | history.rs | クエリ実行履歴。接続ごとに JSONL (~/.config/queryfolio/history/<connection>.jsonl) へ追記、上限 10,000 行でローテーション。SQL に機密が含まれ得るためディレクトリ 700 / ファイル 600 |
@@ -61,6 +62,17 @@ macOS 版のリリースは `.github/workflows/build-macos.yml` (workflow_dispat
 - `lib/export.ts` — CSV/TSV/JSON 変換 (formula injection 対策込み)。テーブル全体用 (`toCsv` / `toTsv` / `toJson`) と選択範囲用 (`toCsvRange` / `toTsvRange` / `toJsonRange`、Cmd+C コピー用) の両系統がある
 - 結果ツールバーの出力 UI (ResultsPane) — フォーマット選択プルダウン (TSV / CSV / JSON、既定 TSV、localStorage `queryfolio.results.copyFormat` に永続化) + `Copy` ボタン (テーブル全体をクリップボードへ) + `Export` ボタン (ネイティブ保存ダイアログ `@tauri-apps/plugin-dialog` の `save` で選んだパスへ Rust の `write_export_file` コマンドで書き出す)。Cmd+C の選択範囲コピーも同じ選択フォーマットに従う。`Copy with headers` チェックボックスは Cmd+C 選択コピーのヘッダ有無 (CSV/TSV のみ) に効く
 - `lib/sqlFormat.ts` — SQL 整形器 (自前トークナイザ。SELECT / UNION 系のみ整形し、INSERT / UPDATE / WITH 等やパース不能な文は原文維持。整形結果を再トークナイズして入力とトークン列が一致しなければ原文に戻す安全ネット付き)
+
+## `queryfolio://` スキーム / CLI (ファイルを開く)
+
+保存済みのクエリファイルを、URL スキームまたは CLI からパス指定で開ける。どちらも
+`router.rs` の共通ルーターを通り、今後アクションを増やす時は `Route` の variant と
+パースを足すだけで両方に対応できる。
+
+- **URL スキーム**: `queryfolio://open/<絶対パス>` (例: `queryfolio://open//Users/me/.config/queryfolio/sqlfiles/reporting/monthly.sql`。絶対パスなのでスキーム後に `/` が重なる)。macOS はネイティブに (`tauri.conf.json > plugins > deep-link > desktop > schemes` の `queryfolio` を bundle 時に Info.plist へ登録) URL を受け取る。Linux/Windows は `single-instance` プラグイン (deep-link feature) が 2 個目の起動の URL を実行中インスタンスへ転送する。
+- **CLI**: アプリのバイナリを `queryfolio open <パス>` サブコマンドで起動する。実行中インスタンスがあれば single-instance がそのウインドウを前面化してそこで開き、無ければ新規起動後に開く (macOS の `.app` からは `open -a QueryFolio --args open <パス>`、または `open "queryfolio://open/<パス>"` でも同じ経路)。
+- **セキュリティ**: 開けるのはクエリファイル保存ディレクトリ (`sqlfiles_dir`) 直下の接続フォルダにある `.sql` ファイルだけ。`resolve_open_target` が字句正規化で `..` トラバーサルを潰し、保存領域外・未知のフォルダ・`.sql` 以外・ドット始まりを拒否する (ファイルシステムには触れない純粋な検証)。
+- **配線**: 起動時指定は setup が `AppState.launch_route` に控える。フロントは onMount で listener を登録した直後に `frontend_ready` コマンドを 1 度呼び、起動時指定 + 起動中 (listener 準備前) に届いてキューされた分をまとめて受け取って開く。以降の実行中指定は Rust が解決して `open-query-file` (成功) / `open-query-file-error` (失敗) イベントで直接届き、`app.svelte.ts` の `openFileByTarget` が接続を選択してファイルを開く (listener 準備前の取りこぼしを `AppState.live` の ready フラグ + キューで防ぐ)。
 
 ## 設定 (config.yml)
 

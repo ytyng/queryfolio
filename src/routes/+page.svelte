@@ -2,7 +2,8 @@
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { toast } from "svelte-sonner";
-  import { ensureConfigFile } from "$lib/api";
+  import { ensureConfigFile, frontendReady } from "$lib/api";
+  import type { OpenTarget } from "$lib/api";
   import appStore from "$lib/stores/app.svelte";
   import Toolbar from "$lib/components/Toolbar.svelte";
   import EditorToolbar from "$lib/components/EditorToolbar.svelte";
@@ -186,7 +187,42 @@
       openConfigEditor("source");
     });
 
+    // 開く指定を直列で処理するキュー。openFileByTarget は selectConnection を呼び、
+    // ストアの世代ガードが後発の接続切替で先行分をキャンセルするため、複数を並行で
+    // 走らせると別接続のファイルが黙って飛ばされ得る。Promise チェーンで 1 件ずつ
+    // 順に開く (1 件の失敗でチェーンが止まらないよう catch する。個別の失敗は
+    // openFileByTarget が errorMessage で表示する)。
+    let openQueue: Promise<void> = Promise.resolve();
+    const enqueueOpen = (connection: string, fileName: string) => {
+      openQueue = openQueue
+        .then(() => appStore.openFileByTarget(connection, fileName))
+        .catch(() => {});
+    };
+
+    // 実行中に queryfolio:// deep link / CLI で開くよう要求された時の通知。
+    // バックエンドが保存領域配下かを検証済みの接続 / ファイル名を届ける。
+    // 1 イベントに複数 URL・近接した複数回起動でも直列に開く。
+    const unlistenOpenFilePromise = listen<OpenTarget>(
+      "open-query-file",
+      (event) => {
+        enqueueOpen(event.payload.connection, event.payload.fileName);
+      },
+    );
+    const unlistenOpenFileErrPromise = listen<string>(
+      "open-query-file-error",
+      (event) => {
+        toast.error("Failed to open the file", {
+          description: event.payload,
+        });
+      },
+    );
+
     void (async () => {
+      // frontend_ready を呼ぶと backend が ready=true にしてイベント直送に切り替わる。
+      // その前に open-query-file / -error の listener が実際に installed される
+      // (listen の Promise が解決する) のを待たないと、間に届いた指定を取りこぼす。
+      await unlistenOpenFilePromise;
+      await unlistenOpenFileErrPromise;
       try {
         const createdPath = await ensureConfigFile();
         if (createdPath) {
@@ -200,12 +236,36 @@
         });
       }
       await appStore.loadConnections();
+      // listener が installed 済みになったので frontend_ready を呼んで「準備完了」を
+      // 知らせ、起動時指定 + 起動中に溜まった開く対象をまとめて受け取って開く。
+      // 以降の指定は open-query-file イベントで直接届く (取りこぼさない)。
+      try {
+        const { targets, errors } = await frontendReady();
+        // ライブイベントと同じキューに載せて直列に開く (ready 直後に届くライブ
+        // イベントとの並行実行を避ける)。
+        for (const target of targets) {
+          enqueueOpen(target.connection, target.fileName);
+        }
+        // 起動時指定の解決に失敗した分はトーストで知らせる (GUI 起動では
+        // stderr が見えず、握り潰すとユーザーの明示的な指定が無反応になる)。
+        for (const message of errors) {
+          toast.error("Failed to open the requested file", {
+            description: message,
+          });
+        }
+      } catch (e) {
+        toast.error("Failed to open the requested file", {
+          description: String(e),
+        });
+      }
     })();
 
     return () => {
       void unlistenPromise.then((unlisten) => unlisten());
       void unlistenEditPromise.then((unlisten) => unlisten());
       void unlistenEditSourcePromise.then((unlisten) => unlisten());
+      void unlistenOpenFilePromise.then((unlisten) => unlisten());
+      void unlistenOpenFileErrPromise.then((unlisten) => unlisten());
     };
   });
 </script>

@@ -232,6 +232,29 @@ export const aiExplainPlan = (
 export const aiExplainSql = (connection: string, sql: string) =>
   invoke<string>("ai_explain_sql", { connection, sql });
 
+/// `queryfolio://open/<path>` deep link / CLI で指定された「開く対象」
+/// (バックエンドの router::OpenTarget に対応)。
+export interface OpenTarget {
+  /// 対象ファイルが属する接続名
+  connection: string;
+  /// 開くファイル名 (.sql 付き)
+  fileName: string;
+}
+
+/// frontend_ready の戻り値 (バックエンドの LaunchResult に対応)。
+export interface LaunchResult {
+  /// 開く対象 (起動時指定 + 起動中に届いた分)
+  targets: OpenTarget[];
+  /// 起動時指定の解決に失敗した理由 (トーストで表示する)
+  errors: string[];
+}
+
+/// フロントの listener 登録完了を知らせ、それまでに溜まった開く対象
+/// (起動時の deep link / CLI 指定 + 起動中に届いた分) と、起動時指定の解決に
+/// 失敗した理由をまとめて受け取る。呼び出し後は以降の指定が open-query-file
+/// イベントで直接届く。onMount で listener を登録した直後に 1 度だけ呼ぶ。
+export const frontendReady = () => invoke<LaunchResult>("frontend_ready");
+
 export const getConfigInfo = () => invoke<ConfigInfo>("get_config_info");
 
 /// config.yml が無ければテンプレートを作成する。作成した場合はそのパスを返す。

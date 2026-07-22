@@ -458,6 +458,29 @@ const selectFile = async (fileName: string) => {
   }
 };
 
+/// deep link (`queryfolio://open/<path>`) / CLI で指定されたファイルを開く。
+/// 対象接続へ切り替えてからそのファイルを開く。接続が設定に無ければエラー表示。
+/// (バックエンドが保存領域配下かを検証済みの connection / fileName を受け取る)
+const openFileByTarget = async (connection: string, fileName: string) => {
+  // 実行中インスタンスへの deep link は、まれに接続一覧の初回ロード完了前に
+  // 届き得る。空のまま「接続が無い」と捨てないよう、未ロードなら先に読み込む。
+  if (connections.length === 0) {
+    await loadConnections();
+  }
+  if (!connections.some((c) => c.name === connection)) {
+    errorMessage = `Connection '${connection}' is not defined in the config`;
+    return;
+  }
+  // selectConnection は同じ接続なら no-op (files は既に読込済み)、別接続なら
+  // 切り替えてファイル一覧を読み込む。追い越された場合は selectedConnection が
+  // 変わるため、下のガードで開かない。
+  await selectConnection(connection);
+  if (selectedConnection !== connection) {
+    return;
+  }
+  await selectFile(fileName);
+};
+
 /// エディタタブを閉じる。未保存なら閉じる前に保存する (best-effort)。
 /// アクティブタブを閉じたら右隣 (無ければ左隣) をアクティブにする。
 const removeEditorTab = async (id: number, save: boolean) => {
@@ -1374,6 +1397,7 @@ export default {
   selectConnection,
   changeActiveSchema,
   selectFile,
+  openFileByTarget,
   activateEditorTab,
   closeEditorTab,
   createFile,

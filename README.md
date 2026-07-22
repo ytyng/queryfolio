@@ -26,6 +26,7 @@ https://github.com/user-attachments/assets/90439816-49c8-4ebd-a068-b102cfe9c7aa
 - AI features (OpenAI): SQL generation from natural language, Fix with AI on query errors, EXPLAIN plan analysis with index suggestions, and explanation of selected SQL. Generated SQL is inserted into the editor, never auto-executed. Only the schema (table / column names), engine dialect, statements, and plans are sent — never query results
 - Resizable panes: drag the dividers between the sidebars, editor, and results; sizes are persisted across restarts
 - Window size / position restored across restarts
+- Open a saved query file by path from a `queryfolio://open/<path>` URL or the `queryfolio open <path>` CLI subcommand (restricted to files under the query files directory; reuses the running window)
 
 ## Setup
 
@@ -77,6 +78,20 @@ ai:
 The `ai:` section can live at the top level of the local config file, or at the top level of the YAML fetched by `config_override_command`. The fetched YAML wins (that is just the merge result) — so the API key can stay in 1Password together with the connection secrets.
 
 The `QUERYFOLIO_CONFIG_YAML` environment variable overrides the whole config file (for development; GUI apps launched from Finder do not inherit shell env vars).
+
+## Opening files by URL / CLI
+
+A saved query file can be opened by path, from either a URL scheme or a CLI subcommand. Both go through the same router and reuse the already-running window.
+
+```shell
+# URL scheme (absolute path; the leading slash of the path doubles the slash after the scheme)
+open "queryfolio://open//Users/me/.config/queryfolio/sqlfiles/reporting/monthly.sql"
+
+# CLI subcommand
+queryfolio open /Users/me/.config/queryfolio/sqlfiles/reporting/monthly.sql
+```
+
+Only files directly under a connection folder inside the query files directory (`sqlfiles_dir`) can be opened. Paths outside that directory, unknown folders, non-`.sql` files, and `..` traversal are rejected. The connection that owns the folder is selected automatically and the file is opened in a new editor tab.
 
 ## Development
 
