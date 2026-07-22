@@ -28,6 +28,9 @@ struct LiveDelivery {
     ready: bool,
     /// ready 前に届いた開く対象 (frontend_ready で drain して渡す)。
     pending: Vec<router::OpenTarget>,
+    /// ready 前に届いた解決失敗のメッセージ (frontend_ready で drain して渡す)。
+    /// 成功対象と同様、listener 準備前は emit しても取りこぼすためキューする。
+    pending_errors: Vec<String>,
 }
 
 /// アプリ全体の共有状態。
@@ -1032,12 +1035,16 @@ async fn frontend_ready(
     // (2) ready にして、それまでにキューされた対象を drain する。
     //     ready 設定と drain を 1 つのロックで行い、dispatch_route の
     //     「ready 判定 → push/emit」と直列化する (取りこぼし・二重配送を防ぐ)。
-    let mut queued = {
+    let (mut queued, mut queued_errors) = {
         let mut live = state.live.lock().unwrap();
         live.ready = true;
-        std::mem::take(&mut live.pending)
+        (
+            std::mem::take(&mut live.pending),
+            std::mem::take(&mut live.pending_errors),
+        )
     };
     targets.append(&mut queued);
+    errors.append(&mut queued_errors);
     Ok(LaunchResult { targets, errors })
 }
 
@@ -1090,8 +1097,22 @@ fn dispatch_route(app: &tauri::AppHandle, route: router::Route, cwd: Option<Path
                 }
             }
             Err(e) => {
-                if let Err(emit_err) = app.emit("open-query-file-error", e.to_string()) {
-                    eprintln!("[router] failed to emit open-query-file-error: {emit_err}");
+                // 成功対象と同様、listener 未登録 (起動中) なら emit しても取りこぼす。
+                // ready でなければエラーもキューに積み、frontend_ready で drain させる。
+                let message = e.to_string();
+                let emit_now = {
+                    let mut live = state.live.lock().unwrap();
+                    if live.ready {
+                        true
+                    } else {
+                        live.pending_errors.push(message.clone());
+                        false
+                    }
+                };
+                if emit_now {
+                    if let Err(emit_err) = app.emit("open-query-file-error", message) {
+                        eprintln!("[router] failed to emit open-query-file-error: {emit_err}");
+                    }
                 }
             }
         }

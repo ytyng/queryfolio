@@ -187,15 +187,25 @@
       openConfigEditor("source");
     });
 
+    // 開く指定を直列で処理するキュー。openFileByTarget は selectConnection を呼び、
+    // ストアの世代ガードが後発の接続切替で先行分をキャンセルするため、複数を並行で
+    // 走らせると別接続のファイルが黙って飛ばされ得る。Promise チェーンで 1 件ずつ
+    // 順に開く (1 件の失敗でチェーンが止まらないよう catch する。個別の失敗は
+    // openFileByTarget が errorMessage で表示する)。
+    let openQueue: Promise<void> = Promise.resolve();
+    const enqueueOpen = (connection: string, fileName: string) => {
+      openQueue = openQueue
+        .then(() => appStore.openFileByTarget(connection, fileName))
+        .catch(() => {});
+    };
+
     // 実行中に queryfolio:// deep link / CLI で開くよう要求された時の通知。
     // バックエンドが保存領域配下かを検証済みの接続 / ファイル名を届ける。
+    // 1 イベントに複数 URL・近接した複数回起動でも直列に開く。
     const unlistenOpenFilePromise = listen<OpenTarget>(
       "open-query-file",
       (event) => {
-        void appStore.openFileByTarget(
-          event.payload.connection,
-          event.payload.fileName,
-        );
+        enqueueOpen(event.payload.connection, event.payload.fileName);
       },
     );
     const unlistenOpenFileErrPromise = listen<string>(
@@ -231,8 +241,10 @@
       // 以降の指定は open-query-file イベントで直接届く (取りこぼさない)。
       try {
         const { targets, errors } = await frontendReady();
+        // ライブイベントと同じキューに載せて直列に開く (ready 直後に届くライブ
+        // イベントとの並行実行を避ける)。
         for (const target of targets) {
-          await appStore.openFileByTarget(target.connection, target.fileName);
+          enqueueOpen(target.connection, target.fileName);
         }
         // 起動時指定の解決に失敗した分はトーストで知らせる (GUI 起動では
         // stderr が見えず、握り潰すとユーザーの明示的な指定が無反応になる)。
