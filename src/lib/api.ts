@@ -5,6 +5,8 @@ export interface SshTunnelInfo {
   host: string;
   port: number;
   user: string;
+  /// ~/.ssh/config の Host エイリアス (system ssh 委譲モード時)。libssh2 モードでは null
+  ssh_config: string | null;
 }
 
 export interface ConnectionInfo {

@@ -82,6 +82,27 @@ sql_servers:
       # 1Password SSH agent when launched from Finder). "none" disables the agent.
       # identity_agent: ~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock
 
+  - name: remote-db-via-ssh-config
+    description: "~/.ssh/config の Host エイリアスで接続 (ProxyJump / 多段トンネル対応)"
+    engine: postgres
+    host: localhost  # 踏み台 (ssh_config の最終ホスト) から見た DB ホスト
+    port: 5432
+    schema: remote_db
+    user: remote_user
+    password: remote_password
+    ssh_tunnel:
+      # queryfolio extension: delegate the tunnel to the system `ssh` client
+      # using this ~/.ssh/config Host alias. HostName / User / Port / ProxyJump
+      # (multi-hop) are all resolved by OpenSSH, so a config like
+      #   Host pop-three-ec2-staging
+      #       HostName 172.21.122.39
+      #       User torico
+      #       ProxyJump pop-three-bastion
+      # just works by naming the alias here. host / user / private_key_path /
+      # identity_agent above are ignored in this mode (auth and host-key
+      # checking are handled entirely by OpenSSH).
+      ssh_config: pop-three-ec2-staging
+
 # --- sql_servers: グループ機能 (queryfolio 拡張) ---
 # リスト項目に group_name + sql_servers を書くと、その中のサーバーが
 # 接続一覧でグループ見出し付きで表示される。直書きサーバーとの混在も可
