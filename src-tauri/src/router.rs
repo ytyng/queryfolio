@@ -50,6 +50,8 @@ pub enum RouteError {
     NotUnderConnectionFolder,
     /// どの接続のフォルダにも一致しないフォルダ名。
     UnknownFolder(String),
+    /// 同じフォルダに複数の接続が対応していて、どの接続で開くか一意に決められない。
+    AmbiguousFolder(String),
     /// ファイル名が不正 (`.sql` でない・ドット始まり等)。
     InvalidFileName(String),
 }
@@ -73,6 +75,10 @@ impl std::fmt::Display for RouteError {
             RouteError::UnknownFolder(folder) => write!(
                 f,
                 "No connection matches the folder: {folder}"
+            ),
+            RouteError::AmbiguousFolder(folder) => write!(
+                f,
+                "Multiple connections map to the folder, cannot decide which to open: {folder}"
             ),
             RouteError::InvalidFileName(name) => {
                 write!(f, "Invalid query file name: {name}")
@@ -175,11 +181,16 @@ pub fn resolve_open_target(
     let folder = components[0].to_string_lossy().into_owned();
     let file_name = components[1].to_string_lossy().into_owned();
 
-    let connection = folders
-        .iter()
-        .find(|(f, _)| *f == folder)
-        .map(|(_, conn)| conn.clone())
-        .ok_or(RouteError::UnknownFolder(folder))?;
+    // 同じフォルダに複数の接続が対応している場合 (同一 folder_name や、生成される
+    // host/engine/schema/user フォルダが偶然一致) は、どの接続で開くか一意に
+    // 決められない。先頭を黙って選ぶと別 DB / 別 readonly ポリシーの接続で開いて
+    // しまう恐れがあるため、曖昧としてエラーにする。
+    let mut matches = folders.iter().filter(|(f, _)| *f == folder);
+    let connection = match (matches.next(), matches.next()) {
+        (None, _) => return Err(RouteError::UnknownFolder(folder)),
+        (Some(_), Some(_)) => return Err(RouteError::AmbiguousFolder(folder)),
+        (Some((_, conn)), None) => conn.clone(),
+    };
 
     validate_sql_file_name(&file_name)?;
 
@@ -450,6 +461,21 @@ mod tests {
             )
             .unwrap_err(),
             RouteError::UnknownFolder("unknown".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_open_target_ambiguous_folder() {
+        let base = Path::new("/data/sqlfiles");
+        // 同じフォルダ名に 2 つの接続が対応する場合は曖昧としてエラー
+        let dup = vec![
+            ("shared".to_string(), "conn-a".to_string()),
+            ("shared".to_string(), "conn-b".to_string()),
+        ];
+        assert_eq!(
+            resolve_open_target(base, &dup, "/data/sqlfiles/shared/a.sql", None, None)
+                .unwrap_err(),
+            RouteError::AmbiguousFolder("shared".to_string())
         );
     }
 
