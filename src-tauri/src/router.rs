@@ -153,8 +153,12 @@ pub fn resolve_open_target(
     cwd: Option<&Path>,
 ) -> Result<OpenTarget, RouteError> {
     let expanded = expand_path(raw_path, home, cwd);
+    // 入力パスは cwd で絶対化しているので、比較する base (sqlfiles_dir) も同じ基準で
+    // 絶対化する。設定で相対 sqlfiles_dir を使っていても、コピーした絶対パスと
+    // 突き合わせられるようにする (相対のままだと strip_prefix が常に外れる)。
+    let base_absolute = absolutize(sqlfiles_dir, cwd);
     let normalized = lexical_normalize(&expanded);
-    let base = lexical_normalize(sqlfiles_dir);
+    let base = lexical_normalize(&base_absolute);
 
     let relative = normalized
         .strip_prefix(&base)
@@ -200,6 +204,17 @@ fn validate_sql_file_name(name: &str) -> Result<(), RouteError> {
         return Err(RouteError::InvalidFileName(name.to_string()));
     }
     Ok(())
+}
+
+/// 相対パスを `cwd` で絶対化する (絶対パス・`cwd` 無しはそのまま)。
+fn absolutize(path: &Path, cwd: Option<&Path>) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Some(cwd) = cwd {
+        cwd.join(path)
+    } else {
+        path.to_path_buf()
+    }
 }
 
 /// `~` / 相対パスを展開する (ファイルシステムには触れない字句的展開)。
@@ -369,6 +384,32 @@ mod tests {
         .unwrap();
         assert_eq!(target.connection, "reporting-conn");
         let _ = base;
+    }
+
+    #[test]
+    fn test_resolve_open_target_relative_base_with_cwd() {
+        // 相対 sqlfiles_dir でも、cwd で絶対化した絶対パスと突き合わせられる
+        let cwd = Path::new("/work");
+        let base = Path::new("queries"); // 相対
+        let target = resolve_open_target(
+            base,
+            &folders(),
+            "/work/queries/reporting/a.sql",
+            None,
+            Some(cwd),
+        )
+        .unwrap();
+        assert_eq!(target.connection, "reporting-conn");
+        // 相対の入力パスも同じ cwd 基準で解決される
+        let target = resolve_open_target(
+            base,
+            &folders(),
+            "queries/reporting/a.sql",
+            None,
+            Some(cwd),
+        )
+        .unwrap();
+        assert_eq!(target.file_name, "a.sql");
     }
 
     #[test]

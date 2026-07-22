@@ -87,16 +87,20 @@ impl AppState {
 
     /// ルート (deep link / CLI) を、開く対象のクエリファイル (接続 + ファイル名) へ
     /// 解決する。保存ディレクトリ配下の接続フォルダにある `.sql` でなければエラー。
+    /// `cwd` は相対パスを解決する基準ディレクトリ。deep link / CLI を実行中
+    /// インスタンスが受け取った時は「起動元ディレクトリ」を渡す (single-instance の
+    /// callback cwd)。None の時はこのプロセスのカレントディレクトリを使う。
     async fn resolve_route_target(
         &self,
         route: &router::Route,
+        cwd: Option<PathBuf>,
     ) -> Result<router::OpenTarget, AppError> {
         match route {
             router::Route::OpenFile { path } => {
                 let sqlfiles_dir = self.resolve_sqlfiles_dir().await?;
                 let folders = self.folder_connection_map().await?;
                 let home = dirs::home_dir();
-                let cwd = std::env::current_dir().ok();
+                let cwd = cwd.or_else(|| std::env::current_dir().ok());
                 let target = router::resolve_open_target(
                     &sqlfiles_dir,
                     &folders,
@@ -977,7 +981,8 @@ async fn take_launch_target(
     // std Mutex は await をまたいで保持しない (take だけして即解放)
     let route = state.launch_route.lock().unwrap().take();
     match route {
-        Some(route) => Ok(Some(state.resolve_route_target(&route).await?)),
+        // 起動時指定はこのプロセスのカレントディレクトリ基準でよい (None)
+        Some(route) => Ok(Some(state.resolve_route_target(&route, None).await?)),
         None => Ok(None),
     }
 }
@@ -1005,12 +1010,12 @@ fn verify_within_dir(base: &std::path::Path, file: &std::path::Path) -> Result<(
 /// イベントで届ける。解決は設定の読み取りを伴い async なので、別タスクで行う。
 /// 成功なら `open-query-file` に OpenTarget を、失敗なら `open-query-file-error` に
 /// エラーメッセージを載せる。
-fn dispatch_route(app: &tauri::AppHandle, route: router::Route) {
+fn dispatch_route(app: &tauri::AppHandle, route: router::Route, cwd: Option<PathBuf>) {
     use tauri::{Emitter, Manager};
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
-        match state.resolve_route_target(&route).await {
+        match state.resolve_route_target(&route, cwd).await {
             Ok(target) => {
                 if let Err(e) = app.emit("open-query-file", target) {
                     eprintln!("[router] failed to emit open-query-file: {e}");
@@ -1193,13 +1198,14 @@ pub fn run() {
         // 実行中インスタンスの deep-link プラグインへ転送され on_open_url が発火する。
         // ここでは追加で (1) ウインドウを前面化し (2) CLI サブコマンド
         // (queryfolio open <path>) を処理する (URL 引数は上記で処理済みなので無視)。
-        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
             use tauri::Manager;
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_focus();
             }
+            // cwd は 2 個目の起動元ディレクトリ。CLI の相対パスをこの基準で解決する。
             if let Some(route) = router::route_from_cli_args(&argv) {
-                dispatch_route(app, route);
+                dispatch_route(app, route, Some(PathBuf::from(cwd)));
             }
         }))
         // queryfolio:// スキームの deep link。macOS はネイティブに URL を受け取り、
@@ -1253,7 +1259,8 @@ pub fn run() {
             app.deep_link().on_open_url(move |event| {
                 for url in event.urls() {
                     match router::parse_uri(url.as_str()) {
-                        Ok(route) => dispatch_route(&handle, route),
+                        // deep link の URL は絶対パス想定なので cwd は不要 (None)
+                        Ok(route) => dispatch_route(&handle, route, None),
                         Err(e) => eprintln!("[router] ignoring URL {url}: {e}"),
                     }
                 }
