@@ -69,10 +69,18 @@ impl SshTunnel {
             return start_system_ssh(alias, target_host, target_port);
         }
 
-        // libssh2 経路: host は必須。
+        // libssh2 経路: host / user は必須 (ssh_config 委譲時のみ省略可)。
+        // serde default で空文字になり得るため明示的に弾く。空のまま進むと
+        // userauth で分かりにくい認証失敗になり、設定漏れだと気付けない。
         if ssh_config.host.trim().is_empty() {
             return Err(AppError::Config(
                 "ssh_tunnel requires 'host' (or set 'ssh_config' to delegate to system ssh)"
+                    .into(),
+            ));
+        }
+        if ssh_config.user.trim().is_empty() {
+            return Err(AppError::Config(
+                "ssh_tunnel requires 'user' (or set 'ssh_config' to delegate to system ssh)"
                     .into(),
             ));
         }
@@ -1265,6 +1273,26 @@ mod tests {
             host: String::new(),
             port: 22,
             user: "u".into(),
+            ssh_config: None,
+            password: None,
+            private_key_path: None,
+            private_key_passphrase: None,
+            identity_agent: None,
+        };
+        assert!(matches!(
+            SshTunnel::start(&cfg, "localhost", 5432),
+            Err(AppError::Config(_))
+        ));
+    }
+
+    /// ssh_config 無しで user が空なら (libssh2 経路で user 必須) エラーを返すこと。
+    /// serde default で "" になっても userauth まで進ませない。
+    #[test]
+    fn start_requires_user_without_ssh_config() {
+        let cfg = SshTunnelConfig {
+            host: "db.example.com".into(),
+            port: 22,
+            user: String::new(),
             ssh_config: None,
             password: None,
             private_key_path: None,
