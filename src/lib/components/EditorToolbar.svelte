@@ -87,9 +87,9 @@
     }
   };
 
-  /// 衝突タブの解消: 手元の編集でディスクを上書き保存する
+  /// 衝突タブの解消: 手元の編集でディスクを上書き保存する (force)
   const onOverwriteConflict = async () => {
-    if (await appStore.saveCurrentFile()) {
+    if (await appStore.overwriteActiveFileConflict()) {
       toast.success("Saved (overwrote the external change)");
     } else {
       toast.error("Failed to save the file", {
