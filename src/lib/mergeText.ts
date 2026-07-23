@@ -19,6 +19,12 @@ export interface Merge3Result {
 /// これを超えるのは通常のクエリファイルでは考えにくく、超えた場合は手動解決に委ねる。
 const MAX_MERGE_LINES = 20000;
 
+/// DP 表は (n+1)*(m+1) のセルを確保するため、行数だけでなく面積 (base×side) でも
+/// 上限を設ける。MAX_MERGE_LINES 単独では base も side も 20000 行のとき約 4 億
+/// セルまで許してしまい、確保時点で UI スレッドを固まらせる/クラッシュさせ得るため。
+/// 4,000,000 セル (例: 2000×2000) を超える組み合わせはマージを諦め衝突扱いにする。
+const MAX_MERGE_CELLS = 4_000_000;
+
 /// text を行配列へ分解する。join("\n") で元に戻せる可逆な分割にするため
 /// split("\n") を使う ("a\nb" -> ["a","b"], "a\nb\n" -> ["a","b",""]).
 function splitLines(text: string): string[] {
@@ -111,10 +117,14 @@ export function merge3(
   const remote = splitLines(remoteText);
 
   // 巨大なファイルは自動マージを諦め衝突扱いにする (呼び出し側が警告する)。
+  // 行数上限に加え、DP 表の面積 (base×local / base×remote) でも制限し、
+  // 巨大な二次元配列の確保でメインスレッドを固まらせないようにする。
   if (
     base.length > MAX_MERGE_LINES ||
     local.length > MAX_MERGE_LINES ||
-    remote.length > MAX_MERGE_LINES
+    remote.length > MAX_MERGE_LINES ||
+    base.length * local.length > MAX_MERGE_CELLS ||
+    base.length * remote.length > MAX_MERGE_CELLS
   ) {
     return { merged: localText, conflict: true };
   }
