@@ -56,6 +56,24 @@
 
   const activeTab = $derived(appStore.activeResultTab);
 
+  /// 結果セットを持たない文 (INSERT / UPDATE / DELETE / DDL 等) の実行結果を、
+  /// DB コンソール風の生の実行メッセージとして組み立てる。最終行には
+  /// [ No result set ] のラベルを置き、表形式の結果が無かったことを明示する。
+  function noResultSetText(result: api.QueryResult): string {
+    const lines: string[] = [];
+    if (result.affected_rows !== null) {
+      const n = result.affected_rows;
+      lines.push(`Query OK, ${n} row${n === 1 ? "" : "s"} affected`);
+    } else {
+      // fetch 系だが列も行も得られなかった稀なケース (describe 不可の SHOW 等)
+      lines.push("Query executed. No rows returned.");
+    }
+    lines.push(`Elapsed: ${result.elapsed_ms} ms`);
+    lines.push("");
+    lines.push("[ No result set ]");
+    return lines.join("\n");
+  }
+
   /// Analyze with AI ボタンの表示条件: EXPLAIN 由来のタブに結果があり、
   /// AI が設定済みであること
   const canAnalyzePlan = $derived(
@@ -1343,7 +1361,10 @@
           </tbody>
         </table>
       {:else if activeTab?.result}
-        <p class="px-3 py-2 text-xs text-zinc-500">No result set</p>
+        {@const result = activeTab.result}
+        <pre
+          class="px-3 py-2 font-mono text-xs whitespace-pre-wrap text-zinc-400"
+          data-annotate="text-no-result-set">{noResultSetText(result)}</pre>
       {:else}
         <p class="px-3 py-2 text-xs text-zinc-500">
           Press Cmd+Enter (Ctrl+Enter) to run the SQL statement under the cursor
