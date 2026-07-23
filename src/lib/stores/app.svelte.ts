@@ -117,6 +117,12 @@ let schemaMapGeneration = 0;
 /// しないよう、コミット前に最新世代かを検査する (schemaMapGeneration と同趣旨)
 let connectionContextGeneration = 0;
 
+/// ファイル/タブのナビゲーション世代。ファイルを開く (selectFile) / タブをアクティブに
+/// する (activateEditorTab) たびに進める。await を挟む処理が、その間にユーザーが別の
+/// ファイル/タブへ移動していないかを検査するのに使う (connectionContextGeneration は
+/// 接続切替しか捕捉しないため、同一接続内のファイル移動はこちらで見る)。
+let navigationGeneration = 0;
+
 let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
 /// 自動保存が予約されているエディタタブ ID (デバウンス中の対象)
 let autoSavePendingTabId: number | null = null;
@@ -165,6 +171,18 @@ const loadAiInfo = async () => {
 /// まだ存在する場合のみ再選択する (ファイル一覧も新設定で再取得される)。
 /// 失敗した場合は false を返す (errorMessage 設定済み)。
 const reloadConnections = async (): Promise<boolean> => {
+  // リロードは全エディタタブを破棄する。衝突タブは saveAllDirtyTabs で保存されない
+  // (外部変更を黙って上書きしないため) ので、そのまま進めると手元の編集が保存も
+  // 明示的な破棄もされないまま失われる。衝突が残っている間はリロードを中断し、
+  // ユーザーに解消 (保存で上書き / reopen で破棄) を促す。
+  const conflicted = editorTabs.find((t) => t.conflicted);
+  if (conflicted) {
+    errorMessage =
+      `Cannot reload config while "${conflicted.file}" has an unresolved ` +
+      `external-change conflict. Save it to overwrite the file, or reopen it ` +
+      `to discard your edits, then reload.`;
+    return false;
+  }
   // タブを破棄するので、pending だけでなく全ての未保存タブを先に保存する
   if (!(await saveAllDirtyTabs())) {
     return false;
@@ -524,6 +542,9 @@ const activateEditorTab = async (id: number) => {
   if (!tab) {
     return;
   }
+  // タブのアクティブ化もナビゲーション。await を挟む処理が「その後にユーザーが
+  // 別タブへ移動した」ことを検知できるよう世代を進める。
+  navigationGeneration++;
   // 未保存タブは best-effort で保存するが、保存失敗でもアクティブ化は止めない。
   // (書込不可などで保存に失敗しても未保存 SQL を閲覧・コピーできるようにする。
   //  タブは残るので内容は失われない)
@@ -573,6 +594,9 @@ const changeActiveSchema = async (schema: string): Promise<boolean> => {
 /// ファイルを開く。既に開いているタブがあればアクティブにし、無ければ
 /// 内容を読み込んで新しいタブを作りアクティブにする (FilesPane から呼ばれる)。
 const selectFile = async (fileName: string) => {
+  // このファイルオープンをナビゲーション世代として記録する (await 中に別ファイル/タブへ
+  // 移動されたかを後で検査するため)。
+  const navGen = ++navigationGeneration;
   // 読み込み先の接続を await 前に固定する。読込中に接続が切り替わっても、
   // タブは必ず「内容を読んだ接続」に紐づける (誤った接続への実行/保存を防ぐ)。
   const connection = selectedConnection;
@@ -592,10 +616,12 @@ const selectFile = async (fileName: string) => {
       } catch (e) {
         errorMessage = toErrorMessage(e);
       }
-      // 読込 await 中にユーザーが別接続/別ファイルへ移動していたら、この結果で
-      // タブを書き換えず、フォーカスも奪わない (遅い読込が新しいナビゲーションを
-      // 巻き戻さないようにする。未着タブ生成パスの stale-read ガードと同方針)。
-      if (selectedConnection !== connection) {
+      // 読込 await 中にユーザーが別接続へ移動、または同一接続内で別ファイル/タブへ
+      // 移動していたら、この結果でタブを書き換えず、フォーカスも奪わない (遅い読込が
+      // 新しいナビゲーションを巻き戻さないようにする。未着タブ生成パスの stale-read
+      // ガードと同方針)。同一接続内のファイル移動は connection 比較では捕まらないため
+      // ナビゲーション世代で検査する。
+      if (selectedConnection !== connection || navigationGeneration !== navGen) {
         return;
       }
       if (disk !== undefined) {
