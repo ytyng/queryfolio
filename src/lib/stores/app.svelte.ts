@@ -1721,7 +1721,10 @@ const checkTabForExternalChange = async (tabId: number) => {
     return;
   }
   // base / local / remote が三者三様 → 3-way マージを試みる。
-  const { merged, conflict } = merge3(base, tab.content, disk);
+  // マージに使った手元の内容を控える (書き込み await 中にユーザーが更に打鍵した場合、
+  // その新しい編集を merged で黙って上書きしないため)。
+  const localSnapshot = tab.content;
+  const { merged, conflict } = merge3(base, localSnapshot, disk);
   if (!conflict) {
     // 別々の箇所への変更なので自動マージできる。結果をディスクへ書き戻す。
     // ただし force で無条件に書くと、この tick の read (disk) 〜 書き込み完了の間に
@@ -1747,14 +1750,21 @@ const checkTabForExternalChange = async (tabId: number) => {
       return;
     }
     if (wrote) {
-      // マージ結果をディスクへ反映できた。エディタと基準を merged に確定する。
-      t2.content = merged;
+      // マージ結果をディスクへ反映できた。ディスクは今 merged。
       t2.diskContent = merged;
-      t2.dirty = false;
       t2.conflicted = false;
-      cancelPendingSaveFor(tabId);
       conflictNotified.delete(tabId);
-      toast.info(`Merged external changes into "${file}"`);
+      if (t2.content === localSnapshot) {
+        // 書き込み中に追加編集は無い → エディタもマージ結果に確定する。
+        t2.content = merged;
+        t2.dirty = false;
+        cancelPendingSaveFor(tabId);
+        toast.info(`Merged external changes into "${file}"`);
+      } else {
+        // await 中にさらに打鍵された → その新しい編集は捨てず dirty のまま残す。
+        // 基準 (diskContent) は merged に進めたので、次 tick / 予約済み自動保存が
+        // 新編集を merged を base として保存/マージする (予約はそのまま活かす)。
+      }
     } else {
       // マージ中にさらに外部書き込みが入った。今回は反映せず (手元の編集はそのまま)、
       // dedup キーを消して次 tick で最新ディスク内容に対して再判定させる。
