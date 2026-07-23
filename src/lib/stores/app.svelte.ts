@@ -867,8 +867,9 @@ const copyFilePath = async (fileName: string): Promise<boolean> => {
 //   (自動マージ or 衝突検知) に委ねる。マージが clean に通ってタブが保存済みになれば
 //   true、衝突が残れば false を返す。検査と書き込みをバックエンドの単一呼び出しで
 //   隣接させることで、フロント往復ぶんの TOCTOU をなくす。
-// force=true: ユーザーの明示的な上書き (Overwrite ボタン) や、算出済みマージ結果の
-//   書き戻しなど、意図的に現在のディスク内容を置き換えたいケース。検査せず書き込む。
+// force=true: ユーザーの明示的な上書き (Overwrite ボタン)。ディスクの現在内容が
+//   何であれ手元の内容で置き換える意思なので、検査せず書き込む。
+//   (自動マージの書き戻しは force ではなく expectedBase=disk の CAS を直接使う。)
 const saveEditorTab = async (
   tab: EditorTab,
   opts: { force?: boolean } = {},
@@ -1722,21 +1723,42 @@ const checkTabForExternalChange = async (tabId: number) => {
   // base / local / remote が三者三様 → 3-way マージを試みる。
   const { merged, conflict } = merge3(base, tab.content, disk);
   if (!conflict) {
-    // 別々の箇所への変更なので自動マージできる。結果を採用しディスクへ書き戻す。
-    tab.content = merged;
-    tab.dirty = true;
-    cancelPendingSaveFor(tabId);
-    // 算出済みのマージ結果を書き戻す。現在のディスクは remote (base と異なる) なので
-    // CAS では拒否される。マージは今読んだ disk を織り込んで作ったものなので force で書く。
-    // saveEditorTab が成功時に diskContent=merged・dirty=false を確定させる
-    // (書込中にさらに編集された場合の lost update も内部で防ぐ)。
-    if (await saveEditorTab(tab, { force: true })) {
+    // 別々の箇所への変更なので自動マージできる。結果をディスクへ書き戻す。
+    // ただし force で無条件に書くと、この tick の read (disk) 〜 書き込み完了の間に
+    // さらに別プロセスが保存した場合、古い disk を基にした merged で新しい外部保存を
+    // 黙って上書きしてしまう。マージの基にした disk スナップショットとディスクが
+    // まだ一致する時だけ書く CAS にする (expectedBase=disk)。食い違っていたら書かず、
+    // 次 tick で最新内容に対して改めてマージ/衝突判定させる。
+    let wrote = false;
+    try {
+      wrote = await api.writeQueryFileIfUnchanged(connection, file, merged, disk);
+    } catch (e) {
+      errorMessage = `Failed to save the file: ${toErrorMessage(e)}`;
+    }
+    // 書き込み await 中にタブが閉じられた / 別ファイルになった / base が進んだ場合は
+    // この結果を反映しない (次 tick で最新状態を見る)。
+    const t2 = editorTabs.find((t) => t.id === tabId);
+    if (
+      !t2 ||
+      t2.connection !== connection ||
+      t2.file !== file ||
+      t2.diskContent !== base
+    ) {
+      return;
+    }
+    if (wrote) {
+      // マージ結果をディスクへ反映できた。エディタと基準を merged に確定する。
+      t2.content = merged;
+      t2.diskContent = merged;
+      t2.dirty = false;
+      t2.conflicted = false;
+      cancelPendingSaveFor(tabId);
       conflictNotified.delete(tabId);
       toast.info(`Merged external changes into "${file}"`);
     } else {
-      // 書込失敗時は基準が base のまま残り次 tick で再検知される。同じ状態での
-      // 通知多重化だけ dedup で防ぐ (errorMessage は saveEditorTab が表示済み)。
-      conflictNotified.set(tabId, disk);
+      // マージ中にさらに外部書き込みが入った。今回は反映せず (手元の編集はそのまま)、
+      // dedup キーを消して次 tick で最新ディスク内容に対して再判定させる。
+      conflictNotified.delete(tabId);
     }
     return;
   }
