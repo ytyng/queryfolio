@@ -699,6 +699,21 @@ const removeEditorTab = async (id: number, save: boolean) => {
   if (!tab) {
     return;
   }
+  // 衝突タブ (外部変更 vs 手元の未保存編集) を閉じる時は、どちらかを黙って失わない。
+  // 通常の dirty タブは閉じる前に保存されるが、衝突タブを保存すると外部変更を黙って
+  // 上書きし、逆に破棄すると手元の編集を黙って失う。どちらを捨てるかはユーザーの
+  // 明示操作 (保存で上書き / reopen で破棄) に委ねるべきなので、閉じる操作はブロックし
+  // トーストで解消を促す。save=false (ファイル削除で閉じる等) は保存も上書きもしないため対象外。
+  if (save && tab.conflicted) {
+    toast.warning(
+      `"${tab.file}" has unsaved edits conflicting with an external change`,
+      {
+        description:
+          "Save to overwrite the file, or reopen it to discard your edits, before closing.",
+      },
+    );
+    return;
+  }
   // このタブの自動保存予約が残っていれば解除する (閉じた後に走らせない)
   if (autoSavePendingTabId === id) {
     if (autoSaveTimer) {
@@ -707,10 +722,9 @@ const removeEditorTab = async (id: number, save: boolean) => {
     }
     autoSavePendingTabId = null;
   }
-  // 衝突タブは閉じる時に保存しない (= 手元の編集を破棄しディスクの外部変更を残す)。
-  // 保存すると "reopen the file to discard them" の案内に反して外部変更を黙って
-  // 上書きしてしまう。閉じる操作は破棄の意思とみなす。
-  if (save && tab.dirty && !tab.conflicted) {
+  // 通常の dirty タブは閉じる前に保存する (衝突タブは上でブロック済みなのでここには
+  // 到達しない)。
+  if (save && tab.dirty) {
     // 保存に失敗したら閉じない (未保存内容をメモリごと失わないため)
     if (!(await saveEditorTab(tab))) {
       return;
