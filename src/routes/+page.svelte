@@ -168,6 +168,9 @@
   const selectedEngine = $derived(selectedConnectionInfo?.engine ?? null);
 
   onMount(() => {
+    // 開いているクエリファイルが外部で変更されたら自動リロード / マージする
+    appStore.startFileWatcher();
+
     // メニューの Reload config file からの通知を受けて再読込する
     const unlistenPromise = listen("menu-reload-config", async () => {
       if (await appStore.reloadConnections()) {
@@ -261,6 +264,7 @@
     })();
 
     return () => {
+      appStore.stopFileWatcher();
       void unlistenPromise.then((unlisten) => unlisten());
       void unlistenEditPromise.then((unlisten) => unlisten());
       void unlistenEditSourcePromise.then((unlisten) => unlisten());

@@ -2,8 +2,12 @@ import { toast } from "svelte-sonner";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import * as api from "$lib/api";
 import type { AiInfo, ConnectionInfo, QueryResult } from "$lib/api";
+import { merge3 } from "$lib/mergeText";
 
 const AUTO_SAVE_DELAY_MS = 1000;
+
+/// 開いているクエリファイルがアプリ外で変更されていないか調べる間隔 (ms)。
+const FILE_WATCH_INTERVAL_MS = 2500;
 
 /// 結果タブの上限。超過時は最も古い非ピン留めタブを破棄する
 const MAX_RESULT_TABS = 10;
@@ -46,6 +50,9 @@ export interface EditorTab {
   content: string;
   /// 未保存の編集があるか (自動保存で false に戻る)
   dirty: boolean;
+  /// ディスク上にあると分かっている内容 (読込時 = 読んだ内容、保存時 = 書いた内容)。
+  /// 外部変更の検知 (この値と実ファイルを突き合わせる) と 3-way マージの base に使う。
+  diskContent: string;
 }
 
 let connections = $state<ConnectionInfo[]>([]);
@@ -590,6 +597,7 @@ const selectFile = async (fileName: string) => {
       file: fileName,
       content,
       dirty: false,
+      diskContent: content,
     };
     editorTabs = [...editorTabs, tab];
     activeEditorTabId = tab.id;
@@ -784,6 +792,9 @@ const saveEditorTab = async (tab: EditorTab): Promise<boolean> => {
   const saved = tab.content;
   try {
     await api.writeQueryFile(tab.connection, tab.file, saved);
+    // 自分が書いた内容をディスクの既知内容として控える。これにより外部変更
+    // ウォッチャが「自分の保存」を外部変更と誤検知しない。
+    tab.diskContent = saved;
     if (tab.content === saved) {
       tab.dirty = false;
     }
@@ -1433,6 +1444,162 @@ const toggleResultTabPin = (id: number) => {
   }
 };
 
+/// ===== 外部ファイル変更のウォッチャ =====
+/// 開いているクエリファイルがアプリ外 (別エディタ・git・他プロセス) で変更された時に、
+/// 未編集なら自動リロードし、編集中なら 3-way マージを試み、衝突時は警告する。
+/// クエリファイルの読込はローカル FS のみ (DB / SSH トンネルには触れない) ため、
+/// バックグラウンドで定期的に読み直しても接続を開いてしまうことはない。
+
+let fileWatchTimer: ReturnType<typeof setInterval> | null = null;
+/// tick の多重実行を防ぐ (ファイル読込は非同期のため)。
+let fileWatchTicking = false;
+/// タブごとに「既に衝突を警告したディスク内容」を覚え、同じ状態で毎 tick 警告を
+/// 繰り返さないようにする。解消・タブクローズでエントリを消す。
+const conflictNotified = new Map<number, string>();
+
+/// このタブの保留中の自動保存予約を解除する (外部変更を取り込んだ後に、古い
+/// エディタ内容で上書き保存し直されるのを防ぐ)。
+const cancelPendingSaveFor = (tabId: number) => {
+  if (autoSavePendingTabId === tabId) {
+    if (autoSaveTimer) {
+      clearTimeout(autoSaveTimer);
+      autoSaveTimer = null;
+    }
+    autoSavePendingTabId = null;
+  }
+};
+
+/// 1 つのエディタタブについて外部変更を調べて反映する。
+const checkTabForExternalChange = async (tabId: number) => {
+  const before = editorTabs.find((t) => t.id === tabId);
+  if (!before) {
+    return;
+  }
+  const { connection, file } = before;
+  // 読込前の base を控える。読込中に自動保存が完了して diskContent が進むと、
+  // 古い read 結果を新しい base への外部変更と誤認しかねないため、読込後に
+  // base が変わっていたらこの tick は見送る (次の tick で最新状態を見る)。
+  const baseAtStart = before.diskContent;
+  let disk: string;
+  try {
+    disk = await api.readQueryFile(connection, file);
+  } catch {
+    // 読めない (外部で削除された等) 場合は何もしない。次の契機に委ねる。
+    return;
+  }
+  // await の間にタブが閉じられた / ファイル名が変わった可能性があるので取り直す。
+  const tab = editorTabs.find((t) => t.id === tabId);
+  if (!tab || tab.connection !== connection || tab.file !== file) {
+    return;
+  }
+  // 読込中に保存が回り込んで base (diskContent) が変わっていたら、この read は
+  // 古い可能性があるので判定しない。
+  if (tab.diskContent !== baseAtStart) {
+    return;
+  }
+
+  const base = tab.diskContent;
+  if (disk === base) {
+    // 外部変更なし。過去の衝突警告が残っていればクリアする。
+    conflictNotified.delete(tabId);
+    return;
+  }
+  // ここに来た = ディスクが最後に把握した内容と異なる (外部変更あり)。
+  if (tab.content === base) {
+    // 手元に未保存の編集が無い → 外部の内容をそのまま採用してリロードする。
+    tab.content = disk;
+    tab.diskContent = disk;
+    tab.dirty = false;
+    cancelPendingSaveFor(tabId);
+    conflictNotified.delete(tabId);
+    toast.info(`Reloaded "${file}" (changed on disk)`);
+    return;
+  }
+  if (tab.content === disk) {
+    // 手元の編集が結果的にディスクと一致 (保存が回り込んだ等)。表示は変えず基準だけ更新。
+    tab.diskContent = disk;
+    tab.dirty = false;
+    conflictNotified.delete(tabId);
+    return;
+  }
+  // base / local / remote が三者三様 → 3-way マージを試みる。
+  const { merged, conflict } = merge3(base, tab.content, disk);
+  if (!conflict) {
+    // 別々の箇所への変更なので自動マージできる。結果を採用しディスクへ書き戻す。
+    tab.content = merged;
+    tab.dirty = true;
+    cancelPendingSaveFor(tabId);
+    // saveEditorTab が成功時に diskContent=merged・dirty=false を確定させる
+    // (書込中にさらに編集された場合の lost update も内部で防ぐ)。
+    if (await saveEditorTab(tab)) {
+      conflictNotified.delete(tabId);
+      toast.info(`Merged external changes into "${file}"`);
+    } else {
+      // 書込失敗時は基準が base のまま残り次 tick で再検知される。同じ状態での
+      // 通知多重化だけ dedup で防ぐ (errorMessage は saveEditorTab が表示済み)。
+      conflictNotified.set(tabId, disk);
+    }
+    return;
+  }
+  // 同じ箇所を双方が別々に変更 → 自動マージ不可。未保存の編集は保持し、警告する。
+  // 保留中の自動保存は解除する。解除しないと、警告直後にデバウンス保存が走って
+  // ユーザー操作なしに手元の編集で外部変更を上書きし、「Save to overwrite」という
+  // 案内と実挙動が食い違う。以後ユーザーが編集を続ければ通常どおり保存が予約され、
+  // 明示的な意思 (編集継続 / 保存) で手元の内容が優先される。
+  cancelPendingSaveFor(tabId);
+  // 同じディスク状態で毎 tick 警告しないよう既通知を記録する。
+  if (conflictNotified.get(tabId) !== disk) {
+    conflictNotified.set(tabId, disk);
+    toast.warning(`"${file}" was changed on disk, but you have unsaved edits`, {
+      description:
+        "Your edits are kept. Save to overwrite, or reopen the file to discard them.",
+    });
+  }
+};
+
+const fileWatchTick = async () => {
+  if (fileWatchTicking) {
+    return;
+  }
+  fileWatchTicking = true;
+  try {
+    // 開始時点の id スナップショットで回す (処理中に配列が変わっても安全)。
+    const ids = editorTabs.map((t) => t.id);
+    for (const id of ids) {
+      await checkTabForExternalChange(id);
+    }
+    // 閉じられたタブの通知記録を掃除する。
+    const alive = new Set(editorTabs.map((t) => t.id));
+    for (const id of [...conflictNotified.keys()]) {
+      if (!alive.has(id)) {
+        conflictNotified.delete(id);
+      }
+    }
+  } finally {
+    fileWatchTicking = false;
+  }
+};
+
+/// 外部ファイル変更のポーリングを開始する (+page の onMount から呼ぶ)。
+const startFileWatcher = () => {
+  if (fileWatchTimer) {
+    return;
+  }
+  fileWatchTimer = setInterval(
+    () => void fileWatchTick(),
+    FILE_WATCH_INTERVAL_MS,
+  );
+};
+
+/// ポーリングを停止する (+page の onDestroy から呼ぶ)。
+const stopFileWatcher = () => {
+  if (fileWatchTimer) {
+    clearInterval(fileWatchTimer);
+    fileWatchTimer = null;
+  }
+  conflictNotified.clear();
+};
+
 export default {
   get connections() {
     return connections;
@@ -1574,4 +1741,6 @@ export default {
   selectResultTab,
   closeResultTab,
   toggleResultTabPin,
+  startFileWatcher,
+  stopFileWatcher,
 };
