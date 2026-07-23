@@ -155,6 +155,21 @@ export const writeQueryFile = (
   content: string,
 ) => invoke<void>("write_query_file", { connection, fileName, content });
 
+/// 楽観的排他つきの書き込み。expectedBase とディスクの現在内容が一致する時だけ書き込む。
+/// 書けたら true、アプリ外で変更されていて書かなかったら false を返す。
+export const writeQueryFileIfUnchanged = (
+  connection: string,
+  fileName: string,
+  content: string,
+  expectedBase: string,
+) =>
+  invoke<boolean>("write_query_file_if_unchanged", {
+    connection,
+    fileName,
+    content,
+    expectedBase,
+  });
+
 export const createQueryFile = (connection: string, fileName: string) =>
   invoke<string>("create_query_file", { connection, fileName });
 

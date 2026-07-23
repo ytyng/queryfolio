@@ -861,11 +861,12 @@ const copyFilePath = async (fileName: string): Promise<boolean> => {
 // エディタタブの内容を保存する。成功したら true。
 // 失敗時は dirty を保持したまま errorMessage を設定する。
 //
-// force=false (既定): 暗黙の保存 (自動保存・閉じる前保存等)。書き込み前にディスクの
-//   現在内容を読み、こちらが把握している base (diskContent) と食い違っていたら、その
-//   外部変更を黙って上書きしない。書き込まずに checkTabForExternalChange へ委ね
-//   (自動マージ or 衝突検知)、false を返す。ウォッチャの間隔 (2.5s) より自動保存の
-//   debounce (1s) が短いため、両者の隙間に外部書き込みが入っても取りこぼさないための CAS。
+// force=false (既定): 暗黙の保存 (自動保存・閉じる前保存等)。バックエンドの
+//   write_query_file_if_unchanged で、把握している base (diskContent) とディスクの
+//   現在内容が一致する時だけ書く (楽観的排他)。食い違えば書かず、外部変更処理
+//   (自動マージ or 衝突検知) に委ねる。マージが clean に通ってタブが保存済みになれば
+//   true、衝突が残れば false を返す。検査と書き込みをバックエンドの単一呼び出しで
+//   隣接させることで、フロント往復ぶんの TOCTOU をなくす。
 // force=true: ユーザーの明示的な上書き (Overwrite ボタン) や、算出済みマージ結果の
 //   書き戻しなど、意図的に現在のディスク内容を置き換えたいケース。検査せず書き込む。
 const saveEditorTab = async (
@@ -877,29 +878,37 @@ const saveEditorTab = async (
   // 変わっていない時だけ dirty を下ろす。
   const saved = tab.content;
   const expectedBase = tab.diskContent;
-  const readFile = tab.file;
   try {
     if (!opts.force) {
-      // 書き込み前に外部変更を検査する (楽観的排他)。読めない (削除された等) 場合は
-      // 従来どおり書きにいく (再作成)。
-      let current: string | undefined;
+      // バックエンドで CAS 書き込み。書けなければ外部変更あり。
+      let wrote: boolean;
       try {
-        current = await api.readQueryFile(tab.connection, readFile);
-      } catch {
-        current = undefined;
-      }
-      // 読込 await 中にタブが閉じられた / ファイル名が変わった (rename) 場合は中断する
-      // (古い名前で読んだ結果で現在の状態を判定しない)。
-      const still = editorTabs.find((t) => t.id === tab.id);
-      if (!still || still.file !== readFile) {
+        wrote = await api.writeQueryFileIfUnchanged(
+          tab.connection,
+          tab.file,
+          saved,
+          expectedBase,
+        );
+      } catch (e) {
+        errorMessage = `Failed to save the file: ${toErrorMessage(e)}`;
         return false;
       }
-      if (current !== undefined && current !== expectedBase) {
+      if (!wrote) {
         // ディスクが base と食い違う = 外部変更あり。黙って上書きせず、外部変更処理
-        // (自動マージ / 衝突検知) に委ねる。書き込みは行わない。
+        // (自動マージ / 衝突検知) に委ねる。自動マージが clean に通れば tab は保存済み
+        // (dirty=false) になるので、その実際の結果を返す (close/reload/rename が
+        // マージ成功を「保存失敗」と誤認して中断しないように)。
         await checkTabForExternalChange(tab.id);
-        return false;
+        const after = editorTabs.find((t) => t.id === tab.id);
+        return !!after && !after.dirty && !after.conflicted;
       }
+      // 書けた → 状態確定。
+      tab.diskContent = saved;
+      tab.conflicted = false;
+      if (tab.content === saved) {
+        tab.dirty = false;
+      }
+      return true;
     }
     await api.writeQueryFile(tab.connection, tab.file, saved);
     // 自分が書いた内容をディスクの既知内容として控える。これにより外部変更
