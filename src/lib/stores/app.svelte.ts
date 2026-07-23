@@ -845,19 +845,10 @@ const saveCurrentFile = async (): Promise<boolean> => {
   return saveEditorTab(tab);
 };
 
-/// エディタからの変更通知。アクティブタブの内容を更新し、自動保存を
-/// デバウンスして予約する。予約は編集中のタブを対象にする。
-const updateEditorContent = (content: string) => {
-  const tab = getActiveEditorTab();
-  if (!tab || content === tab.content) {
-    return;
-  }
-  tab.content = content;
-  tab.dirty = true;
-  // ユーザーが自ら編集を続けた = 手元の内容を優先する明示的な意思。衝突による自動保存
-  // 抑止を外し、通常どおりデバウンス保存 (外部変更の上書き) を予約する。
-  tab.conflicted = false;
-  autoSavePendingTabId = tab.id;
+/// 指定タブのデバウンス自動保存を (張り直して) 予約する。既存の予約は解除される
+/// (自動保存は一度に 1 タブのみを対象にする既存仕様に合わせる)。
+const scheduleAutoSave = (tabId: number) => {
+  autoSavePendingTabId = tabId;
   if (autoSaveTimer) {
     clearTimeout(autoSaveTimer);
   }
@@ -870,6 +861,21 @@ const updateEditorContent = (content: string) => {
       void saveEditorTab(target);
     }
   }, AUTO_SAVE_DELAY_MS);
+};
+
+/// エディタからの変更通知。アクティブタブの内容を更新し、自動保存を
+/// デバウンスして予約する。予約は編集中のタブを対象にする。
+const updateEditorContent = (content: string) => {
+  const tab = getActiveEditorTab();
+  if (!tab || content === tab.content) {
+    return;
+  }
+  tab.content = content;
+  tab.dirty = true;
+  // ユーザーが自ら編集を続けた = 手元の内容を優先する明示的な意思。衝突による自動保存
+  // 抑止を外し、通常どおりデバウンス保存 (外部変更の上書き) を予約する。
+  tab.conflicted = false;
+  scheduleAutoSave(tab.id);
 };
 
 /// 履歴パネル・スキーマブラウザからの SQL 断片の挿入。
@@ -1536,6 +1542,18 @@ const checkTabForExternalChange = async (tabId: number) => {
   if (disk === base) {
     // 外部変更なし。過去の衝突警告が残っていればクリアする。
     conflictNotified.delete(tabId);
+    // 衝突を起こした外部変更が元に戻り disk が base と一致した場合、衝突は解消。
+    // conflicted を残すと、外部変更が無いのに dirty タブが衝突扱いのままとなり、
+    // 閉じる/リロード時に手元の編集が破棄されてしまう。フラグを下ろし、まだ dirty
+    // なら通常のデバウンス自動保存を張り直して編集を確実に永続化する
+    // (衝突検知時に cancelPendingSaveFor で予約を外しているため、張り直さないと
+    //  次の編集まで自動保存されない)。
+    if (tab.conflicted) {
+      tab.conflicted = false;
+      if (tab.dirty) {
+        scheduleAutoSave(tabId);
+      }
+    }
     return;
   }
   // ここに来た = ディスクが最後に把握した内容と異なる (外部変更あり)。
