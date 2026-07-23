@@ -179,8 +179,8 @@ const reloadConnections = async (): Promise<boolean> => {
   if (conflicted) {
     errorMessage =
       `Cannot reload config while "${conflicted.file}" has an unresolved ` +
-      `external-change conflict. Save it to overwrite the file, or reopen it ` +
-      `to discard your edits, then reload.`;
+      `external-change conflict. Resolve it with Overwrite or Discard in the ` +
+      `editor toolbar, then reload.`;
     return false;
   }
   // タブを破棄するので、pending だけでなく全ての未保存タブを先に保存する
@@ -709,7 +709,7 @@ const removeEditorTab = async (id: number, save: boolean) => {
       `"${tab.file}" has unsaved edits conflicting with an external change`,
       {
         description:
-          "Save to overwrite the file, or reopen it to discard your edits, before closing.",
+          "Resolve it first with Overwrite or Discard in the editor toolbar, then close.",
       },
     );
     return;
@@ -890,6 +890,43 @@ const saveCurrentFile = async (): Promise<boolean> => {
     return true;
   }
   return saveEditorTab(tab);
+};
+
+/// アクティブな衝突タブについて、手元の未保存編集を破棄してディスクの内容を読み直す。
+/// 警告文の "reopen the file to discard" と同じ効果を、常に到達可能な UI (ツールバー)
+/// から明示的に呼べるようにするための手段 (選択中ファイルの再クリックが Rename に
+/// なる等で reopen 経路に到達できないケースの逃げ道)。
+const discardActiveFileConflict = async (): Promise<void> => {
+  const tab = getActiveEditorTab();
+  if (!tab || !tab.conflicted) {
+    return;
+  }
+  const { id, connection, file } = tab;
+  let disk: string;
+  try {
+    disk = await api.readQueryFile(connection, file);
+  } catch (e) {
+    errorMessage = toErrorMessage(e);
+    return;
+  }
+  // 読込 await 中にタブが閉じられた / 別接続へ移動した / ファイル名が変わった場合は
+  // 適用しない (古い読込で現在の状態を壊さない)。
+  const cur = editorTabs.find((t) => t.id === id);
+  if (
+    !cur ||
+    selectedConnection !== connection ||
+    cur.connection !== connection ||
+    cur.file !== file
+  ) {
+    return;
+  }
+  cur.content = disk;
+  cur.diskContent = disk;
+  cur.dirty = false;
+  cur.conflicted = false;
+  cancelPendingSaveFor(id);
+  conflictNotified.delete(id);
+  toast.info(`Reloaded "${file}" (discarded unsaved edits)`);
 };
 
 /// 指定タブのデバウンス自動保存を (張り直して) 予約する。既存の予約は解除される
@@ -1665,7 +1702,7 @@ const checkTabForExternalChange = async (tabId: number) => {
     conflictNotified.set(tabId, disk);
     toast.warning(`"${file}" was changed on disk, but you have unsaved edits`, {
       description:
-        "Your edits are kept. Save to overwrite, or reopen the file to discard them.",
+        "Your edits are kept. Use Overwrite or Discard in the editor toolbar to resolve.",
     });
   }
 };
@@ -1778,6 +1815,10 @@ export default {
   get dirty() {
     return getActiveEditorTab()?.dirty ?? false;
   },
+  /// アクティブなエディタタブが外部変更との衝突状態か (ツールバーの解消 UI 表示に使う)
+  get activeFileConflicted() {
+    return getActiveEditorTab()?.conflicted ?? false;
+  },
   get schemas() {
     return schemas;
   },
@@ -1836,6 +1877,7 @@ export default {
   renameFile,
   copyFilePath,
   saveCurrentFile,
+  discardActiveFileConflict,
   updateEditorContent,
   insertSqlSnippet,
   fixSqlWithAi,

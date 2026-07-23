@@ -87,6 +87,22 @@
     }
   };
 
+  /// 衝突タブの解消: 手元の編集でディスクを上書き保存する
+  const onOverwriteConflict = async () => {
+    if (await appStore.saveCurrentFile()) {
+      toast.success("Saved (overwrote the external change)");
+    } else {
+      toast.error("Failed to save the file", {
+        description: appStore.errorMessage ?? undefined,
+      });
+    }
+  };
+
+  /// 衝突タブの解消: 手元の編集を破棄してディスクの内容を読み直す
+  const onDiscardConflict = async () => {
+    await appStore.discardActiveFileConflict();
+  };
+
   const onSchemaChange = async (e: Event) => {
     const select = e.currentTarget as HTMLSelectElement;
     const schema = select.value;
@@ -125,6 +141,36 @@
     >
       read-only
     </span>
+  {/if}
+
+  <!-- 外部変更との衝突中は、常に到達可能な解消手段 (上書き / 破棄) を出す。
+       ファイル一覧の再クリックが Rename になり reopen 経路に届かないケースの逃げ道。 -->
+  {#if appStore.activeFileConflicted}
+    <span
+      class="flex items-center gap-1 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] tracking-wide text-amber-400"
+      title="This file was changed on disk while you have unsaved edits"
+      data-annotate="badge-editor-conflict"
+    >
+      <i class="bi bi-exclamation-triangle-fill" aria-hidden="true"></i> conflict
+    </span>
+    <button
+      type="button"
+      class="rounded border border-amber-500/50 bg-amber-500/15 px-2 py-0.5 text-xs text-amber-300 hover:bg-amber-500/25"
+      data-annotate="button-conflict-overwrite"
+      title="Save your edits, overwriting the external change on disk"
+      onclick={onOverwriteConflict}
+    >
+      <i class="bi bi-save" aria-hidden="true"></i> Overwrite
+    </button>
+    <button
+      type="button"
+      class="rounded border border-zinc-600 bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-700"
+      data-annotate="button-conflict-discard"
+      title="Discard your unsaved edits and reload the file from disk"
+      onclick={onDiscardConflict}
+    >
+      <i class="bi bi-arrow-counterclockwise" aria-hidden="true"></i> Discard
+    </button>
   {/if}
 
   <span class="text-xs text-zinc-500">Database:</span>
