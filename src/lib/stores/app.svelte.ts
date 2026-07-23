@@ -2,8 +2,12 @@ import { toast } from "svelte-sonner";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import * as api from "$lib/api";
 import type { AiInfo, ConnectionInfo, QueryResult } from "$lib/api";
+import { merge3 } from "$lib/mergeText";
 
 const AUTO_SAVE_DELAY_MS = 1000;
+
+/// 開いているクエリファイルがアプリ外で変更されていないか調べる間隔 (ms)。
+const FILE_WATCH_INTERVAL_MS = 2500;
 
 /// 結果タブの上限。超過時は最も古い非ピン留めタブを破棄する
 const MAX_RESULT_TABS = 10;
@@ -46,6 +50,14 @@ export interface EditorTab {
   content: string;
   /// 未保存の編集があるか (自動保存で false に戻る)
   dirty: boolean;
+  /// ディスク上にあると分かっている内容 (読込時 = 読んだ内容、保存時 = 書いた内容)。
+  /// 外部変更の検知 (この値と実ファイルを突き合わせる) と 3-way マージの base に使う。
+  diskContent: string;
+  /// 外部変更と手元の未保存編集が自動マージ不能な衝突状態にあるか。true の間は
+  /// 「閉じる」「アプリ終了」等での自動保存を抑止し、手元の編集で外部変更を黙って
+  /// 上書きするのを防ぐ (警告文の "reopen the file to discard" を実挙動と一致させる)。
+  /// ユーザーが編集を続けるか明示保存すれば false に戻り、通常の上書き保存に従う。
+  conflicted?: boolean;
 }
 
 let connections = $state<ConnectionInfo[]>([]);
@@ -105,6 +117,12 @@ let schemaMapGeneration = 0;
 /// しないよう、コミット前に最新世代かを検査する (schemaMapGeneration と同趣旨)
 let connectionContextGeneration = 0;
 
+/// ファイル/タブのナビゲーション世代。ファイルを開く (selectFile) / タブをアクティブに
+/// する (activateEditorTab) たびに進める。await を挟む処理が、その間にユーザーが別の
+/// ファイル/タブへ移動していないかを検査するのに使う (connectionContextGeneration は
+/// 接続切替しか捕捉しないため、同一接続内のファイル移動はこちらで見る)。
+let navigationGeneration = 0;
+
 let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
 /// 自動保存が予約されているエディタタブ ID (デバウンス中の対象)
 let autoSavePendingTabId: number | null = null;
@@ -153,6 +171,18 @@ const loadAiInfo = async () => {
 /// まだ存在する場合のみ再選択する (ファイル一覧も新設定で再取得される)。
 /// 失敗した場合は false を返す (errorMessage 設定済み)。
 const reloadConnections = async (): Promise<boolean> => {
+  // リロードは全エディタタブを破棄する。衝突タブは saveAllDirtyTabs で保存されない
+  // (外部変更を黙って上書きしないため) ので、そのまま進めると手元の編集が保存も
+  // 明示的な破棄もされないまま失われる。衝突が残っている間はリロードを中断し、
+  // ユーザーに解消 (保存で上書き / reopen で破棄) を促す。
+  const conflicted = editorTabs.find((t) => t.conflicted);
+  if (conflicted) {
+    errorMessage =
+      `Cannot reload config while "${conflicted.file}" has an unresolved ` +
+      `external-change conflict. Resolve it with Overwrite or Discard in the ` +
+      `editor toolbar, then reload.`;
+    return false;
+  }
   // タブを破棄するので、pending だけでなく全ての未保存タブを先に保存する
   if (!(await saveAllDirtyTabs())) {
     return false;
@@ -268,7 +298,9 @@ const saveAllDirtyTabs = async (): Promise<boolean> => {
   autoSavePendingTabId = null;
   let ok = true;
   for (const tab of editorTabs) {
-    if (tab.dirty) {
+    // 衝突タブは保存しない (外部変更を手元の編集で黙って上書きしないため)。
+    // ユーザーが編集継続 / 明示保存で衝突を解いた場合のみ通常の dirty として保存される。
+    if (tab.dirty && !tab.conflicted) {
       if (!(await saveEditorTab(tab))) {
         ok = false;
       }
@@ -510,6 +542,9 @@ const activateEditorTab = async (id: number) => {
   if (!tab) {
     return;
   }
+  // タブのアクティブ化もナビゲーション。await を挟む処理が「その後にユーザーが
+  // 別タブへ移動した」ことを検知できるよう世代を進める。
+  navigationGeneration++;
   // 未保存タブは best-effort で保存するが、保存失敗でもアクティブ化は止めない。
   // (書込不可などで保存に失敗しても未保存 SQL を閲覧・コピーできるようにする。
   //  タブは残るので内容は失われない)
@@ -559,6 +594,9 @@ const changeActiveSchema = async (schema: string): Promise<boolean> => {
 /// ファイルを開く。既に開いているタブがあればアクティブにし、無ければ
 /// 内容を読み込んで新しいタブを作りアクティブにする (FilesPane から呼ばれる)。
 const selectFile = async (fileName: string) => {
+  // このファイルオープンをナビゲーション世代として記録する (await 中に別ファイル/タブへ
+  // 移動されたかを後で検査するため)。
+  const navGen = ++navigationGeneration;
   // 読み込み先の接続を await 前に固定する。読込中に接続が切り替わっても、
   // タブは必ず「内容を読んだ接続」に紐づける (誤った接続への実行/保存を防ぐ)。
   const connection = selectedConnection;
@@ -569,6 +607,33 @@ const selectFile = async (fileName: string) => {
     (t) => t.connection === connection && t.file === fileName,
   );
   if (existing) {
+    // 衝突状態のタブを開き直した場合は、警告文 "reopen the file to discard them" に
+    // 従い手元の編集を破棄してディスクの内容を読み直す (best-effort。失敗時は現状維持)。
+    if (existing.conflicted) {
+      let disk: string | undefined;
+      try {
+        disk = await api.readQueryFile(connection, fileName);
+      } catch (e) {
+        errorMessage = toErrorMessage(e);
+      }
+      // 読込 await 中にユーザーが別接続へ移動、または同一接続内で別ファイル/タブへ
+      // 移動していたら、この結果でタブを書き換えず、フォーカスも奪わない (遅い読込が
+      // 新しいナビゲーションを巻き戻さないようにする。未着タブ生成パスの stale-read
+      // ガードと同方針)。同一接続内のファイル移動は connection 比較では捕まらないため
+      // ナビゲーション世代で検査する。
+      if (selectedConnection !== connection || navigationGeneration !== navGen) {
+        return;
+      }
+      if (disk !== undefined) {
+        existing.content = disk;
+        existing.diskContent = disk;
+        existing.dirty = false;
+        existing.conflicted = false;
+        cancelPendingSaveFor(existing.id);
+        conflictNotified.delete(existing.id);
+        toast.info(`Reloaded "${fileName}" (discarded unsaved edits)`);
+      }
+    }
     await activateEditorTab(existing.id);
     // ファイルをエディタで開いた = 接続を使う契機。トンネル/接続を張り直す
     // (全エディタを閉じて切断した後に再度開いた場合もここで復帰する)。
@@ -590,6 +655,7 @@ const selectFile = async (fileName: string) => {
       file: fileName,
       content,
       dirty: false,
+      diskContent: content,
     };
     editorTabs = [...editorTabs, tab];
     activeEditorTabId = tab.id;
@@ -633,6 +699,21 @@ const removeEditorTab = async (id: number, save: boolean) => {
   if (!tab) {
     return;
   }
+  // 衝突タブ (外部変更 vs 手元の未保存編集) を閉じる時は、どちらかを黙って失わない。
+  // 通常の dirty タブは閉じる前に保存されるが、衝突タブを保存すると外部変更を黙って
+  // 上書きし、逆に破棄すると手元の編集を黙って失う。どちらを捨てるかはユーザーの
+  // 明示操作 (保存で上書き / reopen で破棄) に委ねるべきなので、閉じる操作はブロックし
+  // トーストで解消を促す。save=false (ファイル削除で閉じる等) は保存も上書きもしないため対象外。
+  if (save && tab.conflicted) {
+    toast.warning(
+      `"${tab.file}" has unsaved edits conflicting with an external change`,
+      {
+        description:
+          "Resolve it first with Overwrite or Discard in the editor toolbar, then close.",
+      },
+    );
+    return;
+  }
   // このタブの自動保存予約が残っていれば解除する (閉じた後に走らせない)
   if (autoSavePendingTabId === id) {
     if (autoSaveTimer) {
@@ -641,6 +722,8 @@ const removeEditorTab = async (id: number, save: boolean) => {
     }
     autoSavePendingTabId = null;
   }
+  // 通常の dirty タブは閉じる前に保存する (衝突タブは上でブロック済みなのでここには
+  // 到達しない)。
   if (save && tab.dirty) {
     // 保存に失敗したら閉じない (未保存内容をメモリごと失わないため)
     if (!(await saveEditorTab(tab))) {
@@ -777,13 +860,64 @@ const copyFilePath = async (fileName: string): Promise<boolean> => {
 
 // エディタタブの内容を保存する。成功したら true。
 // 失敗時は dirty を保持したまま errorMessage を設定する。
-const saveEditorTab = async (tab: EditorTab): Promise<boolean> => {
+//
+// force=false (既定): 暗黙の保存 (自動保存・閉じる前保存等)。バックエンドの
+//   write_query_file_if_unchanged で、把握している base (diskContent) とディスクの
+//   現在内容が一致する時だけ書く (楽観的排他)。食い違えば書かず、外部変更処理
+//   (自動マージ or 衝突検知) に委ねる。マージが clean に通ってタブが保存済みになれば
+//   true、衝突が残れば false を返す。検査と書き込みをバックエンドの単一呼び出しで
+//   隣接させることで、フロント往復ぶんの TOCTOU をなくす。
+// force=true: ユーザーの明示的な上書き (Overwrite ボタン)。ディスクの現在内容が
+//   何であれ手元の内容で置き換える意思なので、検査せず書き込む。
+//   (自動マージの書き戻しは force ではなく expectedBase=disk の CAS を直接使う。)
+const saveEditorTab = async (
+  tab: EditorTab,
+  opts: { force?: boolean } = {},
+): Promise<boolean> => {
   // 書き込み中にさらに編集された場合、その古い保存完了で新しい編集の dirty を
   // 消してはならない (lost update 防止)。保存した内容を控え、完了時に内容が
   // 変わっていない時だけ dirty を下ろす。
   const saved = tab.content;
+  const expectedBase = tab.diskContent;
   try {
+    if (!opts.force) {
+      // バックエンドで CAS 書き込み。書けなければ外部変更あり。
+      let wrote: boolean;
+      try {
+        wrote = await api.writeQueryFileIfUnchanged(
+          tab.connection,
+          tab.file,
+          saved,
+          expectedBase,
+        );
+      } catch (e) {
+        errorMessage = `Failed to save the file: ${toErrorMessage(e)}`;
+        return false;
+      }
+      if (!wrote) {
+        // ディスクが base と食い違う = 外部変更あり。黙って上書きせず、外部変更処理
+        // (自動マージ / 衝突検知) に委ねる。自動マージが clean に通れば tab は保存済み
+        // (dirty=false) になるので、その実際の結果を返す (close/reload/rename が
+        // マージ成功を「保存失敗」と誤認して中断しないように)。
+        await checkTabForExternalChange(tab.id);
+        const after = editorTabs.find((t) => t.id === tab.id);
+        return !!after && !after.dirty && !after.conflicted;
+      }
+      // 書けた → 状態確定。
+      tab.diskContent = saved;
+      tab.conflicted = false;
+      if (tab.content === saved) {
+        tab.dirty = false;
+      }
+      return true;
+    }
     await api.writeQueryFile(tab.connection, tab.file, saved);
+    // 自分が書いた内容をディスクの既知内容として控える。これにより外部変更
+    // ウォッチャが「自分の保存」を外部変更と誤検知しない。
+    tab.diskContent = saved;
+    // 明示保存 / 自動マージ保存が通った = 手元の内容がディスクに反映された。
+    // 衝突状態は解消したので自動保存の抑止を外す。
+    tab.conflicted = false;
     if (tab.content === saved) {
       tab.dirty = false;
     }
@@ -803,6 +937,74 @@ const saveCurrentFile = async (): Promise<boolean> => {
   return saveEditorTab(tab);
 };
 
+/// アクティブな衝突タブについて、手元の未保存編集を破棄してディスクの内容を読み直す。
+/// 警告文の "reopen the file to discard" と同じ効果を、常に到達可能な UI (ツールバー)
+/// から明示的に呼べるようにするための手段 (選択中ファイルの再クリックが Rename に
+/// なる等で reopen 経路に到達できないケースの逃げ道)。
+const discardActiveFileConflict = async (): Promise<void> => {
+  const tab = getActiveEditorTab();
+  if (!tab || !tab.conflicted) {
+    return;
+  }
+  const { id, connection, file } = tab;
+  let disk: string;
+  try {
+    disk = await api.readQueryFile(connection, file);
+  } catch (e) {
+    errorMessage = toErrorMessage(e);
+    return;
+  }
+  // 読込 await 中にタブが閉じられた / 別接続へ移動した / ファイル名が変わった場合は
+  // 適用しない (古い読込で現在の状態を壊さない)。
+  const cur = editorTabs.find((t) => t.id === id);
+  if (
+    !cur ||
+    selectedConnection !== connection ||
+    cur.connection !== connection ||
+    cur.file !== file
+  ) {
+    return;
+  }
+  cur.content = disk;
+  cur.diskContent = disk;
+  cur.dirty = false;
+  cur.conflicted = false;
+  cancelPendingSaveFor(id);
+  conflictNotified.delete(id);
+  toast.info(`Reloaded "${file}" (discarded unsaved edits)`);
+};
+
+/// アクティブな衝突タブについて、手元の編集でディスクを上書き保存する (ユーザーの
+/// 明示的な上書き意思)。CAS を通さず force で書くため、外部変更を意図的に置き換える。
+const overwriteActiveFileConflict = async (): Promise<boolean> => {
+  const tab = getActiveEditorTab();
+  if (!tab) {
+    return true;
+  }
+  return saveEditorTab(tab, { force: true });
+};
+
+/// 指定タブのデバウンス自動保存を (張り直して) 予約する。既存の予約は解除される
+/// (自動保存は一度に 1 タブのみを対象にする既存仕様に合わせる)。
+const scheduleAutoSave = (tabId: number) => {
+  autoSavePendingTabId = tabId;
+  if (autoSaveTimer) {
+    clearTimeout(autoSaveTimer);
+  }
+  autoSaveTimer = setTimeout(() => {
+    autoSaveTimer = null;
+    const id = autoSavePendingTabId;
+    autoSavePendingTabId = null;
+    const target = editorTabs.find((t) => t.id === id);
+    // 衝突タブは暗黙保存しない (saveEditorTab の CAS でも守られるが、無駄な read を
+    // 避けるためここでも弾く)。saveEditorTab は force 無しなので、debounce 中に
+    // 外部書き込みが入っていれば書き込み前の CAS で検知し、上書きせず衝突検知へ委ねる。
+    if (target && target.dirty && !target.conflicted) {
+      void saveEditorTab(target);
+    }
+  }, AUTO_SAVE_DELAY_MS);
+};
+
 /// エディタからの変更通知。アクティブタブの内容を更新し、自動保存を
 /// デバウンスして予約する。予約は編集中のタブを対象にする。
 const updateEditorContent = (content: string) => {
@@ -812,19 +1014,12 @@ const updateEditorContent = (content: string) => {
   }
   tab.content = content;
   tab.dirty = true;
-  autoSavePendingTabId = tab.id;
-  if (autoSaveTimer) {
-    clearTimeout(autoSaveTimer);
+  // 衝突中は暗黙の自動保存を予約しない (外部変更を黙って上書きしないため)。
+  // 編集は反映するが、解消はユーザーの明示操作 (ツールバーの Overwrite / Discard) に
+  // 委ねる。編集の結果ディスク内容と一致すれば、次のウォッチャ tick が衝突を自動解消する。
+  if (!tab.conflicted) {
+    scheduleAutoSave(tab.id);
   }
-  autoSaveTimer = setTimeout(() => {
-    autoSaveTimer = null;
-    const id = autoSavePendingTabId;
-    autoSavePendingTabId = null;
-    const target = editorTabs.find((t) => t.id === id);
-    if (target && target.dirty) {
-      void saveEditorTab(target);
-    }
-  }, AUTO_SAVE_DELAY_MS);
 };
 
 /// 履歴パネル・スキーマブラウザからの SQL 断片の挿入。
@@ -1433,6 +1628,211 @@ const toggleResultTabPin = (id: number) => {
   }
 };
 
+/// ===== 外部ファイル変更のウォッチャ =====
+/// 開いているクエリファイルがアプリ外 (別エディタ・git・他プロセス) で変更された時に、
+/// 未編集なら自動リロードし、編集中なら 3-way マージを試み、衝突時は警告する。
+/// クエリファイルの読込はローカル FS のみ (DB / SSH トンネルには触れない) ため、
+/// バックグラウンドで定期的に読み直しても接続を開いてしまうことはない。
+
+let fileWatchTimer: ReturnType<typeof setInterval> | null = null;
+/// tick の多重実行を防ぐ (ファイル読込は非同期のため)。
+let fileWatchTicking = false;
+/// タブごとに「既に衝突を警告したディスク内容」を覚え、同じ状態で毎 tick 警告を
+/// 繰り返さないようにする。解消・タブクローズでエントリを消す。
+const conflictNotified = new Map<number, string>();
+
+/// このタブの保留中の自動保存予約を解除する (外部変更を取り込んだ後に、古い
+/// エディタ内容で上書き保存し直されるのを防ぐ)。
+const cancelPendingSaveFor = (tabId: number) => {
+  if (autoSavePendingTabId === tabId) {
+    if (autoSaveTimer) {
+      clearTimeout(autoSaveTimer);
+      autoSaveTimer = null;
+    }
+    autoSavePendingTabId = null;
+  }
+};
+
+/// 1 つのエディタタブについて外部変更を調べて反映する。
+const checkTabForExternalChange = async (tabId: number) => {
+  const before = editorTabs.find((t) => t.id === tabId);
+  if (!before) {
+    return;
+  }
+  const { connection, file } = before;
+  // 読込前の base を控える。読込中に自動保存が完了して diskContent が進むと、
+  // 古い read 結果を新しい base への外部変更と誤認しかねないため、読込後に
+  // base が変わっていたらこの tick は見送る (次の tick で最新状態を見る)。
+  const baseAtStart = before.diskContent;
+  let disk: string;
+  try {
+    disk = await api.readQueryFile(connection, file);
+  } catch {
+    // 読めない (外部で削除された等) 場合は何もしない。次の契機に委ねる。
+    return;
+  }
+  // await の間にタブが閉じられた / ファイル名が変わった可能性があるので取り直す。
+  const tab = editorTabs.find((t) => t.id === tabId);
+  if (!tab || tab.connection !== connection || tab.file !== file) {
+    return;
+  }
+  // 読込中に保存が回り込んで base (diskContent) が変わっていたら、この read は
+  // 古い可能性があるので判定しない。
+  if (tab.diskContent !== baseAtStart) {
+    return;
+  }
+
+  const base = tab.diskContent;
+  if (disk === base) {
+    // 外部変更なし。過去の衝突警告が残っていればクリアする。
+    conflictNotified.delete(tabId);
+    // 衝突を起こした外部変更が元に戻り disk が base と一致した場合、衝突は解消。
+    // conflicted を残すと、外部変更が無いのに dirty タブが衝突扱いのままとなり、
+    // 閉じる/リロード時に手元の編集が破棄されてしまう。フラグを下ろし、まだ dirty
+    // なら通常のデバウンス自動保存を張り直して編集を確実に永続化する
+    // (衝突検知時に cancelPendingSaveFor で予約を外しているため、張り直さないと
+    //  次の編集まで自動保存されない)。
+    if (tab.conflicted) {
+      tab.conflicted = false;
+      if (tab.dirty) {
+        scheduleAutoSave(tabId);
+      }
+    }
+    return;
+  }
+  // ここに来た = ディスクが最後に把握した内容と異なる (外部変更あり)。
+  if (tab.content === base) {
+    // 手元に未保存の編集が無い → 外部の内容をそのまま採用してリロードする。
+    tab.content = disk;
+    tab.diskContent = disk;
+    tab.dirty = false;
+    tab.conflicted = false;
+    cancelPendingSaveFor(tabId);
+    conflictNotified.delete(tabId);
+    toast.info(`Reloaded "${file}" (changed on disk)`);
+    return;
+  }
+  if (tab.content === disk) {
+    // 手元の編集が結果的にディスクと一致 (保存が回り込んだ等)。表示は変えず基準だけ更新。
+    tab.diskContent = disk;
+    tab.dirty = false;
+    tab.conflicted = false;
+    conflictNotified.delete(tabId);
+    return;
+  }
+  // base / local / remote が三者三様 → 3-way マージを試みる。
+  // マージに使った手元の内容を控える (書き込み await 中にユーザーが更に打鍵した場合、
+  // その新しい編集を merged で黙って上書きしないため)。
+  const localSnapshot = tab.content;
+  const { merged, conflict } = merge3(base, localSnapshot, disk);
+  if (!conflict) {
+    // 別々の箇所への変更なので自動マージできる。結果をディスクへ書き戻す。
+    // ただし force で無条件に書くと、この tick の read (disk) 〜 書き込み完了の間に
+    // さらに別プロセスが保存した場合、古い disk を基にした merged で新しい外部保存を
+    // 黙って上書きしてしまう。マージの基にした disk スナップショットとディスクが
+    // まだ一致する時だけ書く CAS にする (expectedBase=disk)。食い違っていたら書かず、
+    // 次 tick で最新内容に対して改めてマージ/衝突判定させる。
+    let wrote = false;
+    try {
+      wrote = await api.writeQueryFileIfUnchanged(connection, file, merged, disk);
+    } catch (e) {
+      errorMessage = `Failed to save the file: ${toErrorMessage(e)}`;
+    }
+    // 書き込み await 中にタブが閉じられた / 別ファイルになった / base が進んだ場合は
+    // この結果を反映しない (次 tick で最新状態を見る)。
+    const t2 = editorTabs.find((t) => t.id === tabId);
+    if (
+      !t2 ||
+      t2.connection !== connection ||
+      t2.file !== file ||
+      t2.diskContent !== base
+    ) {
+      return;
+    }
+    if (wrote) {
+      // マージ結果をディスクへ反映できた。ディスクは今 merged。
+      t2.diskContent = merged;
+      t2.conflicted = false;
+      conflictNotified.delete(tabId);
+      if (t2.content === localSnapshot) {
+        // 書き込み中に追加編集は無い → エディタもマージ結果に確定する。
+        t2.content = merged;
+        t2.dirty = false;
+        cancelPendingSaveFor(tabId);
+        toast.info(`Merged external changes into "${file}"`);
+      } else {
+        // await 中にさらに打鍵された → その新しい編集は捨てず dirty のまま残す。
+        // 基準 (diskContent) は merged に進めたので、次 tick / 予約済み自動保存が
+        // 新編集を merged を base として保存/マージする (予約はそのまま活かす)。
+      }
+    } else {
+      // マージ中にさらに外部書き込みが入った。今回は反映せず (手元の編集はそのまま)、
+      // dedup キーを消して次 tick で最新ディスク内容に対して再判定させる。
+      conflictNotified.delete(tabId);
+    }
+    return;
+  }
+  // 同じ箇所を双方が別々に変更 → 自動マージ不可。未保存の編集は保持し、警告する。
+  // 保留中の自動保存は解除する (残すと衝突中のタブに対して debounce 保存が走りかねない)。
+  cancelPendingSaveFor(tabId);
+  // 衝突中は自動保存 (閉じる・アプリ終了・reloadConnections) を抑止し、手元の編集で
+  // 外部変更を黙って上書きするのを防ぐ。解消はユーザーの明示操作 (ツールバーの
+  // Overwrite で上書き / Discard で破棄) に委ねる。なお暗黙の自動保存自体も
+  // saveEditorTab の CAS で外部変更を上書きしないよう二重に守られている。
+  tab.conflicted = true;
+  // 同じディスク状態で毎 tick 警告しないよう既通知を記録する。
+  if (conflictNotified.get(tabId) !== disk) {
+    conflictNotified.set(tabId, disk);
+    toast.warning(`"${file}" was changed on disk, but you have unsaved edits`, {
+      description:
+        "Your edits are kept. Use Overwrite or Discard in the editor toolbar to resolve.",
+    });
+  }
+};
+
+const fileWatchTick = async () => {
+  if (fileWatchTicking) {
+    return;
+  }
+  fileWatchTicking = true;
+  try {
+    // 開始時点の id スナップショットで回す (処理中に配列が変わっても安全)。
+    const ids = editorTabs.map((t) => t.id);
+    for (const id of ids) {
+      await checkTabForExternalChange(id);
+    }
+    // 閉じられたタブの通知記録を掃除する。
+    const alive = new Set(editorTabs.map((t) => t.id));
+    for (const id of [...conflictNotified.keys()]) {
+      if (!alive.has(id)) {
+        conflictNotified.delete(id);
+      }
+    }
+  } finally {
+    fileWatchTicking = false;
+  }
+};
+
+/// 外部ファイル変更のポーリングを開始する (+page の onMount から呼ぶ)。
+const startFileWatcher = () => {
+  if (fileWatchTimer) {
+    return;
+  }
+  fileWatchTimer = setInterval(
+    () => void fileWatchTick(),
+    FILE_WATCH_INTERVAL_MS,
+  );
+};
+
+/// ポーリングを停止する (+page の onDestroy から呼ぶ)。
+const stopFileWatcher = () => {
+  if (fileWatchTimer) {
+    clearInterval(fileWatchTimer);
+    fileWatchTimer = null;
+  }
+  conflictNotified.clear();
+};
+
 export default {
   get connections() {
     return connections;
@@ -1498,6 +1898,10 @@ export default {
   get dirty() {
     return getActiveEditorTab()?.dirty ?? false;
   },
+  /// アクティブなエディタタブが外部変更との衝突状態か (ツールバーの解消 UI 表示に使う)
+  get activeFileConflicted() {
+    return getActiveEditorTab()?.conflicted ?? false;
+  },
   get schemas() {
     return schemas;
   },
@@ -1556,6 +1960,8 @@ export default {
   renameFile,
   copyFilePath,
   saveCurrentFile,
+  discardActiveFileConflict,
+  overwriteActiveFileConflict,
   updateEditorContent,
   insertSqlSnippet,
   fixSqlWithAi,
@@ -1574,4 +1980,6 @@ export default {
   selectResultTab,
   closeResultTab,
   toggleResultTabPin,
+  startFileWatcher,
+  stopFileWatcher,
 };

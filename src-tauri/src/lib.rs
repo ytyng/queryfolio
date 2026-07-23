@@ -579,6 +579,32 @@ async fn write_query_file(
     Ok(())
 }
 
+/// 楽観的排他つきの保存。expected_base とディスクの現在内容が一致する時だけ書き込む。
+/// 書けたら true、アプリ外で変更されていて書かなかったら false を返す
+/// (フロントはマージ/衝突処理へ回す)。暗黙の保存 (自動保存・閉じる前保存) で使い、
+/// 外部変更を黙って上書きしないための atomic 寄りの CAS。
+#[tauri::command]
+async fn write_query_file_if_unchanged(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    file_name: String,
+    content: String,
+    expected_base: String,
+) -> Result<bool, AppError> {
+    let server = state.find_server(&connection).await?;
+    let wrote = query_files::write_query_file_if_unchanged(
+        &state.resolve_sqlfiles_dir().await?,
+        &server.sqlfiles_folder_name(),
+        &file_name,
+        &content,
+        &expected_base,
+    )?;
+    if wrote {
+        let _ = state.refresh_folder_meta(&server).await;
+    }
+    Ok(wrote)
+}
+
 #[tauri::command]
 async fn create_query_file(
     state: tauri::State<'_, AppState>,
@@ -1398,6 +1424,7 @@ pub fn run() {
             read_query_file,
             query_file_path,
             write_query_file,
+            write_query_file_if_unchanged,
             create_query_file,
             delete_query_file,
             rename_query_file,

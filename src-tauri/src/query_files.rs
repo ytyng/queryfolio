@@ -199,6 +199,44 @@ pub fn write_query_file(
     Ok(())
 }
 
+/// 楽観的排他つきの書き込み。呼び出し側が把握している base (expected_base) と、
+/// 書き込み直前に読んだディスクの現在内容が一致する時だけ書き込む。
+/// - 書き込めたら Ok(true)。
+/// - ファイルが存在するのに expected_base と食い違う (= アプリ外で変更された) 場合は
+///   書き込まず Ok(false) を返す (呼び出し側でマージ/衝突処理へ回すため)。
+/// - ファイルが存在しない場合は expected_base に関わらず (再) 作成して Ok(true)
+///   (外部で削除されたケースで手元の編集を確実に残す)。
+///
+/// 検査と書き込みを同一のバックエンド呼び出し内で隣接して行うことで、フロントとの
+/// 非同期往復ぶんの TOCTOU 窓を無くす (完全な OS レベル atomic ではないが、
+/// read→write の間隔を隣接システムコールまで詰める)。
+pub fn write_query_file_if_unchanged(
+    sqlfiles_dir: &Path,
+    connection: &str,
+    file_name: &str,
+    content: &str,
+    expected_base: &str,
+) -> Result<bool, AppError> {
+    let path = file_path(sqlfiles_dir, connection, file_name)?;
+    match fs::read_to_string(&path) {
+        Ok(current) => {
+            if current != expected_base {
+                // アプリ外で変更されている。上書きしない。
+                return Ok(false);
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // 外部で削除された等。下で再作成する。
+        }
+        Err(e) => return Err(e.into()),
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, content)?;
+    Ok(true)
+}
+
 /// 空のクエリファイルを新規作成し、正規化されたファイル名を返す。
 pub fn create_query_file(
     sqlfiles_dir: &Path,
@@ -341,6 +379,47 @@ mod tests {
             list_query_files(&dir, connection).unwrap(),
             Vec::<String>::new()
         );
+
+        // 後始末
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_write_query_file_if_unchanged() {
+        let dir = test_dir().join("cas");
+        let connection = "test-conn";
+        let name = "q.sql";
+
+        // ファイルが無ければ expected_base に関わらず作成する (外部削除からの復帰)。
+        assert_eq!(
+            write_query_file_if_unchanged(&dir, connection, name, "V1", "").unwrap(),
+            true
+        );
+        assert_eq!(read_query_file(&dir, connection, name).unwrap(), "V1");
+
+        // base が現在のディスク内容と一致すれば書き込む。
+        assert_eq!(
+            write_query_file_if_unchanged(&dir, connection, name, "V2", "V1").unwrap(),
+            true
+        );
+        assert_eq!(read_query_file(&dir, connection, name).unwrap(), "V2");
+
+        // アプリ外で "EXTERNAL" に変更されたのに、こちらの base が古い ("V2") 場合は
+        // 書き込まず false を返す (外部変更を黙って上書きしない)。
+        write_query_file(&dir, connection, name, "EXTERNAL").unwrap();
+        assert_eq!(
+            write_query_file_if_unchanged(&dir, connection, name, "MINE", "V2").unwrap(),
+            false
+        );
+        assert_eq!(read_query_file(&dir, connection, name).unwrap(), "EXTERNAL");
+
+        // base を現在値に合わせれば再び書ける。
+        assert_eq!(
+            write_query_file_if_unchanged(&dir, connection, name, "MINE", "EXTERNAL")
+                .unwrap(),
+            true
+        );
+        assert_eq!(read_query_file(&dir, connection, name).unwrap(), "MINE");
 
         // 後始末
         let _ = fs::remove_dir_all(&dir);
