@@ -586,19 +586,26 @@ const selectFile = async (fileName: string) => {
     // 衝突状態のタブを開き直した場合は、警告文 "reopen the file to discard them" に
     // 従い手元の編集を破棄してディスクの内容を読み直す (best-effort。失敗時は現状維持)。
     if (existing.conflicted) {
+      let disk: string | undefined;
       try {
-        const disk = await api.readQueryFile(connection, fileName);
-        if (selectedConnection === connection) {
-          existing.content = disk;
-          existing.diskContent = disk;
-          existing.dirty = false;
-          existing.conflicted = false;
-          cancelPendingSaveFor(existing.id);
-          conflictNotified.delete(existing.id);
-          toast.info(`Reloaded "${fileName}" (discarded unsaved edits)`);
-        }
+        disk = await api.readQueryFile(connection, fileName);
       } catch (e) {
         errorMessage = toErrorMessage(e);
+      }
+      // 読込 await 中にユーザーが別接続/別ファイルへ移動していたら、この結果で
+      // タブを書き換えず、フォーカスも奪わない (遅い読込が新しいナビゲーションを
+      // 巻き戻さないようにする。未着タブ生成パスの stale-read ガードと同方針)。
+      if (selectedConnection !== connection) {
+        return;
+      }
+      if (disk !== undefined) {
+        existing.content = disk;
+        existing.diskContent = disk;
+        existing.dirty = false;
+        existing.conflicted = false;
+        cancelPendingSaveFor(existing.id);
+        conflictNotified.delete(existing.id);
+        toast.info(`Reloaded "${fileName}" (discarded unsaved edits)`);
       }
     }
     await activateEditorTab(existing.id);
@@ -1513,6 +1520,15 @@ const cancelPendingSaveFor = (tabId: number) => {
 const checkTabForExternalChange = async (tabId: number) => {
   const before = editorTabs.find((t) => t.id === tabId);
   if (!before) {
+    return;
+  }
+  // このタブに自動保存が予約されている間は、ユーザーの上書き意思による保存が
+  // 間近に迫っている (編集直後の debounce 中)。ここで衝突を再検知して
+  // cancelPendingSaveFor で保存を取り消すと、編集したのに衝突扱いのまま残り、
+  // 閉じる/リロードで破棄されてしまう。予約中はこの tick を見送り、保存完了で
+  // diskContent が進んだ後の次 tick で判定する (保存失敗時は予約が外れるので
+  // 次 tick で通常どおり再検知される)。
+  if (autoSavePendingTabId === tabId) {
     return;
   }
   const { connection, file } = before;
