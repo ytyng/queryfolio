@@ -65,9 +65,15 @@ jobs:
           node-version: 22
           cache: pnpm
 
+      # SHA は **master 履歴のコミット**を選ぶこと。`stable` / `1.89.0` などの
+      # 生成ブランチの先端 SHA を pin すると、ブランチが進んだ時にその commit が
+      # GC され、以降の run が Rust セットアップ前に落ちる (action の README の
+      # "Choice of full-length commit SHA" 参照)。master SHA を pin する場合は
+      # ref からツールチェインを推測できないので `toolchain` を明示する。
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
+          toolchain: stable
           targets: ${{ matrix.rust-targets }}
 
       - name: Cache Rust (cargo + target)
