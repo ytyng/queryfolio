@@ -33,8 +33,9 @@ fab -l                  # fab タスク一覧 (dev / check / unittest / build_lo
 - **draft → publish 分離が必須**: matrix の 2 ジョブが同じ `v<version>` Release を作るため、`releaseDraft: false` だと先に終わった方だけの不完全な Release が即公開される。
 - **version は毎回インクリメント必須**: 公開済みと同じ version で再実行すると tauri-action が draft 状態の不一致でエラーになる。だから `scripts/release.sh` が採番を自動化している (bump し忘れ事故を構造的に消す)。
 - **`pnpm publish` は使えない** (pnpm 組み込みコマンドで上書き不可)。コマンド名は `release`。
-- **tauri-action は commit SHA 固定**。Apple の証明書・認証情報を渡す action なので、タグ差し替えで secrets を抜かれるのを防ぐ。`APPLE_*` は macOS ジョブにのみ渡す (Windows には空文字)。
-- **`tauriScript: pnpm exec tauri`** で package.json の `tauri` スクリプトを迂回する。あちらはローカル署名用に `APPLE_SIGNING_IDENTITY` を env 前置きでハードコードしており、Windows のシェルでは構文エラーになる。
+- **`uses:` は全て commit SHA 固定** (行末コメントが元のタグ)。Apple の証明書・認証情報を扱うジョブなので、tauri-action だけ固定しても先行ステップの action が改変されれば同じこと。checkout は `persist-credentials: false` で write 権限の token を `.git/config` に残さない。`APPLE_*` は macOS ジョブにのみ渡す (Windows には空文字)。
+- **`tauriScript: pnpm exec tauri`** を必ず指定する。省くと tauri-action は pnpm プロジェクトに対して `pnpm tauri build` を実行し、package.json の `tauri` スクリプト (`APPLE_SIGNING_IDENTITY='...' tauri`) が走る。シェルのインライン代入は継承 env より強いので、**workflow が渡した `secrets.APPLE_SIGNING_IDENTITY` が黙って無視される** (加えて Windows のシェルでは構文エラーになる)。`pnpm exec tauri` はスクリプトを経由しない。
+- **`cancel-in-progress: false` + `queue: max`**: 1 dispatch = 1 version なので、キャンセルされた run の version は (bump コミットは main に載ったまま) 永久に公開されなくなる。走行中の run を守る (`cancel-in-progress: false`) だけでは足りず、既定の `queue: single` は pending を 1 件しか保持せず新しい dispatch で既存 pending を捨てるため、`queue: max` (最大 100 件) も要る。CI 分数より取りこぼし防止を優先する。
 - **弱点**: `pnpm release` は main へ直接 push するため、ブランチ保護 (PR 必須) を掛けると破綻する。
 
 ## アーキテクチャ
