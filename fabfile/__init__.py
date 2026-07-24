@@ -2,16 +2,16 @@
 
 Run `fab -l` to list tasks.
 
-The macOS release build runs on GitHub Actions and is triggered manually from
-here with `fab build_mac` (the Actions workflow is workflow_dispatch only).
+The release build (macOS dmg + Windows NSIS installer) runs on GitHub Actions and
+is triggered manually from here with `fab release` (the Actions workflow is
+workflow_dispatch only). That task just wraps `pnpm release`, which bumps the
+version, pushes it to main, dispatches the workflow, and follows the run.
 """
 import os
 
 from fabric.api import task, local, lcd
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-WORKFLOW = 'build-macos.yml'
 
 
 @task
@@ -46,49 +46,30 @@ def build_local():
 
 
 @task
-def build_mac(draft='true', watch='true'):
-    """Trigger the macOS build+release GitHub Actions workflow (manual dispatch).
+def release(bump='patch'):
+    """Bump the version and run the release build on GitHub Actions.
 
-        fab build_mac                # draft release, then follow the run
-        fab build_mac:draft=false    # publish the release directly (not a draft)
-        fab build_mac:watch=false    # dispatch and return without following
+        fab release              # 0.1.0 -> 0.1.1 (patch)
+        fab release:minor        # 0.1.0 -> 0.2.0
+        fab release:major        # 0.1.0 -> 1.0.0
 
-    The workflow builds a universal (Apple Silicon + Intel) app and attaches the
-    signed .dmg to a GitHub Release. See the `publish-macos-release` skill for
-    the full publish-to-site runbook.
+    Thin wrapper around `pnpm release` (scripts/release.sh): it bumps the version
+    in tauri.conf.json / package.json, commits and pushes to main, dispatches the
+    Release workflow, and follows the run. The workflow builds the macOS universal
+    dmg (Developer ID signed + notarized) and the Windows NSIS installer, then
+    publishes the draft Release once every platform succeeded. See the
+    `publish-macos-release` skill for the full runbook.
     """
-    if draft not in ('true', 'false'):
-        raise SystemExit("draft must be 'true' or 'false', got: {!r}".format(draft))
-    with lcd(PROJECT_ROOT):
-        if watch != 'true':
-            local('gh workflow run {} -f draft={}'.format(WORKFLOW, draft))
-            return
-        # `gh workflow run` does not return the created run id, so record the
-        # latest run id first, dispatch, then wait for a *new* run id to appear
-        # and watch exactly that run (not an unrelated concurrent one).
-        # `gh run watch --exit-status` fails the task if the build fails, so a
-        # broken macOS build stops the release flow instead of looking done.
-        local(
-            'PREV=$(gh run list --workflow={wf} --limit 1 '
-            "--json databaseId --jq '.[0].databaseId // empty') && "
-            'gh workflow run {wf} -f draft={draft} && '
-            'RUN_ID="" && '
-            'for i in $(seq 1 20); do sleep 3; '
-            'RID=$(gh run list --workflow={wf} --limit 1 '
-            "--json databaseId --jq '.[0].databaseId // empty'); "
-            'if [ -n "$RID" ] && [ "$RID" != "$PREV" ]; then RUN_ID="$RID"; break; fi; '
-            'done && '
-            'if [ -z "$RUN_ID" ]; then '
-            'echo "Could not find the dispatched run; check: gh run list --workflow={wf}"; '
-            'exit 1; fi && '
-            'echo "Watching run $RUN_ID: '
-            'https://github.com/ytyng/queryfolio/actions/runs/$RUN_ID" && '
-            'gh run watch "$RUN_ID" --exit-status'.format(wf=WORKFLOW, draft=draft)
+    if bump not in ('patch', 'minor', 'major'):
+        raise SystemExit(
+            "bump must be 'patch', 'minor' or 'major', got: {!r}".format(bump)
         )
+    with lcd(PROJECT_ROOT):
+        local('pnpm release {}'.format(bump))
 
 
 @task
 def releases():
-    """List the GitHub Releases (published macOS builds)."""
+    """List the GitHub Releases (published builds)."""
     with lcd(PROJECT_ROOT):
         local('gh release list')
