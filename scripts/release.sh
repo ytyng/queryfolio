@@ -48,7 +48,11 @@ if [ -n "$(git status --porcelain)" ]; then
   echo "Error: working tree is not clean. Commit or stash your changes first." >&2
   exit 1
 fi
-git fetch origin main
+# refspec を明示して origin/main を確実に更新する。`git fetch origin main` でも
+# remote-tracking ref は更新されるが (git 1.8.4 以降の opportunistic update)、
+# 明示しておけば remote の fetch 設定に依存しない。先頭の + は clone 既定の refspec と
+# 同じ強制更新で、force push 後も fetch 自体は成功させ、ズレは下の比較で検出する。
+git fetch origin +main:refs/remotes/origin/main
 if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
   echo "Error: local HEAD does not match origin/main. Push (or pull) first." >&2
   exit 1
@@ -108,25 +112,38 @@ fi
 
 echo "Triggering release build for v${VERSION} ..."
 
-# workflow_dispatch は run ID を返さないため、トリガー前の最新 run ID を控えておき、
-# それと異なる ID (= 今回の run) が現れるまでポーリングして拾う。
-PREV_RUN_ID=$(gh run list --workflow=release.yml --branch main --limit 1 \
-  --json databaseId --jq '.[0].databaseId // ""')
+# workflow_dispatch は run ID を返さないため、起動後にポーリングして拾う。
+# 「最新の run」ではなく「今 push した bump コミットを head に持つ run」を探す:
+# ポーリング中に別の dispatch が挟まっても、他人の run を watch してしまわない。
+# version は毎回インクリメントされるので、この SHA を持つ run は今回の 1 つだけ。
+RELEASE_SHA=$(git rev-parse HEAD)
 
-gh workflow run release.yml --ref main
+if ! gh workflow run release.yml --ref main; then
+  echo "Error: failed to trigger the workflow. v${VERSION} is already pushed to main." >&2
+  echo "  Retry with: gh workflow run release.yml --ref main" >&2
+  exit 1
+fi
 
+# `|| true` が無いと、GitHub API の一時エラーで set -e がリトライループごと殺す
+# (X=$(failing-cmd) は set -e で即 exit する)。ここは「まだ run が出てこない」状態を
+# 待つループなので、失敗は空文字として扱う。
+# 60 回 x 2 秒 = 最大 2 分。run 一覧 API は反映が遅れることがあり、短いと誤判定する。
 RUN_ID=""
-for _ in $(seq 1 15); do
+for _ in $(seq 1 60); do
   sleep 2
-  RUN_ID=$(gh run list --workflow=release.yml --branch main --limit 1 \
-    --json databaseId --jq '.[0].databaseId // ""')
-  if [ -n "${RUN_ID}" ] && [ "${RUN_ID}" != "${PREV_RUN_ID}" ]; then
+  RUN_ID=$(gh run list --workflow=release.yml --branch main --limit 20 \
+    --json databaseId,headSha \
+    --jq "[.[] | select(.headSha == \"${RELEASE_SHA}\")] | .[0].databaseId // \"\"" \
+    2>/dev/null || true)
+  if [ -n "${RUN_ID}" ]; then
     break
   fi
-  RUN_ID=""
 done
 if [ -z "${RUN_ID}" ]; then
-  echo "Error: could not find the triggered workflow run." >&2
+  # 見つからないだけで、run 自体は動いている可能性が高い (watch できないだけ)。
+  echo "Error: could not find the triggered workflow run within 2 minutes." >&2
+  echo "  The build may still be running. Check it with:" >&2
+  echo "    gh run list --workflow=release.yml" >&2
   exit 1
 fi
 echo "Watching run ${RUN_ID} ..."
