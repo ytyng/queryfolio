@@ -1,101 +1,85 @@
 ---
 name: publish-macos-release
-description: QueryFolio の macOS 版をビルドして GitHub Release として公開 (サイトで配布) する手順。「mac 版をリリース」「アプリを公開」「新しいバージョンを配布」「release the mac app」「publish a new build」と言及された時に使う。GitHub Actions の build-macos ワークフローを fab で起動 → 署名付き DMG を確認 → Release を公開 → ダウンロードリンクを更新する一連の作業を扱う。
+description: QueryFolio をビルドして GitHub Release として公開 (サイトで配布) する手順。「mac 版をリリース」「アプリを公開」「新しいバージョンを配布」「release the mac app」「publish a new build」と言及された時に使う。`pnpm release` で version 採番 → GitHub Actions で macOS dmg (署名 + 公証) と Windows インストーラをビルド → 全プラットフォーム成功時に自動公開 → 公開された成果物の署名・公証を検証してダウンロード導線を確認する、一連の作業を扱う。
 ---
 
-# QueryFolio macOS 版のリリース手順
+# QueryFolio のリリース手順
 
-macOS 版アプリを GitHub Actions でビルドし、GitHub Release としてサイト (ダウンロードページ) で
-公開するまでの runbook。ビルドは `.github/workflows/build-macos.yml` (workflow_dispatch のみ)、
-起動は `fabfile/__init__.py` の `build_mac` タスクで行う。
+macOS 版 (universal dmg) と Windows 版 (NSIS インストーラ) を GitHub Actions でビルドし、
+GitHub Release としてサイト (ダウンロードページ) で公開するまでの runbook。
+ビルドは `.github/workflows/release.yml` (workflow_dispatch のみ)、起動は
+`scripts/release.sh` (`pnpm release` / `fab release`)。構成の設計判断はグローバルスキル
+`tauri-github-actions-release` に書いてある。
 
 ## 前提
 
 - `gh` が `ytyng` アカウントで認証済みで、リポジトリは `ytyng/queryfolio`。
-- 署名用の GitHub Secrets が設定済み (下記「初回セットアップ」)。未設定でもビルドは通るが
-  **ad-hoc 署名のみのテストビルド** (`APPLE_SIGNING_IDENTITY=-`) になり、配布には使えない
-  (Apple Silicon でも開けるが、身元不明の開発者として扱われる)。
-- 公証 (notarization) は未対応。署名のみなので、初回起動時は Gatekeeper の警告が出る
-  (右クリック → 開く、または システム設定 › プライバシーとセキュリティ で許可)。
+- 署名・公証用の GitHub Secrets が 6 つとも設定済み (下記「初回セットアップ」)。
+  **1 つでも未設定なら macOS ジョブは "Check macOS signing secrets" ステップで失敗する**
+  (ad-hoc 署名や公証なしの dmg が黙って公開されるのを防ぐための preflight。フォールバックは無い)。
+- `main` がクリーンで `origin/main` と一致していること (スクリプトが検証して弾く)。
 
 ## リリース手順
 
-### 1. バージョンを上げる
-
-タグは `tauri.conf.json` の `version` から `queryfolio-v<version>` として生成される。同じバージョンで
-2 回リリースするとタグが衝突するので、**リリースごとに必ず version を上げる**。2 ファイルを一致させる:
-
-- `src-tauri/tauri.conf.json` の `version`
-- `package.json` の `version`
-
-変更を `main` にコミット & プッシュする (Release のタグはこのコミットに付く)。
+### 1. version 採番 → ビルド → 公開 (1 コマンド)
 
 ```shell
-git add src-tauri/tauri.conf.json package.json
-git commit -m "chore: bump version to v<version>"
-git push origin main
+pnpm release           # 0.1.0 -> 0.1.1 (patch)
+pnpm release minor     # 0.1.0 -> 0.2.0
+pnpm release major     # 0.1.0 -> 1.0.0
 ```
 
-### 2. ビルド & Release 作成を起動する
+`scripts/release.sh` が以下を行う:
+
+1. `gh` の認証、`main` ブランチ・クリーンツリー・`HEAD == origin/main` を検証
+2. `src-tauri/tauri.conf.json` の version を bump し、`package.json` にも同期
+3. `chore: release v<version>` として commit → `origin/main` へ push
+4. `release.yml` を dispatch し、起動した run を `gh run watch --exit-status` で追う
+
+ワークフローは matrix で macOS (universal dmg / Developer ID 署名 + 公証 + staple) と
+Windows (NSIS exe / 署名なし) を並列ビルドし、`v<version>` の **draft** Release に
+アップロードする。全プラットフォームが成功すると `publish` ジョブが
+`gh release edit "v<version>" --draft=false --latest` で公開する。所要 15〜25 分程度。
+
+> どれかのプラットフォームが失敗した場合、Release は **draft のまま残る**。
+> 修正して再実行する時は version が上がるので (再度 `pnpm release`)、残った draft と
+> タグは掃除する: `gh release delete v<version> --cleanup-tag --yes`
+
+### 2. 成果物を検証する (公開後 / 初回は必ず)
+
+DMG を落として署名・公証・universal を実機確認する:
 
 ```shell
-fab build_mac              # draft の Release を作り、実行をフォロー
+VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+gh release download "v${VERSION}" --pattern '*.dmg' --dir /tmp/qf-release --clobber
+hdiutil attach -nobrowse -quiet /tmp/qf-release/QueryFolio_${VERSION}_universal.dmg
+APP=/Volumes/QueryFolio/QueryFolio.app
+codesign -dv --verbose=2 "$APP"      # Authority=Developer ID Application: Cyberneura K.K. (2YN5TLNQ9J) / flags=...runtime
+spctl -a -vvv "$APP"                 # → accepted / source=Notarized Developer ID
+xcrun stapler validate "$APP"        # → The validate action worked!
+lipo -archs "$APP/Contents/MacOS/QueryFolio"   # → x86_64 arm64
+hdiutil detach -quiet /Volumes/QueryFolio
 ```
 
-内部的には `gh workflow run build-macos.yml -f draft=true` を実行し、`gh run watch` で追う。
-直接叩くなら:
+`source=Notarized Developer ID` と staple 成功が出れば、ユーザーがダウンロードして開いても
+Gatekeeper 警告は出ない。ここが `Developer ID` 止まり (Notarized でない) なら公証が
+効いていないので、`APPLE_ID` / `APPLE_PASSWORD` (app 用パスワード) / `APPLE_TEAM_ID` を疑う。
+
+### 3. 配布導線を確認・更新する
 
 ```shell
-gh workflow run build-macos.yml -f draft=true
-gh run watch "$(gh run list --workflow=build-macos.yml --limit 1 --json databaseId --jq '.[0].databaseId')" --exit-status
+gh release view "v${VERSION}" --json assets --jq '.assets[].name'
 ```
-
-ワークフローは universal (Apple Silicon + Intel) でビルドし、署名付きの `.dmg` を
-`queryfolio-v<version>` という **draft の Release** に添付する。所要 10〜20 分程度。
-
-### 3. 成果物を検証する
-
-Release から DMG を落として署名を確認する:
-
-```shell
-gh release download queryfolio-v<version> --pattern '*.dmg' --dir /tmp/qf-release
-codesign -dv --verbose=2 "/Volumes/.../QueryFolio.app" 2>&1   # マウント後
-spctl -a -t open --context context:primary-signature /tmp/qf-release/*.dmg  # 署名の受理確認
-```
-
-`Developer ID Application: Cyberneura K.K. (2YN5TLNQ9J)` で署名されていること、DMG がマウントでき
-アプリが起動することを確認する。
-
-### 4. サイトで公開する
-
-draft を外して Release を公開すると、その Release ページ (と DMG の asset URL) が
-そのままダウンロードサイトになる:
-
-```shell
-gh release edit queryfolio-v<version> --draft=false --latest
-```
-
-公開後の DMG の直リンクを取得してダウンロードリンクに使う:
-
-```shell
-gh release view queryfolio-v<version> --json assets --jq '.assets[] | select(.name|endswith(".dmg")) | .url'
-```
-
-必要に応じて配布導線を更新する (このプロジェクトの「サイト」= リリースページが正)。
-
-- `README.md` の見出し付近に最新版のダウンロードリンク / バッジを追加・更新する。
-  常に最新を指すリンクは
-  `https://github.com/ytyng/queryfolio/releases/latest` を使う。
-- 告知が必要なら ytyng-blog (`ytyng-blog-cli` スキル) に BlogPost / Achievement を作る。
-
-### 5. 公開後の確認
 
 - `https://github.com/ytyng/queryfolio/releases/latest` が新バージョンを指していること。
-- DMG の公開 URL が匿名 (未ログイン) で落とせること。
+- dmg / exe の公開 URL が匿名 (未ログイン) で落とせること。
+- README の Download セクションは `releases/latest` を指す固定リンクなので、通常は更新不要。
+- 告知が必要なら ytyng-blog (`ytyng-blog-cli` スキル) に BlogPost / Achievement を作る。
 
-## 初回セットアップ (署名 Secrets)
+## 初回セットアップ (署名・公証 Secrets)
 
 ローカルの署名 ID を CI に持ち込むため、`.p12` を書き出して Secrets に登録する。1 回だけでよい。
+公証には Apple ID と app 用パスワードも要る。
 
 ```shell
 security find-identity -v -p codesigning | grep "Developer ID Application: Cyberneura"
@@ -104,36 +88,28 @@ security find-identity -v -p codesigning | grep "Developer ID Application: Cyber
 base64 -i queryfolio-signing.p12 | gh secret set APPLE_CERTIFICATE
 gh secret set APPLE_CERTIFICATE_PASSWORD   # .p12 のパスワードを入力
 printf 'Developer ID Application: Cyberneura K.K. (2YN5TLNQ9J)' | gh secret set APPLE_SIGNING_IDENTITY
-printf '%s' "$(openssl rand -base64 24)" | gh secret set KEYCHAIN_PASSWORD   # 一時キーチェーン用の任意文字列
-```
-
-登録確認: `gh secret list`
-
-### notarization を有効化する場合 (現状は未対応)
-
-現在のワークフローは署名のみで notarization は行わない。有効化するには **Secrets の登録**と
-**ワークフローの改修**の両方が要る (Secrets 登録だけでは効かない)。
-
-```shell
-gh secret set APPLE_ID           # Apple Developer のメール
-gh secret set APPLE_PASSWORD     # app 用パスワード (appleid.apple.com で発行)
+gh secret set APPLE_ID                     # Apple Developer のメール
+gh secret set APPLE_PASSWORD               # app 用パスワード (appleid.apple.com で発行。通常のパスワードは不可)
 printf '2YN5TLNQ9J' | gh secret set APPLE_TEAM_ID
 ```
 
-そのうえで `.github/workflows/build-macos.yml` の "Configure code signing" ステップの条件付き
-export に `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` を追加し、Release 本文の「not notarized」
-記述も更新する。
+登録確認: `gh secret list` (上記 6 つ)。keychain のパスワードはワークフロー内で
+`openssl rand` から生成するので Secret は不要 (旧構成の `KEYCHAIN_PASSWORD` は廃止)。
 
 ## トラブルシューティング
 
-- **タグ衝突でワークフローが失敗する** → 同じ version で再実行している。手順 1 で version を上げる。
-  やり直すだけなら既存の draft Release とタグを消す: `gh release delete queryfolio-v<version> --cleanup-tag --yes`。
-- **ad-hoc 署名 (未署名相当) でビルドされる** → 署名 Secrets が未設定。"Configure code signing"
-  ステップのログが "building with ad-hoc signing (test build)" になる。配布ビルドには
-  「初回セットアップ」を実施する。
-  「初回セットアップ」を実施する。
-- **`draft=false` でジョブが即失敗する** → 署名 Secrets が未設定のまま公開しようとしている。
-  未署名 (ad-hoc) ビルドを公開 Release にしないための安全弁 (ワークフローが `::error::` で停止)。
-  「初回セットアップ」で署名 Secrets を設定するか、`draft=true` で試すこと。
-- **`gh run watch` がすぐ終わる / run が見つからない** → dispatch 直後で run がまだ登録されていない。
-  数秒待って `gh run list --workflow=build-macos.yml` で databaseId を確認して再度 watch する。
+- **tauri-action がタグ/draft 状態の不一致で失敗する** → 公開済みと同じ version で再実行している。
+  `pnpm release` は毎回 bump するので通常起きない。手で dispatch した時に起きる。
+  残骸を消す: `gh release delete v<version> --cleanup-tag --yes`
+- **`spctl` が `source=Developer ID` (Notarized でない)** → 公証が走っていない。macOS ジョブのログで
+  tauri-action の notarize ステップを確認し、`APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` を疑う。
+  app 用パスワードは通常の Apple ID パスワードでは代用できない。
+- **macOS ジョブが署名で失敗する** → `APPLE_CERTIFICATE` / `APPLE_CERTIFICATE_PASSWORD` 未設定か、
+  `.p12` に秘密鍵が入っていない。"Import Apple Developer certificate" ステップの
+  `security find-identity` の出力に Developer ID が出ているか見る。
+- **Windows ジョブだけ失敗して Release が draft のまま** → Release は公開されない (仕様)。
+  ログを直して version を上げて再実行する。急ぐなら手で
+  `gh release edit v<version> --draft=false --latest` で macOS 分だけ公開できる。
+- **`pnpm release` が "working tree is not clean" / "does not match origin/main" で止まる** →
+  ビルドは origin/main の内容で走るため、ローカルとズレたままリリースさせない安全弁。
+  commit / push してから再実行する。

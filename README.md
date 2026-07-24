@@ -98,26 +98,42 @@ Only files directly under a connection folder inside the query files directory (
 ```shell
 pnpm check                   # svelte-check
 cd src-tauri && cargo test   # Rust unit tests
-pnpm tauri build             # release build (macOS: signed with Developer ID via the tauri script; not notarized)
+pnpm tauri build             # release build (macOS: signed with Developer ID via the tauri script)
 ```
 
 See `AGENTS.md` for architecture details.
 
-## Release (macOS)
+## Download
 
-The signed macOS build is produced on GitHub Actions (`.github/workflows/build-macos.yml`,
-manual trigger only) and published as a GitHub Release. Kick it off with Fabric:
+Grab the latest installer from the [Releases page](https://github.com/ytyng/queryfolio/releases/latest):
+
+- **macOS**: `QueryFolio_<version>_universal.dmg` (Apple Silicon + Intel). Signed with a
+  Developer ID certificate and notarized by Apple, so it opens without a Gatekeeper warning.
+- **Windows**: `QueryFolio_<version>_x64-setup.exe` (NSIS installer). It is *not* code signed,
+  so SmartScreen shows "Windows protected your PC" — choose **More info › Run anyway**.
+
+## Release
+
+Releases are built on GitHub Actions (`.github/workflows/release.yml`, manual trigger only)
+and published as a GitHub Release. Bump the version and kick off the build with one command:
 
 ```shell
-fab build_mac                # build a universal (Apple Silicon + Intel) app, draft Release
-fab build_mac:draft=false    # publish the Release directly
-fab -l                       # list all tasks (dev / check / unittest / build_local / build_mac / releases)
+pnpm release                 # 0.1.0 -> 0.1.1 (patch)
+pnpm release minor           # 0.1.0 -> 0.2.0
+pnpm release major           # 0.1.0 -> 1.0.0
+fab release                  # same thing via Fabric (fab release:minor / fab release:major)
+fab -l                       # list all tasks (dev / check / unittest / build_local / release / releases)
 ```
 
-The workflow signs with the Developer ID certificate (Cyberneura K.K.) when the signing
-secrets are configured; it is not notarized. See the `publish-macos-release` skill
-(`.claude/skills/publish-macos-release/`) for the full build → verify → publish runbook,
-including the one-time signing-secrets setup.
+The script requires a clean `main` in sync with `origin/main`. It bumps the version in
+`src-tauri/tauri.conf.json` and `package.json`, pushes the bump commit, dispatches the
+workflow, and follows the run. The workflow builds the macOS universal dmg (Developer ID
+signed + notarized + stapled) and the Windows NSIS installer in parallel, uploads both to a
+**draft** Release, and publishes it only after every platform succeeded (a missing signing
+secret fails the macOS job up front, so an unsigned or un-notarized build is never
+published). See the `publish-macos-release` skill (`.claude/skills/publish-macos-release/`)
+for the full runbook, including how to verify the published dmg and the one-time
+signing-secrets setup.
 
 ## License
 

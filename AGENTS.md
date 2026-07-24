@@ -23,11 +23,19 @@ pnpm check              # svelte-check (型チェック)
 cd src-tauri && cargo test   # Rust ユニットテスト
 cd src-tauri && cargo check  # Rust 型チェック
 pnpm tauri build        # リリースビルド
-fab build_mac           # macOS 版を GitHub Actions でビルド → draft Release 作成 (手動トリガー。公開は publish-macos-release スキル参照)
-fab -l                  # fab タスク一覧 (dev / check / unittest / build_local / build_mac / releases)
+pnpm release            # version 採番 → main へ push → Release ワークフロー起動 → watch (patch|minor|major)
+fab release             # 同上 (fab release:minor 等)
+fab -l                  # fab タスク一覧 (dev / check / unittest / build_local / release / releases)
 ```
 
-macOS 版のリリースは `.github/workflows/build-macos.yml` (workflow_dispatch のみ) で universal ビルドし GitHub Release に署名付き DMG を添付する。起動は `fabfile/__init__.py` の `build_mac` タスク (`gh workflow run`)。公開までの runbook は `publish-macos-release` スキル (`.claude/skills/publish-macos-release/`。署名 Secrets の初回設定手順を含む)。
+リリースは `.github/workflows/release.yml` (workflow_dispatch のみ) で macOS universal dmg (Developer ID 署名 + 公証 + staple) と Windows NSIS インストーラ (署名なし) を matrix で並列ビルドし、**draft** Release にアップロード → 全プラットフォーム成功後に `publish` ジョブが公開する。起動は `scripts/release.sh` (`pnpm release` / `fab release`)。設計の詳細はグローバルスキル `tauri-github-actions-release`、公開までの runbook は `publish-macos-release` スキル (`.claude/skills/publish-macos-release/`。署名 Secrets の初回設定手順を含む)。設計上の要点:
+
+- **draft → publish 分離が必須**: matrix の 2 ジョブが同じ `v<version>` Release を作るため、`releaseDraft: false` だと先に終わった方だけの不完全な Release が即公開される。
+- **version は毎回インクリメント必須**: 公開済みと同じ version で再実行すると tauri-action が draft 状態の不一致でエラーになる。だから `scripts/release.sh` が採番を自動化している (bump し忘れ事故を構造的に消す)。
+- **`pnpm publish` は使えない** (pnpm 組み込みコマンドで上書き不可)。コマンド名は `release`。
+- **tauri-action は commit SHA 固定**。Apple の証明書・認証情報を渡す action なので、タグ差し替えで secrets を抜かれるのを防ぐ。`APPLE_*` は macOS ジョブにのみ渡す (Windows には空文字)。
+- **`tauriScript: pnpm exec tauri`** で package.json の `tauri` スクリプトを迂回する。あちらはローカル署名用に `APPLE_SIGNING_IDENTITY` を env 前置きでハードコードしており、Windows のシェルでは構文エラーになる。
+- **弱点**: `pnpm release` は main へ直接 push するため、ブランチ保護 (PR 必須) を掛けると破綻する。
 
 ## アーキテクチャ
 
@@ -105,5 +113,5 @@ macOS 版のリリースは `.github/workflows/build-macos.yml` (workflow_dispat
 - 64bit 整数は JS の Number.MAX_SAFE_INTEGER を超えると Tauri invoke 境界で丸められるため、db.rs の json_i64 / json_u64 で範囲外は文字列化している。
 - sqlx は Postgres の数値型互換が厳密 (INT4 は i32 でしかデコードできない等)。デコード追加時は ~/.cargo/registry の sqlx ソースで `compatible` 実装を確認すること。
 - sqlite `:memory:` はプール接続ごとに別 DB になる。テストでは max_connections(1) にする。
-- macOS の署名は package.json の `tauri` スクリプトで `APPLE_SIGNING_IDENTITY` (Developer ID Application: Cyberneura K.K.) を設定済み。`pnpm tauri build` で署名される。公証 (notarization) は未対応。
+- macOS の署名は package.json の `tauri` スクリプトで `APPLE_SIGNING_IDENTITY` (Developer ID Application: Cyberneura K.K.) を設定済み。`pnpm tauri build` (ローカル) はこれで署名される (公証はしない)。tauri.conf.json の `bundle.macOS.signingIdentity: "-"` は env が無い時の ad-hoc 署名フォールバック (tauri-cli の優先順位は env > config)。CI (`release.yml`) は env の Developer ID で署名し、`APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` を渡して公証 + staple まで行う。
 - 実機検証はテスト用 SQLite DB を作り `QUERYFOLIO_CONFIG_YAML` 環境変数で注入して `pnpm tauri dev` を起動すると、ユーザーの実設定を汚さない。orca computer-use で操作する場合、文字入力は type-text でなく paste-text を使う (type-text は二重配送することがある)。
