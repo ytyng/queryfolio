@@ -39,6 +39,8 @@ pnpm tauri dev
 
 Everything lives in one file: `~/.config/queryfolio/config.yml` (see `config.example.yaml`). Connections are written under `sql_servers`, and any key can be overridden from an external source with `config_override_command`:
 
+> 📖 **See [docs/settings.md](docs/settings.md) for the full settings reference** — every key, SSH tunnel modes, groups, templates, `config_override_command`, AI, and more.
+
 ```yaml
 # Inline (sql-agent-mcp-server compatible)
 sql_servers:
