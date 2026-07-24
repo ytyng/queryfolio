@@ -9,12 +9,18 @@ on:
 permissions:
   contents: write
 
-# 同時に走らないよう直列化する。cancel-in-progress は付けない: 1 回の dispatch が
-# 1 つの version に対応するため、後発の run で先発をキャンセルすると、その version の
-# Release だけが (bump コミットは main に載ったまま) 永久に公開されない状態になる。
+# 同時に走らないよう直列化する。1 回の dispatch が 1 つの version に対応するため、
+# キャンセルされた run の version は (bump コミットは main に載ったまま) 永久に
+# 公開されない状態になる。それを防ぐために 2 つとも要る:
+#   cancel-in-progress: false — 走行中の run を後発でキャンセルしない。
+#   queue: max — pending も最大 100 件まで積む。既定の `queue: single` は
+#     「pending は 1 件だけ。新しく queue されたら既存の pending をキャンセルして
+#     置き換える」なので、3 回連続で dispatch すると真ん中の version が消える。
+# (queue: max と cancel-in-progress: true の併用は validation error になる)
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   build:

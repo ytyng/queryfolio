@@ -35,7 +35,7 @@ fab -l                  # fab タスク一覧 (dev / check / unittest / build_lo
 - **`pnpm publish` は使えない** (pnpm 組み込みコマンドで上書き不可)。コマンド名は `release`。
 - **`uses:` は全て commit SHA 固定** (行末コメントが元のタグ)。Apple の証明書・認証情報を扱うジョブなので、tauri-action だけ固定しても先行ステップの action が改変されれば同じこと。checkout は `persist-credentials: false` で write 権限の token を `.git/config` に残さない。`APPLE_*` は macOS ジョブにのみ渡す (Windows には空文字)。
 - **`tauriScript: pnpm exec tauri`** を必ず指定する。省くと tauri-action は pnpm プロジェクトに対して `pnpm tauri build` を実行し、package.json の `tauri` スクリプト (`APPLE_SIGNING_IDENTITY='...' tauri`) が走る。シェルのインライン代入は継承 env より強いので、**workflow が渡した `secrets.APPLE_SIGNING_IDENTITY` が黙って無視される** (加えて Windows のシェルでは構文エラーになる)。`pnpm exec tauri` はスクリプトを経由しない。
-- **`cancel-in-progress` は付けない**: 1 dispatch = 1 version なので、後発の run が先発をキャンセルすると、その version の Release だけが (bump コミットは main に載ったまま) 永久に公開されなくなる。CI 分数より取りこぼし防止を優先する。
+- **`cancel-in-progress: false` + `queue: max`**: 1 dispatch = 1 version なので、キャンセルされた run の version は (bump コミットは main に載ったまま) 永久に公開されなくなる。走行中の run を守る (`cancel-in-progress: false`) だけでは足りず、既定の `queue: single` は pending を 1 件しか保持せず新しい dispatch で既存 pending を捨てるため、`queue: max` (最大 100 件) も要る。CI 分数より取りこぼし防止を優先する。
 - **弱点**: `pnpm release` は main へ直接 push するため、ブランチ保護 (PR 必須) を掛けると破綻する。
 
 ## アーキテクチャ
