@@ -97,7 +97,7 @@
     });
 
   // カーソル位置を含む Statement ノードの範囲を返す。
-  // カーソルが文と文の間にある場合は直前の文を返す (DataGrip と同様の挙動)。
+  // カーソルが文と文の間にある場合は直前の文を返す (一般的な SQL エディタと同様の挙動)。
   const statementRangeAt = (
     state: EditorState,
     pos: number,
