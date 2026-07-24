@@ -1,0 +1,399 @@
+# Settings
+
+QueryFolio is configured through a single YAML file. This page explains where that
+file lives and every key it accepts.
+
+For a ready-to-copy starting point, see [`config.example.yaml`](../config.example.yaml)
+in the repository root.
+
+## Table of contents
+
+- [File location](#file-location)
+- [Editing the config](#editing-the-config)
+- [Connections (`sql_servers`)](#connections-sql_servers)
+  - [Common keys](#common-keys)
+  - [Engines](#engines)
+  - [Safety guards (`readonly`, `allow_dangerous_statements`)](#safety-guards)
+  - [SSH tunnels (`ssh_tunnel`)](#ssh-tunnels-ssh_tunnel)
+- [Connection groups](#connection-groups)
+- [Connection templates](#connection-templates)
+- [Overriding config from an external source (`config_override_command`)](#overriding-config-from-an-external-source-config_override_command)
+- [AI features (`ai`)](#ai-features-ai)
+- [Auto `LIMIT` (`default_limit`)](#auto-limit-default_limit)
+- [Query file storage (`sqlfiles_dir`, `folder_name`)](#query-file-storage-sqlfiles_dir-folder_name)
+- [Environment variable override (`QUERYFOLIO_CONFIG_YAML`)](#environment-variable-override-queryfolio_config_yaml)
+- [Full example](#full-example)
+
+## File location
+
+The config file lives at:
+
+```
+~/.config/queryfolio/config.yml
+```
+
+`config.yaml` (the `.yaml` spelling) is also accepted; `config.yml` takes
+precedence when both exist. On first launch, if neither file is present,
+QueryFolio creates a starter `config.yml` for you.
+
+Because the file can contain plaintext passwords and other secrets, QueryFolio
+writes it with `0600` permissions (owner read/write only) on macOS/Linux. If an
+existing file has looser permissions, they are tightened to `0600` on load and on
+save. (On Windows, the platform's default file permissions apply.)
+
+## Editing the config
+
+You can edit the file with any text editor, or from inside the app:
+
+- Menu bar **QueryFolio → Edit config.yml** opens a built-in editor (with YAML
+  syntax highlighting and lint errors shown inline).
+- Saving from the in-app editor validates that the content still parses as a YAML
+  mapping, writes it atomically, and reloads all connections.
+
+After editing the file directly, reload connections (reopen the app or use the
+menu) to pick up the changes.
+
+## Connections (`sql_servers`)
+
+`sql_servers` is a **list** of connection definitions. This format is compatible
+with `sql-agent-mcp-server`. Writing a mapping here (instead of a list) is an
+error.
+
+```yaml
+sql_servers:
+  - name: dev-postgres
+    description: "Development PostgreSQL"
+    engine: postgres
+    host: localhost
+    port: 5432
+    schema: development_db
+    user: dev_user
+    password: your_password_here
+```
+
+### Common keys
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `name` | yes | Display name shown in the connections list. |
+| `engine` | yes | `postgres` (aliases: `postgresql`), `mysql` (aliases: `mariadb`), or `sqlite` (aliases: `sqlite3`). |
+| `description` | no | Free-text note shown in the UI. |
+| `host` | no | Database host. Defaults to `localhost` when omitted. Not needed for SQLite. When using an SSH tunnel, this is the DB host **as seen from the SSH endpoint** (often `localhost`). |
+| `port` | no | Database port. Defaults per engine when omitted: `5432` (PostgreSQL) / `3306` (MySQL). |
+| `schema` | depends | The database / schema to connect to. For SQLite, this is the **path to the database file** (queryfolio extension; `~` is expanded; if `schema` is omitted, `host` is used as the file path instead). |
+| `user` | no | Database user. |
+| `password` | no | Database password. |
+| `readonly` | no | See [Safety guards](#safety-guards). Default `false`. |
+| `allow_dangerous_statements` | no | See [Safety guards](#safety-guards). Default `false`. |
+| `folder_name` | no | Override the query-file folder name. See [Query file storage](#query-file-storage-sqlfiles_dir-folder_name). |
+| `ssh_tunnel` | no | Connect through an SSH tunnel. See [SSH tunnels](#ssh-tunnels-ssh_tunnel). |
+| `template` | no | Inherit keys from a named template. See [Connection templates](#connection-templates). |
+
+### Engines
+
+- **PostgreSQL** — `engine: postgres`. Standard host / port / schema / user /
+  password.
+- **MySQL / MariaDB** — `engine: mysql`. Standard host / port / schema / user /
+  password.
+- **SQLite** — `engine: sqlite`. Put the **file path** in `schema` (queryfolio
+  extension; if `schema` is omitted, `host` is used as the file path instead).
+  `port` / `user` / `password` are not used.
+
+  ```yaml
+  - name: local-sqlite
+    engine: sqlite
+    schema: ~/data/example.sqlite3
+  ```
+
+### Safety guards
+
+Two per-connection flags help prevent accidents. They are independent of the
+toolbar **Writable** switch (which is off by default each session and only lets
+side-effect-free statements run until you turn it on).
+
+- **`readonly: true`** — rejects write statements (INSERT / UPDATE / DELETE /
+  DDL, CTE-wrapped DML, `SELECT INTO`, `EXPLAIN ANALYZE` of a DML, an assignment
+  `PRAGMA` like `PRAGMA journal_mode = WAL`, etc.). The check is keyword-based:
+  statements whose leading keyword is `SELECT` / `WITH` / `SHOW` / `DESCRIBE` /
+  `DESC` / `EXPLAIN` / `VALUES` / `TABLE` / `CALL` / (non-assignment) `PRAGMA`,
+  plus meta commands, are allowed. This is a guard, not a sandbox — it does **not** stop
+  every side effect: a `CALL` to a stored procedure that writes, a SELECT that
+  calls a side-effecting function (e.g. `nextval`), or a parenthesized settings
+  `PRAGMA` are not blocked. A `readonly` connection shows a lock in the UI and
+  cannot be unlocked with the Writable switch.
+
+  ```yaml
+  - name: production-replica
+    engine: mysql
+    host: replica.example.com
+    schema: production_db
+    user: replica_user
+    password: replica_password
+    readonly: true
+  ```
+
+- **`allow_dangerous_statements: true`** — by default (`false`), statements that
+  can destroy a lot of data at once — `UPDATE` / `DELETE` with no `WHERE`, and
+  `DROP` / `TRUNCATE` — are rejected. Set this to `true` to allow them; the app
+  still shows a confirmation dialog before running such a statement. `readonly`
+  is evaluated first, so a `readonly` connection never reaches this guard.
+
+  The `WHERE` check is a simple word scan (after stripping literals and
+  comments), so it is deliberately conservative: an `UPDATE` / `DELETE` whose
+  only `WHERE` is inside a sub-query or an unrelated CTE is treated as "has a
+  `WHERE`" and allowed through. It reliably catches the typical `WHERE`-less
+  form; it is not a full parser.
+
+  ```yaml
+  - name: dev-db
+    engine: postgres
+    host: localhost
+    schema: dev
+    user: dev_user
+    password: dev_password
+    allow_dangerous_statements: true
+  ```
+
+### SSH tunnels (`ssh_tunnel`)
+
+Add an `ssh_tunnel` block to connect through an SSH local port forward. There are
+two modes.
+
+**1. Built-in tunnel (libssh2).** Give it the SSH host / user and one of:
+password, private key, or (by default) the SSH agent.
+
+```yaml
+- name: remote-db-with-ssh
+  engine: postgres
+  host: localhost      # DB host as seen from the SSH endpoint
+  port: 5432
+  schema: remote_db
+  user: remote_user
+  password: remote_password
+  ssh_tunnel:
+    host: ssh.example.com
+    port: 22
+    user: ssh_user
+    # Pick ONE auth method:
+    # password: ssh_password
+    private_key_path: ~/.ssh/id_rsa
+    # private_key_passphrase: key_passphrase
+    # When no password/private_key_path is set, the SSH agent is used.
+    # identity_agent: ~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock
+```
+
+`ssh_tunnel` keys (built-in mode):
+
+| Key | Description |
+|-----|-------------|
+| `host` | SSH host to connect to. |
+| `port` | SSH port (default `22`). |
+| `user` | SSH user. |
+| `password` | SSH password (optional). |
+| `private_key_path` | Path to a private key (optional; `~` expanded). |
+| `private_key_passphrase` | Passphrase for the private key (optional). |
+| `identity_agent` | ssh-agent socket to use (queryfolio extension, like OpenSSH's `IdentityAgent`). Use `none` to disable the agent. When omitted, it is resolved from `~/.ssh/config` (`IdentityAgent`) and then `$SSH_AUTH_SOCK`. Useful when the app is launched from Finder/Dock and does not inherit the right socket (e.g. the 1Password SSH agent). |
+
+**2. Delegate to the system `ssh` client (`ssh_config`).** Set `ssh_config` to a
+`Host` alias from your `~/.ssh/config`. QueryFolio then runs the system `ssh`
+client (`ssh -N -L`) instead of libssh2, so **ProxyJump / multi-hop tunnels** and
+full `HostName` / `User` / `Port` resolution are handled by OpenSSH.
+
+```yaml
+- name: remote-db-via-ssh-config
+  engine: postgres
+  host: localhost      # DB host as seen from the final SSH host
+  port: 5432
+  schema: remote_db
+  user: remote_user
+  password: remote_password
+  ssh_tunnel:
+    ssh_config: pop-three-ec2-staging
+```
+
+With a `~/.ssh/config` like:
+
+```
+Host pop-three-ec2-staging
+    HostName 172.21.122.39
+    User torico
+    ProxyJump pop-three-bastion
+```
+
+naming the alias is enough. In this mode the built-in-mode keys (`host` / `user`
+/ `password` / `private_key_*` / `identity_agent`) are **ignored** — authentication
+and host-key checking are done entirely by OpenSSH (`BatchMode=yes`, so an unknown
+host key or a passphrase prompt fails instead of blocking; agent auth still
+works).
+
+## Connection groups
+
+Wrap servers in a `group_name` + nested `sql_servers` entry to show them under a
+group heading in the connections list (queryfolio extension). Grouped and plain
+(ungrouped) servers can be mixed; the display order follows the config order.
+Groups cannot be nested (a group inside a group is an error), and a group entry
+may only contain `group_name` and `sql_servers`.
+
+```yaml
+sql_servers:
+  - group_name: production
+    sql_servers:
+      - name: prod-main
+        engine: mysql
+        host: prod.example.com
+        # ...
+      - name: prod-replica
+        engine: mysql
+        host: replica.example.com
+        # ...
+  - name: ungrouped-db          # plain servers can be mixed in
+    engine: sqlite
+    schema: ~/data/example.sqlite3
+```
+
+Templates (see below) still work inside a group.
+
+## Connection templates
+
+Define reusable defaults under `sql_server_templates`, then reference one with
+`template: <name>` on a server. Keys set on the server override the same key in
+the template (shallow merge).
+
+```yaml
+sql_server_templates:
+  - name: my-awesome-sql-host
+    engine: mysql
+    host: db.example.com
+    port: 3306
+    user: shared_user
+    password: shared_password
+
+sql_servers:
+  - name: reporting
+    template: my-awesome-sql-host
+    schema: reporting_db      # host/port/user/password inherited
+```
+
+## Overriding config from an external source (`config_override_command`)
+
+`config_override_command` runs a command whose **stdout is YAML**, and merges
+that YAML over your file. This lets you keep secrets (API keys, passwords, whole
+connection lists) in a secrets manager like 1Password instead of in plaintext.
+
+```yaml
+config_override_command: op read "op://development/queryfolio/config-yaml"
+```
+
+Merge rules (`config.rs > merge_mapping`):
+
+- **Mappings are merged recursively** — e.g. you can override just `ai.api_key`
+  and keep the local `ai.model`.
+- **Scalars and lists (including `sql_servers`) are replaced wholesale** — lists
+  are not merged element-by-element, because there is no reliable element
+  identity.
+- **Any key** can be overridden this way, not just `sql_servers`.
+
+Notes:
+
+- A `config_override_command` inside the fetched YAML is **not** followed
+  recursively; the key is dropped after merging.
+- The command runs **without a shell** (arguments are split with shlex, so pipes
+  and redirects do not work). The minimal GUI `PATH` is supplemented with
+  `/opt/homebrew/bin` and `/usr/local/bin`. It has a 60-second timeout.
+- The merged config is cached once per session (the getter can take a few seconds
+  plus Touch ID), and cleared on reload.
+- If the key exists but is not a non-empty string, that is an error (QueryFolio
+  will not silently fall back to the local-only config).
+- Menu bar **QueryFolio → View override config yaml (Copy only)** appears when
+  this key is set. It runs the command every time and shows the fetched YAML for
+  inspection/copying. You can edit the text in the modal (handy for reformatting
+  before copying it into 1Password), but those edits stay in memory only — there
+  is no Save, so the changes are never written back.
+
+## AI features (`ai`)
+
+Configure natural-language → SQL generation and related AI helpers. The `ai`
+section can live at the top level of the local config **or** in the YAML fetched
+by `config_override_command`. When both exist, the fetched YAML wins (so the API
+key can stay in 1Password). Because `ai` is a mapping, it is merged recursively —
+putting just `api_key` in the fetched YAML keeps your local `model`.
+
+```yaml
+ai:
+  provider: openai   # only "openai" is supported for now
+  api_key: sk-your-api-key
+  model: gpt-5.1                        # optional (default: gpt-5.1)
+  base_url: https://api.openai.com/v1   # optional (for OpenAI-compatible APIs)
+```
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `provider` | no | Currently only `openai` (default). An unknown value is an error. |
+| `api_key` | yes | The API key. It is not exposed through the app's AI status (which reports only whether AI is `configured` and the `model`), though the in-app config editor naturally shows the whole file, including this key. |
+| `model` | no | Model name (default `gpt-5.1`). |
+| `base_url` | no | Base URL for OpenAI-compatible APIs (default `https://api.openai.com/v1`). |
+
+What is sent to the AI: the schema (table / column names), the engine dialect,
+your statements, your natural-language instructions, query plans (for EXPLAIN
+analysis), and — for the "Fix with AI" helper — the **database error message** of
+the failed statement. Query result rows are never sent. Note that a database error
+message can itself embed data values (for example, a unique-constraint violation
+often includes the conflicting key value), so it is not strictly free of row data.
+Generated SQL is inserted into the editor, never auto-executed.
+
+## Auto `LIMIT` (`default_limit`)
+
+`default_limit` appends `LIMIT n` to `SELECT` statements that do not already have
+one, to avoid accidentally fetching huge result sets.
+
+```yaml
+default_limit: 500   # default: 500; set 0 to disable
+```
+
+Sub-query `LIMIT`s, `FOR UPDATE`, and similar cases are skipped conservatively.
+
+## Query file storage (`sqlfiles_dir`, `folder_name`)
+
+QueryFolio auto-saves per-connection query files as
+`<sqlfiles_dir>/<folder>/<name>.sql`.
+
+```yaml
+sqlfiles_dir: ~/queries   # default: ~/.config/queryfolio/sqlfiles
+```
+
+The `<folder>` name is chosen per connection:
+
+- If the server sets `folder_name`, that is used.
+- Otherwise it is built as `<host>_<engine>_<schema>_<user>` (the connection
+  `name` is **not** used; path separators are sanitized).
+
+For example, the `dev-postgres` connection above resolves to
+`localhost_postgres_development_db_dev_user`. Set `folder_name` to pin the folder
+so it does not move when you change `host`/`schema`/etc.:
+
+```yaml
+- name: dev-postgres
+  folder_name: dev-pg
+  engine: postgres
+  # ...
+```
+
+> If you rename a connection's folder (or change the fields it is derived from),
+> existing query files stay in the old folder.
+
+Each folder also gets an auto-generated `_queryfolio.md` describing the connection
+(non-secret info only). It is not a `.sql` file, so it never shows up in the
+file list or search.
+
+## Environment variable override (`QUERYFOLIO_CONFIG_YAML`)
+
+Setting the `QUERYFOLIO_CONFIG_YAML` environment variable replaces the **entire**
+config file with the variable's contents. This is a development / testing hook
+(GUI apps launched from Finder/Dock do not inherit shell environment variables,
+so this mainly applies when launching from a terminal). While it is set, the
+in-app config editor has no file to write and returns an error.
+
+## Full example
+
+See [`config.example.yaml`](../config.example.yaml) for a complete, annotated
+example covering every key above.
