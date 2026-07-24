@@ -1,6 +1,6 @@
 # queryfolio
 
-JetBrains DataGrip の代替を目指す SQL クライアントデスクトップアプリ。
+多目的な SQL GUI クライアントを目指すデスクトップアプリ。
 
 ## 技術スタック
 
